@@ -44,7 +44,7 @@ class EnvInterface(Protocol):
     """Protocol for environments used in multi-turn rollouts."""
 
     def reset(self) -> dict[str, Any]: ...
-    def build_prompt(self) -> tuple[str, list[Image.Image]]: ...
+    def build_prompt(self) -> tuple[list[dict], list[Image.Image]]: ...
     def step(self, action_text: str) -> tuple[float, bool, dict[str, Any]]: ...
     def get_trajectory_reward(self) -> float: ...
     def get_ground_truth(self) -> str: ...
@@ -84,7 +84,7 @@ class Trajectory:
     num_steps: int = 0
 
     # Cached prompt/images from the last generation step (for final batch)
-    last_prompt: str | None = None
+    last_prompt: list[dict] | None = None
     last_images: list[Any] = field(default_factory=list)
 
 
@@ -428,10 +428,16 @@ class MultiturnEnvRollout:
 
     def _tokenize_prompts(
         self,
-        prompts: list[str],
+        prompts: list[list[dict]],
         images_list: list[list[Image.Image]],
     ) -> dict[str, Any]:
         """Tokenize prompts with images into the format expected by generate_sequences.
+
+        Args:
+            prompts: list of chat message lists, each message is a dict with
+                "role" and "content" keys. Content may contain ``<image>``
+                placeholders that correspond to entries in *images_list*.
+            images_list: list of image lists, one per prompt.
 
         Returns a dict with:
           - input_ids: (bs, max_prompt_length) tensor, left-padded
@@ -449,19 +455,28 @@ class MultiturnEnvRollout:
         batch_raw_prompt_ids = []
         batch_multi_modal_data = []
 
-        for prompt, images in zip(prompts, images_list):
-            # Build messages in HF format
-            content_list = []
-            for i, part in enumerate(prompt.split("<image>")):
-                if i != 0:
-                    content_list.append({"type": "image"})
-                if part:
-                    content_list.append({"type": "text", "text": part})
-            messages = [{"role": "user", "content": content_list}]
+        for messages, images in zip(prompts, images_list):
+            # Convert <image> placeholders in message content to HF format
+            hf_messages = []
+            for msg in messages:
+                content = msg["content"]
+                if isinstance(content, str) and "<image>" in content:
+                    content_list = []
+                    for i, part in enumerate(content.split("<image>")):
+                        if i != 0:
+                            content_list.append({"type": "image"})
+                        if part:
+                            content_list.append({"type": "text", "text": part})
+                    hf_messages.append({"role": msg["role"], "content": content_list})
+                elif isinstance(content, str):
+                    hf_messages.append(msg)
+                else:
+                    # Already in HF format (list of content dicts)
+                    hf_messages.append(msg)
 
             # Apply chat template
             text_prompt = self.processor.apply_chat_template(
-                messages, add_generation_prompt=True, tokenize=False
+                hf_messages, add_generation_prompt=True, tokenize=False
             )
 
             # Process images to match pixel constraints
@@ -553,7 +568,7 @@ class MultiturnEnvRollout:
         response_texts = []
 
         for traj in trajectories:
-            prompt_texts.append(traj.last_prompt or "")
+            prompt_texts.append(traj.last_prompt or [{"role": "user", "content": ""}])
             all_images.append(traj.last_images or [])
             response_texts.append(
                 traj.step_responses[-1] if traj.step_responses else ""
@@ -702,7 +717,7 @@ class ObjectNavEnvAdapter:
         self.num_steps = 0
         return {"observation": initial_state.observation}
 
-    def build_prompt(self) -> tuple[str, list[Image.Image]]:
+    def build_prompt(self) -> tuple[list[dict], list[Image.Image]]:
         from interactive_reasoning.objectnavtask.agent.agent_utils import (
             build_annotate_style_context_from_history,
         )
@@ -733,8 +748,11 @@ class ObjectNavEnvAdapter:
                 prompt_parts.append(user_response)
 
         user_text = "\n\n".join(prompt_parts)
-        full_prompt = f"{self.system_prompt}\n\n---\n\n{user_text}"
-        return full_prompt, images
+        messages = [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": user_text},
+        ]
+        return messages, images
 
     def step(self, action_text: str) -> tuple[float, bool, dict[str, Any]]:
         self.num_steps += 1
