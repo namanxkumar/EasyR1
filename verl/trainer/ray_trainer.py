@@ -15,6 +15,7 @@
 PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface.
 """
+import logging
 
 import json
 import os
@@ -181,6 +182,8 @@ class RayPPOTrainer:
         self.reward_fn = reward_fn
         self.val_reward_fn = val_reward_fn
 
+        self.multiturn_rollout = None  # constructed later if config enables it
+
         self.val_reward_score = 0.0
         self.best_val_reward_score = -1.0
         self.best_global_step = None
@@ -249,9 +252,11 @@ class RayPPOTrainer:
 
     def init_workers(self) -> None:
         """Init resource pool and worker group"""
+        logging.info("Creating resource pools...")
         self.resource_pool_manager.create_resource_pool()
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
 
+        logging.info("Creating workers and worker groups...")
         # create actor, rollout and ref
         if self.hybrid_engine:
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRolloutRef)
@@ -304,6 +309,8 @@ class RayPPOTrainer:
         # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
         self.actor_rollout_ref_wg = all_wg["actor_rollout_ref"]
         self.actor_rollout_ref_wg.init_model()
+
+        logging.info("All workers initialized.")
 
     def _save_checkpoint(self) -> None:
         # path: {save_checkpoint_path}/global_step_{global_step}/{actor,critic}
@@ -464,6 +471,16 @@ class RayPPOTrainer:
         metrics.update(global_balance_stats)
 
     def _make_batch_data(self, metrics: dict[str, Any]) -> DataProto:
+        # Multi-turn environment rollout mode
+        if self.multiturn_rollout is not None:
+            return self.multiturn_rollout.generate_trajectories(
+                actor_rollout_ref_wg=self.actor_rollout_ref_wg,
+                batch_size=self.config.data.rollout_batch_size,
+                n_trajectories=self.config.worker.rollout.n,
+                config=self.config,
+                metrics=metrics,
+            )
+
         batch = None
         all_metrics = defaultdict(list)
         num_try_make_batch = 0

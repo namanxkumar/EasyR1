@@ -20,6 +20,46 @@ from typing import Any, Optional
 
 
 @dataclass
+class MultiturnEnvConfig:
+    """Configuration for multi-turn environment rollouts (e.g. AI2Thor ObjectNav).
+
+    When ``enabled=True``, the trainer replaces the standard single-turn
+    generate-then-score loop with multi-turn environment trajectories.
+    """
+
+    enabled: bool = False
+    """Enable multi-turn environment rollout mode."""
+    env_type: str = "objectnav"
+    """Environment type. Currently only 'objectnav' is supported."""
+    data_root: str = "/data/group_data/katefgroup/VLA/poliformer_data"
+    """Root directory for the Poliformer dataset."""
+    split: str = "train"
+    """Dataset split to use."""
+    max_items: Optional[int] = None
+    """Maximum number of dataset items (None = use all)."""
+    system_prompt_path: str = "src/post_annotation/prompts/sft_system_prompt.txt"
+    """Path to the system prompt file."""
+    max_depth: int = 30
+    """Maximum steps per trajectory."""
+    gpu_id: int = 0
+    """GPU ID for AI2Thor rendering."""
+    render_width: int = 640
+    """Environment render width."""
+    render_height: int = 640
+    """Environment render height."""
+    image_side: int = 1000
+    """Coordinate normalization scale for the image grid."""
+    coordinate_normalization_scale: float = 1.0
+    """Scale factor applied to parsed coordinates."""
+    max_observations: int = 20
+    """Maximum observation images to include in prompt context."""
+    num_simulators: int = 8
+    """Number of AI2Thor simulator slots per SimulatorPool.
+    Should be >= rollout_batch_size * n for full parallelism.
+    Each slot creates one AI2Thor Controller (~300MB GPU memory)."""
+
+
+@dataclass
 class RolloutConfig:
     name: str = "vllm"
     n: int = 1

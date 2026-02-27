@@ -105,7 +105,13 @@ class vLLMRollout(BaseRollout):
 
         engine_kwargs = {}
         if processor is not None:  # only VLMs have processor
-            engine_kwargs["disable_mm_preprocessor_cache"] = True
+            # disable_mm_preprocessor_cache was removed in vLLM >= 0.16
+            try:
+                from vllm.engine.arg_utils import EngineArgs
+                if "disable_mm_preprocessor_cache" in EngineArgs.__dataclass_fields__:
+                    engine_kwargs["disable_mm_preprocessor_cache"] = True
+            except Exception:
+                pass
             if config.limit_images:
                 engine_kwargs["limit_mm_per_prompt"] = {"image": config.limit_images}
 
@@ -133,7 +139,11 @@ class vLLMRollout(BaseRollout):
         )
 
         # Offload vllm model to reduce peak memory usage
-        self.inference_engine.sleep(level=1)
+        try:
+            self.inference_engine.sleep(level=1)
+        except Exception as e:
+            print(f"WARNING: vLLM sleep(level=1) failed: {e}")
+            print("Continuing without sleep mode — this may increase peak memory usage.")
 
         sampling_kwargs = {
             "max_tokens": config.response_length,
