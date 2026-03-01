@@ -696,6 +696,19 @@ class ObjectNavEnvAdapter:
         self.coordinate_normalization_scale = coordinate_normalization_scale
         self.max_observations = max_observations
 
+        # Build the per-step instruction matching the SFT annotation format.
+        # Uses the same tags as the action_proposer (explore, answer, summary).
+        from interactive_reasoning.objectnavtask.agent.instructions import (
+            build_annotation_direct_action_instructions,
+        )
+
+        self._step_instructions = build_annotation_direct_action_instructions(
+            think_tag="think",
+            explore_tag=action_proposer.explore_tag,
+            answer_tag=action_proposer.answer_tag,
+            summary_tag="summary",
+        )
+
         # Track reward components
         self.initial_distance: float | None = None
         self.final_distance: float | None = None
@@ -746,6 +759,15 @@ class ObjectNavEnvAdapter:
                     prompt_parts.append("<image>")
             elif user_response:
                 prompt_parts.append(user_response)
+
+        # Append the step instruction (matches what the model saw during SFT)
+        # Use forced answer instruction on the last step before max depth
+        max_actions = self.env.configuration.max_actions
+        if self.num_steps + 1 >= max_actions:
+            instruction = self._step_instructions["forced"]
+        else:
+            instruction = self._step_instructions["standard"]
+        prompt_parts.append(instruction)
 
         user_text = "\n\n".join(prompt_parts)
         messages = [

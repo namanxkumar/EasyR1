@@ -29,7 +29,8 @@ from .config import PPOConfig
 from .data_loader import create_dataloader
 from .ray_trainer import RayPPOTrainer, ResourcePoolManager, Role
 
-logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S", force=True)
+# logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S", force=True)
+logging.basicConfig(level=logging.DEBUG, format="[%(asctime)s] %(levelname)s %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S", force=True)
 
 # Quiet down noisy loggers from environment internals
 for _quiet in ("interactive_reasoning.objectnavtask.environment", "ai2thor"):
@@ -143,6 +144,15 @@ def _create_multiturn_rollout(config: PPOConfig, tokenizer, processor):
     n_gpus = config.trainer.n_gpus_per_node
     simulator_pools = _create_simulator_pools(mt_cfg, n_gpus=n_gpus)
     logging.info(f"Created {len(simulator_pools)} SimulatorPool(s) across {n_gpus} GPUs")
+
+    # Warm up AI2Thor controllers one pool at a time to avoid GPU memory stampede.
+    # Uses the first dataset item's scene as a dummy scene.
+    dummy_scene = dataset[0]["scene_metadata"]
+    logging.info("Warming up AI2Thor controllers (staggered, one pool at a time)...")
+    for i, pool in enumerate(simulator_pools):
+        count = ray.get(pool.warmup_controllers.remote(dummy_scene))
+        logging.info(f"  Pool {i}: warmed up {count} controller(s)")
+    logging.info("All AI2Thor controllers warmed up")
 
     return MultiturnEnvRollout(
         tokenizer=tokenizer,

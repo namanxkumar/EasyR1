@@ -4,6 +4,11 @@ Each SimulatorPool manages multiple ObjectNavEnvAdapter instances on a single GP
 This enables parallel environment operations during multi-turn GRPO rollouts,
 mirroring the ViGoRL reference architecture.
 
+Controller reuse: AI2Thor Unity processes are expensive to start (~30-100s).
+The pool keeps bare AI2ThorController objects alive between episodes and passes
+them to new ObjectNavEnvironment instances, which call reset_scene() internally.
+This is much faster (~2-5s) than creating a new Unity process each time.
+
 Usage:
     pool = SimulatorPool.options(
         runtime_env={"env_vars": {"CUDA_VISIBLE_DEVICES": str(gpu_id)}}
@@ -35,8 +40,8 @@ class SimulatorPool:
     """Manages multiple AI2Thor ObjectNavEnvAdapter instances on a single GPU.
 
     Each 'slot' holds a full ObjectNavEnvAdapter (which owns an ObjectNavEnvironment
-    with its own AI2Thor Controller). Operations can be called in parallel across
-    multiple pools via Ray futures.
+    with its own AI2Thor Controller). Bare AI2ThorController objects are cached
+    and reused across episodes to avoid expensive Unity process restarts.
     """
 
     def __init__(
@@ -66,6 +71,9 @@ class SimulatorPool:
         self.slots: list[Optional[Any]] = [None] * num_slots
         self.slot_available: list[bool] = [True] * num_slots
 
+        # Cached bare AI2ThorController objects (reused across episodes)
+        self._cached_controllers: list[Optional[Any]] = [None] * num_slots
+
         # Shared action proposer (parse-only, no VLM)
         from interactive_reasoning.objectnavtask.agent.action_proposer import (
             ActionProposer,
@@ -82,6 +90,69 @@ class SimulatorPool:
             f"SimulatorPool initialized: gpu_id={gpu_id}, num_slots={num_slots}"
         )
 
+    def _log_gpu_memory(self, context: str):
+        """Log GPU memory usage for diagnostics."""
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["nvidia-smi", "--query-gpu=memory.used,memory.total,memory.free",
+                 "--format=csv,noheader,nounits", f"--id={self.gpu_id}"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0:
+                parts = result.stdout.strip().split(", ")
+                if len(parts) == 3:
+                    used, total, free = parts
+                    logger.info(
+                        f"[GPU {self.gpu_id}] {context}: "
+                        f"memory used={used}MB / total={total}MB (free={free}MB)"
+                    )
+        except Exception:
+            pass  # best-effort diagnostics
+
+    # ── warmup ─────────────────────────────────────────────────────────
+
+    def warmup_controllers(self, dummy_scene_metadata: dict) -> int:
+        """Pre-create bare AI2Thor controllers for all slots using a dummy scene.
+
+        Only creates the AI2ThorController (Unity process), not a full
+        ObjectNavEnvironment, so no target-object pathfinding is attempted.
+
+        Returns the number of controllers successfully warmed up.
+        """
+        from interactive_reasoning.objectnavtask.environment.ai2thor_controller import (
+            AI2ThorController,
+            AI2ThorControllerConfiguration,
+        )
+
+        self._log_gpu_memory(f"before warmup ({self.num_slots} slots)")
+        created = 0
+        for i in range(self.num_slots):
+            if self._cached_controllers[i] is not None:
+                created += 1
+                continue
+            try:
+                config = AI2ThorControllerConfiguration(
+                    scene_metadata=dummy_scene_metadata,
+                    gpu_id=0,  # 0 = first (only) visible GPU after CUDA_VISIBLE_DEVICES
+                    render_width=self.render_width,
+                    render_height=self.render_height,
+                )
+                controller = AI2ThorController(configuration=config)
+                self._cached_controllers[i] = controller
+                created += 1
+                logger.info(
+                    f"Warmed up controller {created}/{self.num_slots} "
+                    f"on gpu {self.gpu_id}"
+                )
+            except Exception as e:
+                logger.error(
+                    f"Failed to warm up controller for slot {i} on gpu "
+                    f"{self.gpu_id}: {e}"
+                )
+        self._log_gpu_memory(f"after warmup ({created}/{self.num_slots} created)")
+        return created
+
     # ── pool info ─────────────────────────────────────────────────────
 
     def get_pool_info(self) -> dict:
@@ -96,9 +167,12 @@ class SimulatorPool:
     # ── lifecycle ─────────────────────────────────────────────────────
 
     def acquire_env(self, item_data: dict) -> Optional[int]:
-        """Create an environment from dataset item data, return slot ID.
+        """Acquire a slot and set up an environment for the given dataset item.
 
-        Returns None if no slots are available.
+        If the slot has a cached AI2ThorController from a previous episode,
+        it is passed to ObjectNavEnvironment which reuses it via reset_scene().
+
+        Returns the slot ID, or None if no slots are available.
         """
         slot_id = None
         for i, avail in enumerate(self.slot_available):
@@ -115,6 +189,8 @@ class SimulatorPool:
         self.slot_available[slot_id] = False
 
         try:
+            self._log_gpu_memory(f"acquire_env slot={slot_id}")
+
             from interactive_reasoning.objectnavtask.environment import (
                 ObjectNavEnvironment,
             )
@@ -132,16 +208,57 @@ class SimulatorPool:
                 capture_extra_info=False,
             )
 
-            env = ObjectNavEnvironment(
-                configuration=env_config,
-                target_object=item_data["target_object"],
-                target_object_description=item_data.get(
-                    "target_object_description", ""
-                ),
-                target_object_id=item_data["target_object_id"],
-                target_object_position=item_data["target_object_position"],
-                initial_agent_state=item_data.get("initial_metadata"),
-            )
+            cached_ctrl = self._cached_controllers[slot_id]
+
+            # Try to reuse cached controller; fall back to creating fresh
+            env = None
+            if cached_ctrl is not None:
+                try:
+                    env = ObjectNavEnvironment(
+                        configuration=env_config,
+                        target_object=item_data["target_object"],
+                        target_object_description=item_data.get(
+                            "target_object_description", ""
+                        ),
+                        target_object_id=item_data["target_object_id"],
+                        target_object_position=item_data["target_object_position"],
+                        initial_agent_state=item_data.get("initial_metadata"),
+                        existing_controller=cached_ctrl,
+                    )
+                    logger.info(
+                        f"Reused cached controller for slot {slot_id} on gpu {self.gpu_id}"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to reuse cached controller for slot {slot_id}: {e}. "
+                        f"Creating fresh controller."
+                    )
+                    try:
+                        cached_ctrl.close_controller()
+                    except Exception:
+                        pass
+                    self._cached_controllers[slot_id] = None
+                    env = None
+
+            if env is None:
+                # Create from scratch (first time or after cache miss)
+                logger.info(
+                    f"Creating new AI2Thor controller for slot {slot_id} "
+                    f"on gpu {self.gpu_id}"
+                )
+                env = ObjectNavEnvironment(
+                    configuration=env_config,
+                    target_object=item_data["target_object"],
+                    target_object_description=item_data.get(
+                        "target_object_description", ""
+                    ),
+                    target_object_id=item_data["target_object_id"],
+                    target_object_position=item_data["target_object_position"],
+                    initial_agent_state=item_data.get("initial_metadata"),
+                )
+
+            # Cache the bare controller for future reuse
+            self._cached_controllers[slot_id] = env._ai2thor
 
             # Lazy import to avoid circular deps
             from verl.workers.rollout.multiturn_env import ObjectNavEnvAdapter
@@ -175,21 +292,30 @@ class SimulatorPool:
         return adapter.reset()
 
     def release_env(self, slot_id: int) -> None:
-        """Release a specific slot, closing the AI2Thor controller."""
+        """Release a slot, keeping the AI2Thor controller cached for reuse."""
         if slot_id < 0 or slot_id >= self.num_slots:
             return
-        if self.slots[slot_id] is not None:
-            try:
-                self.slots[slot_id].close()
-            except Exception:
-                pass
-            self.slots[slot_id] = None
+        # Clear the adapter but keep the cached controller
+        self.slots[slot_id] = None
         self.slot_available[slot_id] = True
 
     def release_all(self) -> None:
-        """Release all slots."""
+        """Release all slots (keeps controllers cached)."""
         for i in range(self.num_slots):
             self.release_env(i)
+        gc.collect()
+
+    def destroy_all(self) -> None:
+        """Destroy all slots and close all AI2Thor controllers."""
+        for i in range(self.num_slots):
+            self.slots[i] = None
+            self.slot_available[i] = True
+            if self._cached_controllers[i] is not None:
+                try:
+                    self._cached_controllers[i].close_controller()
+                except Exception:
+                    pass
+                self._cached_controllers[i] = None
         gc.collect()
 
     # ── environment operations ────────────────────────────────────────
@@ -241,8 +367,15 @@ class SimulatorPool:
                 except Exception as e:
                     logger.warning(
                         f"Slot {i} on gpu {self.gpu_id} appears broken: {e}. "
-                        f"Releasing."
+                        f"Destroying cached controller."
                     )
-            self.release_env(i)
+                    if self._cached_controllers[i] is not None:
+                        try:
+                            self._cached_controllers[i].close_controller()
+                        except Exception:
+                            pass
+                        self._cached_controllers[i] = None
+            self.slots[i] = None
+            self.slot_available[i] = True
         gc.collect()
         return True
