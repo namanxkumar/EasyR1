@@ -26,9 +26,9 @@ from .config import PPOConfig
 from .data_loader import create_dataloader
 from .ray_trainer import RayPPOTrainer, ResourcePoolManager, Role
 
-# logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S", force=True)
+_log_level = getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO)
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=_log_level,
     format="[%(asctime)s] %(levelname)s %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     force=True,
@@ -83,6 +83,16 @@ def _create_simulator_pools(mt_cfg, n_gpus: int):
     with open(mt_cfg.system_prompt_path) as f:
         system_prompt = f.read().strip()
 
+    # Compute coordinate_normalization_scale: maps model output coords
+    # (on [0, model_output_scale] grid) to pixel coords (on [0, render_width]).
+    coord_scale = mt_cfg.coordinate_normalization_scale
+    if coord_scale is None:
+        coord_scale = mt_cfg.render_width / mt_cfg.model_output_scale
+    logging.info(
+        f"coordinate_normalization_scale = {coord_scale} "
+        f"(render_width={mt_cfg.render_width}, model_output_scale={mt_cfg.model_output_scale})"
+    )
+
     pools = []
     for gpu_idx in range(min(n_gpus, len(physical_gpu_ids))):
         n_slots = sims_per_gpu + (1 if gpu_idx < extra else 0)
@@ -101,7 +111,7 @@ def _create_simulator_pools(mt_cfg, n_gpus: int):
             render_width=mt_cfg.render_width,
             render_height=mt_cfg.render_height,
             max_depth=mt_cfg.max_depth,
-            coordinate_normalization_scale=mt_cfg.coordinate_normalization_scale,
+            coordinate_normalization_scale=coord_scale,
             max_observations=mt_cfg.max_observations,
         )
         pools.append(pool)
@@ -188,6 +198,7 @@ def _create_multiturn_rollout(config: PPOConfig, tokenizer, processor):
         max_response_length=config.data.max_response_length,
         min_pixels=config.data.min_pixels,
         max_pixels=config.data.max_pixels,
+        prior_image_scale=mt_cfg.prior_image_scale,
     )
 
 

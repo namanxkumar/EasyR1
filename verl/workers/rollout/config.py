@@ -43,14 +43,19 @@ class MultiturnEnvConfig:
     """Maximum steps per trajectory."""
     gpu_id: int = 0
     """GPU ID for AI2Thor rendering."""
-    render_width: int = 640
-    """Environment render width."""
-    render_height: int = 640
-    """Environment render height."""
-    image_side: int = 1000
-    """Coordinate normalization scale for the image grid."""
-    coordinate_normalization_scale: float = 1.0
-    """Scale factor applied to parsed coordinates."""
+    render_width: int = 616
+    """Environment render width (matches SFT post-annotation pipeline)."""
+    render_height: int = 616
+    """Environment render height (matches SFT post-annotation pipeline)."""
+    model_output_scale: int = 1000
+    """The coordinate grid scale the model was trained to output (e.g. [0, 1000])."""
+    coordinate_normalization_scale: Optional[float] = None
+    """Scale factor applied to parsed coordinates.
+    Computed as render_width / model_output_scale if not set explicitly."""
+    prior_image_scale: float = 0.5
+    """Downscale prior observation images (all but the last) by this factor.
+    Matches the SFT training config (prior_image_scale in LLaMA-Factory).
+    1.0 = no downscaling, 0.5 = half each dimension."""
     max_observations: int = 20
     """Maximum observation images to include in prompt context."""
     num_simulators: int = 8

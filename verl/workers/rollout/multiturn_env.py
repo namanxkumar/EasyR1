@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import time
 import uuid
@@ -32,6 +33,13 @@ from transformers import PreTrainedTokenizer, ProcessorMixin
 from ...protocol import DataProto, pad_dataproto_to_divisor, unpad_dataproto
 
 logger = logging.getLogger(__name__)
+# Ray workers don't inherit the driver's logging config, so set level from env var
+_log_level = getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO)
+logger.setLevel(_log_level)
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+    logger.addHandler(_handler)
 
 
 # ---------------------------------------------------------------------------
@@ -115,6 +123,7 @@ class MultiturnEnvRollout:
         max_response_length: int = 1024,
         min_pixels: int = 102400,
         max_pixels: int = 409600,
+        prior_image_scale: float = 0.5,
     ):
         self.tokenizer = tokenizer
         self.processor = processor
@@ -125,6 +134,7 @@ class MultiturnEnvRollout:
         self.max_response_length = max_response_length
         self.min_pixels = min_pixels
         self.max_pixels = max_pixels
+        self.prior_image_scale = prior_image_scale
 
     # ── public API ────────────────────────────────────────────────────
 
@@ -290,6 +300,34 @@ class MultiturnEnvRollout:
                 trajectories[global_i].last_prompt = prompts[local_i]
                 trajectories[global_i].last_images = list(images_list[local_i])
 
+            if logger.isEnabledFor(logging.DEBUG):
+                for local_i, global_i in enumerate(active_indices):
+                    traj = trajectories[global_i]
+                    msgs = prompts[local_i]
+                    imgs = images_list[local_i]
+                    lines = [f"  [step {step}][traj {global_i}] PROMPT ({len(imgs)} images):"]
+                    img_idx = 0
+                    for msg in msgs:
+                        role = msg["role"].upper()
+                        content = msg.get("content", "")
+                        if role == "SYSTEM":
+                            lines.append(f'  [{role}] "{content[:80]}..."')
+                        elif role == "USER":
+                            # Split on <image> to show text and image placeholders
+                            parts = content.split("<image>")
+                            for pi, part in enumerate(parts):
+                                text = part.strip()
+                                if text:
+                                    # Show last 200 chars of each text segment
+                                    display = text if len(text) <= 200 else f"...{text[-200:]}"
+                                    lines.append(f"  [{role}] Text: \"{display}\"")
+                                if pi < len(parts) - 1:
+                                    lines.append(f"  [{role}] Image: [image_{img_idx}]")
+                                    img_idx += 1
+                        elif role == "ASSISTANT":
+                            lines.append(f'  [{role}] Text: "{content}"')
+                    logger.debug("\n".join(lines))
+
             # ── Tokenize into DataProto format ──
             t_gen = time.time()
             tokenized = self._tokenize_prompts(prompts, images_list)
@@ -307,6 +345,15 @@ class MultiturnEnvRollout:
             )
 
             # ── Generate model responses via vLLM ──
+            if logger.isEnabledFor(logging.DEBUG):
+                prompt_lens = [len(ids) for ids in tokenized["raw_prompt_ids"]]
+                logger.debug(
+                    f"  [step {step}] TOKENIZED: "
+                    f"n_prompts={len(prompt_lens)}, "
+                    f"token_counts={prompt_lens}, "
+                    f"input_ids_shape={tokenized['input_ids'].shape}"
+                )
+
             gen_batch, pad_size = pad_dataproto_to_divisor(
                 gen_batch, actor_rollout_ref_wg.world_size
             )
@@ -324,6 +371,14 @@ class MultiturnEnvRollout:
                     response_ids[i][:length], skip_special_tokens=True
                 )
                 responses.append(text)
+
+            if logger.isEnabledFor(logging.DEBUG):
+                for local_i, global_i in enumerate(active_indices):
+                    resp_len = int(response_mask[local_i].sum().item())
+                    logger.debug(
+                        f"  [step {step}][traj {global_i}] RESPONSE ({resp_len} tokens):\n"
+                        f"  [ASSISTANT] Text: \"{responses[local_i]}\""
+                    )
 
             # ── Step environments in parallel via Ray ──
             step_futures = [
@@ -343,6 +398,12 @@ class MultiturnEnvRollout:
                 traj.num_steps += 1
 
                 reward, terminated, _info = step_results[local_i]
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        f"  [step {step}][traj {global_i}] ENV STEP: "
+                        f"action_type={_info.get('action_type', '?')}, "
+                        f"reward={reward:.3f}, terminated={terminated}"
+                    )
                 if terminated:
                     traj.terminated = True
                     n_terminated_this_step += 1
@@ -479,15 +540,24 @@ class MultiturnEnvRollout:
                 hf_messages, add_generation_prompt=True, tokenize=False
             )
 
-            # Process images to match pixel constraints
-            processed_images = (
-                [
-                    process_image(img, self.min_pixels, self.max_pixels)
-                    for img in images
-                ]
-                if images
-                else None
-            )
+            # Process images: downscale prior images (all but last) to match
+            # the SFT training setup (prior_image_scale), then apply pixel
+            # constraints via process_image.
+            if images:
+                processed_images = []
+                for i, img in enumerate(images):
+                    if i < len(images) - 1 and self.prior_image_scale < 1.0:
+                        # Downscale prior observation images
+                        if isinstance(img, str):
+                            img = Image.open(img)
+                        new_w = max(1, int(img.width * self.prior_image_scale))
+                        new_h = max(1, int(img.height * self.prior_image_scale))
+                        img = img.resize((new_w, new_h), Image.LANCZOS)
+                    processed_images.append(
+                        process_image(img, self.min_pixels, self.max_pixels)
+                    )
+            else:
+                processed_images = None
 
             # Tokenize with processor
             model_inputs = self.processor(
@@ -731,6 +801,22 @@ class ObjectNavEnvAdapter:
         return {"observation": initial_state.observation}
 
     def build_prompt(self) -> tuple[list[dict], list[Image.Image]]:
+        """Build prompt matching the SFT training format from sft_data.py.
+
+        SFT format (single user message):
+            [Step 0]            ← prior image labels + <image> tags
+            <image>
+            [Step 1]
+            <image>
+            Your task is to find the **X** (desc).
+
+            **Memory from previous steps:**
+            - Step 0: summary0
+            ...
+
+            Step N. Here is your current observation:
+            <image>
+        """
         from interactive_reasoning.objectnavtask.agent.agent_utils import (
             build_annotate_style_context_from_history,
         )
@@ -742,34 +828,53 @@ class ObjectNavEnvAdapter:
             max_observations=self.max_observations,
         )
 
-        prompt_parts = []
+        # Separate context into prior images, text-only parts, and the current
+        # observation so we can reorder to match the SFT data layout.
+        prior_image_parts = []   # (label_text, image)
+        text_parts = []          # task description, memory, errors, etc.
+        current_obs_part = None  # (step_text, image) — always the last image entry
         images = []
 
         for _assistant_resp, user_response, observation in model_context.context:
             if observation is not None:
-                if isinstance(observation, np.ndarray):
-                    img = Image.fromarray(observation)
-                else:
-                    img = observation
-                images.append(img)
-
-                if user_response:
-                    prompt_parts.append(f"{user_response}\n<image>")
-                else:
-                    prompt_parts.append("<image>")
+                img = Image.fromarray(observation) if isinstance(observation, np.ndarray) else observation
+                # The last observation entry is the current step
+                if current_obs_part is not None:
+                    # Previous "current" was actually a prior — demote it
+                    prior_image_parts.append(current_obs_part)
+                current_obs_part = (user_response, img)
             elif user_response:
-                prompt_parts.append(user_response)
+                text_parts.append(user_response)
 
-        # Append the step instruction (matches what the model saw during SFT)
-        # Use forced answer instruction on the last step before max depth
+        # Build user content in SFT order:
+        # 1) Prior images with labels (newline-separated, matching SFT's \n join)
+        user_parts = []
+        for label, img in prior_image_parts:
+            images.append(img)
+            if label:
+                user_parts.append(f"{label}\n<image>")
+            else:
+                user_parts.append("<image>")
+
+        # 2) Text parts (task description, memory, errors) joined by \n\n
+        if text_parts:
+            user_parts.append("\n\n".join(text_parts))
+
+        # 3) Current observation
+        if current_obs_part is not None:
+            step_text, img = current_obs_part
+            images.append(img)
+            user_parts.append(f"{step_text}\n<image>")
+
+        # 4) Step instruction (format reminder for the model)
         max_actions = self.env.configuration.max_actions
         if self.num_steps + 1 >= max_actions:
             instruction = self._step_instructions["forced"]
         else:
             instruction = self._step_instructions["standard"]
-        prompt_parts.append(instruction)
+        user_parts.append(instruction)
 
-        user_text = "\n\n".join(prompt_parts)
+        user_text = "\n".join(user_parts)
         messages = [
             {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": user_text},
