@@ -848,17 +848,27 @@ class ObjectNavEnvAdapter:
 
     def get_trajectory_reward(self) -> float:
         reward = 0.0
+        # Primary reward: success
         if self.success:
             reward += 1.0
-        if self.initial_distance is not None and self.initial_distance > 0.1:
-            final = (
-                self.final_distance
-                if self.final_distance is not None
-                else self.initial_distance
-            )
-            improvement = (self.initial_distance - final) / self.initial_distance
-            reward += 0.3 * max(-1.0, min(1.0, improvement))
+        # Shaped reward: improvement in distance to target (normalized by initial distance)
+        # if self.initial_distance is not None and self.initial_distance > 0.1:
+        #     final = (
+        #         self.final_distance
+        #         if self.final_distance is not None
+        #         else self.initial_distance
+        #     )
+        #     improvement = (self.initial_distance - final) / self.initial_distance
+        #     reward += 0.3 * max(-1.0, min(1.0, improvement))
+        # Step penalty to encourage shorter trajectories
         reward -= 0.005 * self.num_steps
+
+        logging.info(
+            f"Trajectory reward: success={self.success}, "
+            f"initial_distance={self.initial_distance:.2f}, "
+            f"final_distance={self.final_distance:.2f}, "
+            f"num_steps={self.num_steps}, reward={reward:.3f}"
+        )
         return reward
 
     def get_ground_truth(self) -> str:

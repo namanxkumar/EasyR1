@@ -16,11 +16,8 @@ import json
 import logging
 import os
 import time
-
 import ray
 from omegaconf import OmegaConf
-
-
 from ..single_controller.ray import RayWorkerGroup
 from ..utils.tokenizer import get_processor, get_tokenizer
 from ..workers.fsdp_workers import FSDPWorker
@@ -30,7 +27,12 @@ from .data_loader import create_dataloader
 from .ray_trainer import RayPPOTrainer, ResourcePoolManager, Role
 
 # logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S", force=True)
-logging.basicConfig(level=logging.DEBUG, format="[%(asctime)s] %(levelname)s %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S", force=True)
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="[%(asctime)s] %(levelname)s %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    force=True,
+)
 
 # Quiet down noisy loggers from environment internals
 for _quiet in ("interactive_reasoning.objectnavtask.environment", "ai2thor"):
@@ -39,6 +41,7 @@ for _quiet in ("interactive_reasoning.objectnavtask.environment", "ai2thor"):
 # ---------------------------------------------------------------------------
 # Dummy dataloader for online env mode (training data comes from env rollouts)
 # ---------------------------------------------------------------------------
+
 
 class _DummyDataLoader:
     def __len__(self):
@@ -87,10 +90,7 @@ def _create_simulator_pools(mt_cfg, n_gpus: int):
             continue
 
         phys_id = physical_gpu_ids[gpu_idx]
-        logging.info(
-            f"Creating SimulatorPool on GPU {gpu_idx} "
-            f"(physical={phys_id}): {n_slots} slots"
-        )
+        logging.info(f"Creating SimulatorPool on GPU {gpu_idx} (physical={phys_id}): {n_slots} slots")
 
         pool = SimulatorPool.options(
             runtime_env={"env_vars": {"CUDA_VISIBLE_DEVICES": str(phys_id)}},
@@ -108,11 +108,8 @@ def _create_simulator_pools(mt_cfg, n_gpus: int):
 
     # Verify all pools initialized
     infos = ray.get([p.get_pool_info.remote() for p in pools])
-    total_slots = sum(info['total'] for info in infos)
-    logging.info(
-        f"Created {len(pools)} SimulatorPools across {n_gpus} GPUs, "
-        f"{total_slots} total slots"
-    )
+    total_slots = sum(info["total"] for info in infos)
+    logging.info(f"Created {len(pools)} SimulatorPools across {n_gpus} GPUs, {total_slots} total slots")
 
     return pools
 
@@ -127,12 +124,39 @@ def _create_multiturn_rollout(config: PPOConfig, tokenizer, processor):
     from interactive_reasoning.datasets.poliformer import PoliformerDataset
 
     data_root = mt_cfg.data_root
+
+    # Filter by difficulty (rooms_seen) if requested
+    filtered_indices = None
+    if mt_cfg.difficulties is not None:
+        from interactive_reasoning.configuration.default_utils import get_val_indices_mapping
+        import interactive_reasoning.configuration as _cfg_pkg
+
+        indices_file = os.path.join(
+            os.path.dirname(_cfg_pkg.__file__),
+            f"{mt_cfg.split}_indices_by_rooms_seen.json",
+        )
+        # Use val_percentage=1.0 to get all indices, then cap with max_per_difficulty
+        indices_mapping = get_val_indices_mapping(
+            val_percentage=1.0,
+            indices_file=indices_file,
+            difficulties=mt_cfg.difficulties,
+            max_per_difficulty=mt_cfg.max_per_difficulty,
+        )
+        filtered_indices = sorted(idx for bucket in indices_mapping.values() for idx in bucket)
+        logging.info(
+            f"Difficulty filter: rooms_seen={mt_cfg.difficulties}, "
+            f"max_per_difficulty={mt_cfg.max_per_difficulty} -> "
+            f"{len(filtered_indices)} episodes "
+            f"(buckets: { {k: len(v) for k, v in sorted(indices_mapping.items())} })"
+        )
+
     dataset = PoliformerDataset(
         houses_data_dir=os.path.join(data_root, "objaverse_houses/houses_2023_07_28"),
         objectnav_data_dir=os.path.join(data_root, "fifteen/ObjectNavType"),
         assets_data_dir=os.path.join(data_root, "objaverse_assets/2023_07_28"),
         split=mt_cfg.split,
         max_items=mt_cfg.max_items,
+        indices=filtered_indices,
     )
     logging.info(f"Loaded multiturn env dataset with {len(dataset)} episodes")
 
@@ -217,7 +241,10 @@ class Runner:
             train_dataloader = _DummyDataLoader()
             multiturn_rollout = _create_multiturn_rollout(config, tokenizer, processor)
             logging.info("Multiturn rollout created successfully")
-            import sys; sys.stdout.flush(); sys.stderr.flush()
+            import sys
+
+            sys.stdout.flush()
+            sys.stderr.flush()
             # Force max_steps since there's no real train dataloader to derive epochs from
             if config.trainer.max_steps is None:
                 config.trainer.max_steps = 100

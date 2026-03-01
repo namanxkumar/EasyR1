@@ -57,6 +57,10 @@ class MultiturnEnvConfig:
     """Number of AI2Thor simulator slots per SimulatorPool.
     Should be >= rollout_batch_size * n for full parallelism.
     Each slot creates one AI2Thor Controller (~300MB GPU memory)."""
+    difficulties: Optional[list[int]] = None
+    """rooms_seen levels to include (None = use all episodes)."""
+    max_per_difficulty: Optional[int] = None
+    """Cap the number of episodes per rooms_seen bucket."""
 
 
 @dataclass
