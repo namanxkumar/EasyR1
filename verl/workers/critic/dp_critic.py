@@ -21,7 +21,6 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
-from ray.experimental.tqdm_ray import tqdm
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
@@ -153,9 +152,6 @@ class DataParallelPPOCritic(BasePPOCritic):
             micro_batches = data.split(self.config.micro_batch_size_per_device_for_experience)
 
         values_lst = []
-        if self.rank == 0:
-            micro_batches = tqdm(micro_batches, desc="Compute values", position=1)
-
         for micro_batch in micro_batches:
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
             values = self._forward_micro_batch(model_inputs)
@@ -182,9 +178,6 @@ class DataParallelPPOCritic(BasePPOCritic):
 
         metrics = defaultdict(list)
         for _ in range(self.config.ppo_epochs):
-            if self.rank == 0:
-                mini_batches = tqdm(mini_batches, desc="Train mini-batches", position=1)
-
             for mini_batch in mini_batches:
                 total_response_tokens = torch.sum(mini_batch.batch["response_mask"])
                 dist.all_reduce(total_response_tokens, op=dist.ReduceOp.SUM)
@@ -195,9 +188,6 @@ class DataParallelPPOCritic(BasePPOCritic):
                     micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
                 else:
                     micro_batches = mini_batch.split(self.config.micro_batch_size_per_device_for_update)
-
-                if self.rank == 0:
-                    micro_batches = tqdm(micro_batches, desc="Update critic", position=2)
 
                 for micro_batch in micro_batches:
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}

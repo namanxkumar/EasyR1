@@ -516,10 +516,21 @@ class FSDPWorker(Worker):
             video_fps = data.meta_info["video_fps"]
             batch_multi_modal_inputs = []
             multi_modal_inputs_cache = {}  # avoid repeated processing for n > 1 samples
-            for index, multi_modal_data in zip(
+            for sample_idx, (index, multi_modal_data) in enumerate(zip(
                 data.non_tensor_batch["uid"], data.non_tensor_batch["multi_modal_data"]
-            ):  # process multi modal data per sample
-                if index not in multi_modal_inputs_cache:
+            )):  # process multi modal data per sample
+                if "pixel_values" in multi_modal_data:
+                    # Pre-computed from tokenization — use directly to avoid
+                    # image token mismatch from re-processing through a different path.
+                    # Do NOT use uid-based caching here: in multi-turn rollouts,
+                    # trajectories sharing the same uid can terminate at different
+                    # steps and have different numbers of images/pixel_values.
+                    multi_modal_inputs = {k: v for k, v in multi_modal_data.items() if v is not None}
+                    batch_multi_modal_inputs.append(multi_modal_inputs)
+                elif index not in multi_modal_inputs_cache:
+                    # Original path for backward compat (offline data with raw images).
+                    # uid-based caching is safe here since all samples with the same
+                    # uid share the same raw images.
                     images, videos = [], []
                     if "images" in multi_modal_data:
                         for image in multi_modal_data["images"]:
@@ -542,8 +553,9 @@ class FSDPWorker(Worker):
                         multi_modal_inputs = {}
 
                     multi_modal_inputs_cache[index] = multi_modal_inputs
-
-                batch_multi_modal_inputs.append(multi_modal_inputs_cache[index])
+                    batch_multi_modal_inputs.append(multi_modal_inputs_cache[index])
+                else:
+                    batch_multi_modal_inputs.append(multi_modal_inputs_cache[index])
 
             self._cache["uid"] = data.non_tensor_batch["uid"]
             self._cache["multi_modal_inputs"] = np.array(batch_multi_modal_inputs, dtype=object)

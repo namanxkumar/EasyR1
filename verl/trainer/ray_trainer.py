@@ -29,7 +29,7 @@ from typing import Any, Optional, Type
 import numpy as np
 import ray
 import torch
-from ray.experimental.tqdm_ray import tqdm
+
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import PreTrainedTokenizer, ProcessorMixin
 
@@ -583,12 +583,10 @@ class RayPPOTrainer:
         """
         self.logger = Tracker(loggers=self.config.trainer.logger, config=self.config.to_dict())
         self.global_step = 0
-        main_tqdm = tqdm(range(self.training_steps), desc="Running step", position=0)
         val_metrics: Optional[dict[str, Any]] = None
 
         # load checkpoint before doing anything
         self._load_checkpoint()
-        main_tqdm.update(self.global_step)
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
@@ -702,7 +700,7 @@ class RayPPOTrainer:
             metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, num_gpus=num_gpus))
 
             self.logger.log(data=metrics, step=self.global_step)
-            main_tqdm.update()
+
 
         # perform validation after training
         if self.val_reward_fn is not None:

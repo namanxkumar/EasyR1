@@ -27,7 +27,6 @@ import ray
 import torch
 from PIL import Image
 from tensordict import TensorDict
-from tqdm import tqdm
 from transformers import PreTrainedTokenizer, ProcessorMixin
 
 from ...protocol import DataProto, pad_dataproto_to_divisor, unpad_dataproto
@@ -40,6 +39,7 @@ if not logger.handlers:
     _handler = logging.StreamHandler()
     _handler.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
     logger.addHandler(_handler)
+    logger.propagate = False  # prevent duplicate output from root logger
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +136,32 @@ class MultiturnEnvRollout:
         self.max_pixels = max_pixels
         self.prior_image_scale = prior_image_scale
 
+    # ── controller lifecycle ────────────────────────────────────────
+
+    def warmup_controllers(self):
+        """Pre-create AI2Thor controllers on all SimulatorPools in parallel.
+
+        Called before rollout to ensure controllers are ready. Uses the first
+        dataset item's scene as a dummy scene for initialization. All pools
+        warm up concurrently since they're on different GPUs.
+        """
+        dummy_scene = self.env_factory.dataset[0]["scene_metadata"]
+        logger.info(f"Warming up AI2Thor controllers across {len(self.simulator_pools)} pools...")
+        t0 = time.time()
+        futures = [pool.warmup_controllers.remote(dummy_scene) for pool in self.simulator_pools]
+        counts = ray.get(futures)
+        total = sum(counts)
+        logger.info(
+            f"All AI2Thor controllers warmed up: {total} controllers "
+            f"across {len(self.simulator_pools)} pools in {time.time() - t0:.1f}s"
+        )
+
+    def destroy_controllers(self):
+        """Destroy all AI2Thor controllers to free GPU memory for training."""
+        logger.info("Destroying AI2Thor controllers to free GPU memory...")
+        ray.get([p.destroy_all.remote() for p in self.simulator_pools])
+        logger.info("All AI2Thor controllers destroyed")
+
     # ── public API ────────────────────────────────────────────────────
 
     def generate_trajectories(
@@ -159,6 +185,9 @@ class MultiturnEnvRollout:
         3. Step environments in parallel (Ray futures)
         """
         total = batch_size * n_trajectories
+
+        # Warm up AI2Thor controllers (destroyed after previous training step)
+        self.warmup_controllers()
 
         # Determine available simulator slots
         pool_infos = ray.get(
@@ -190,13 +219,6 @@ class MultiturnEnvRollout:
         all_rewards: list[float] = []
         all_ground_truths: list[str] = []
 
-        pbar = tqdm(
-            total=total,
-            desc="Collecting trajectories",
-            unit="traj",
-            dynamic_ncols=True,
-        )
-
         for chunk_idx in range(num_chunks):
             # Determine which groups (dataset items) are in this chunk
             group_start = chunk_idx * groups_per_chunk
@@ -214,7 +236,7 @@ class MultiturnEnvRollout:
                 trajectories, actor_rollout_ref_wg, config
             )
 
-            # ── Collect rewards ──
+            # ── Collect rewards (tolerant of broken envs) ──
             reward_futures = [
                 t.pool.get_trajectory_reward.remote(t.slot_id)
                 for t in trajectories
@@ -223,30 +245,42 @@ class MultiturnEnvRollout:
                 t.pool.get_ground_truth.remote(t.slot_id)
                 for t in trajectories
             ]
-            rewards = ray.get(reward_futures)
-            ground_truths = ray.get(gt_futures)
+            rewards = []
+            for i, f in enumerate(reward_futures):
+                try:
+                    rewards.append(ray.get(f))
+                except Exception as e:
+                    logger.warning(f"get_trajectory_reward failed for traj {i}: {e}, using 0.0")
+                    rewards.append(0.0)
+            ground_truths = []
+            for i, f in enumerate(gt_futures):
+                try:
+                    ground_truths.append(ray.get(f))
+                except Exception as e:
+                    logger.warning(f"get_ground_truth failed for traj {i}: {e}")
+                    ground_truths.append("{}")
 
             # ── Release environments ──
             release_futures = [
                 t.pool.release_env.remote(t.slot_id) for t in trajectories
             ]
-            ray.get(release_futures)
+            for f in release_futures:
+                try:
+                    ray.get(f)
+                except Exception as e:
+                    logger.warning(f"release_env failed: {e}")
 
             all_trajectories.extend(trajectories)
             all_rewards.extend(rewards)
             all_ground_truths.extend(ground_truths)
 
-            # Update progress bar with running stats
             chunk_avg_steps = float(np.mean([t.num_steps for t in trajectories]))
             chunk_avg_reward = float(np.mean(rewards))
-            pbar.update(chunk_n)
-            pbar.set_postfix(
-                chunk=f"{chunk_idx + 1}/{num_chunks}",
-                avg_steps=f"{chunk_avg_steps:.1f}",
-                avg_reward=f"{chunk_avg_reward:.2f}",
+            logger.info(
+                f"Chunk {chunk_idx + 1}/{num_chunks}: "
+                f"{chunk_n} trajectories, avg_steps={chunk_avg_steps:.1f}, "
+                f"avg_reward={chunk_avg_reward:.2f}"
             )
-
-        pbar.close()
 
         # ── Log stats ──
         avg_steps = float(np.mean([t.num_steps for t in all_trajectories]))
@@ -259,6 +293,9 @@ class MultiturnEnvRollout:
             f"{time.time() - t_start:.1f}s | "
             f"avg_steps={avg_steps:.1f} | avg_reward={avg_reward:.3f}"
         )
+
+        # ── Free GPU memory for training ──
+        self.destroy_controllers()
 
         # ── Build final DataProto batch from all chunks ──
         return self._build_final_batch(
@@ -290,15 +327,43 @@ class MultiturnEnvRollout:
                 )
                 for i in active_indices
             ]
-            prompt_results = ray.get(prompt_futures)
+            prompt_results_raw = ray.get(prompt_futures)
 
-            prompts = [r[0] for r in prompt_results]
-            images_list = [r[1] for r in prompt_results]
+            # Filter out trajectories whose prompt build failed
+            valid_local_indices = []
+            prompts = []
+            images_list = []
+            for local_i, global_i in enumerate(active_indices):
+                result = prompt_results_raw[local_i]
+                if isinstance(result, Exception):
+                    logger.warning(
+                        f"  [step {step}][traj {global_i}] build_prompt failed: {result}. "
+                        f"Terminating trajectory."
+                    )
+                    trajectories[global_i].terminated = True
+                    continue
+                try:
+                    prompts.append(result[0])
+                    images_list.append(result[1])
+                    valid_local_indices.append((local_i, global_i))
+                except Exception as e:
+                    logger.warning(
+                        f"  [step {step}][traj {global_i}] build_prompt result invalid: {e}. "
+                        f"Terminating trajectory."
+                    )
+                    trajectories[global_i].terminated = True
+
+            if not valid_local_indices:
+                logger.warning(f"  step {step}: all prompts failed, ending episode loop")
+                break
 
             # Cache prompt/images for final batch construction
-            for local_i, global_i in enumerate(active_indices):
-                trajectories[global_i].last_prompt = prompts[local_i]
-                trajectories[global_i].last_images = list(images_list[local_i])
+            for idx, (local_i, global_i) in enumerate(valid_local_indices):
+                trajectories[global_i].last_prompt = prompts[idx]
+                trajectories[global_i].last_images = list(images_list[idx])
+
+            # Re-map active_indices to only the valid ones
+            active_indices = [gi for _, gi in valid_local_indices]
 
             if logger.isEnabledFor(logging.DEBUG):
                 for local_i, global_i in enumerate(active_indices):
@@ -388,16 +453,36 @@ class MultiturnEnvRollout:
                 )
                 for local_i in range(len(active_indices))
             ]
-            step_results = ray.get(step_futures)
+
+            # Collect results one-by-one so a single env failure doesn't
+            # block the entire batch.
+            step_results = []
+            for f in step_futures:
+                try:
+                    step_results.append(ray.get(f))
+                except Exception as e:
+                    step_results.append(e)
 
             # Process step results
             n_terminated_this_step = 0
+            n_failed_this_step = 0
             for local_i, global_i in enumerate(active_indices):
                 traj = trajectories[global_i]
                 traj.step_responses.append(responses[local_i])
                 traj.num_steps += 1
 
-                reward, terminated, _info = step_results[local_i]
+                result = step_results[local_i]
+                if isinstance(result, Exception):
+                    logger.warning(
+                        f"  [step {step}][traj {global_i}] step_env FAILED: {result}. "
+                        f"Terminating trajectory."
+                    )
+                    traj.terminated = True
+                    n_terminated_this_step += 1
+                    n_failed_this_step += 1
+                    continue
+
+                reward, terminated, _info = result
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug(
                         f"  [step {step}][traj {global_i}] ENV STEP: "
@@ -410,8 +495,9 @@ class MultiturnEnvRollout:
 
             logger.info(
                 f"  step {step}: {len(active_indices)} active, "
-                f"{n_terminated_this_step} done, "
-                f"gen={t_gen_elapsed:.1f}s, "
+                f"{n_terminated_this_step} done"
+                + (f" ({n_failed_this_step} failed)" if n_failed_this_step else "")
+                + f", gen={t_gen_elapsed:.1f}s, "
                 f"total={time.time() - t_step:.1f}s"
             )
 
@@ -599,6 +685,52 @@ class MultiturnEnvRollout:
                 truncation="right",
             )
 
+            # After truncation, pixel_values/image_grid_thw may have more images
+            # than surviving <|image_pad|> tokens. Trim to only complete images.
+            image_grid_thw = model_inputs.get("image_grid_thw", None)
+            if image_grid_thw is not None and len(image_grid_thw) > 0:
+                image_token_id = self.processor.image_token_id
+                merge_size = self.processor.image_processor.merge_size
+                n_image_tokens = (input_ids == image_token_id).sum().item()
+
+                # features_per_image[i] = number of <|image_pad|> tokens for image i
+                features_per_image = []
+                patches_per_image = []
+                for thw in image_grid_thw:
+                    t, h, w = thw[0].item(), thw[1].item(), thw[2].item()
+                    features_per_image.append(t * (h // merge_size) * (w // merge_size))
+                    patches_per_image.append(t * h * w)
+
+                total_features = sum(features_per_image)
+                if n_image_tokens < total_features:
+                    # Find how many complete images survive truncation
+                    cumulative = 0
+                    n_keep = 0
+                    for f in features_per_image:
+                        if cumulative + f <= n_image_tokens:
+                            cumulative += f
+                            n_keep += 1
+                        else:
+                            break
+
+                    # Trim multi-modal tensors
+                    model_inputs["image_grid_thw"] = image_grid_thw[:n_keep]
+                    if n_keep > 0:
+                        total_patches_keep = sum(patches_per_image[:n_keep])
+                        model_inputs["pixel_values"] = model_inputs["pixel_values"][:total_patches_keep]
+                    else:
+                        model_inputs.pop("pixel_values", None)
+                        model_inputs.pop("image_grid_thw", None)
+
+                    # Mask out any leftover partial image tokens
+                    excess = n_image_tokens - cumulative
+                    if excess > 0:
+                        image_positions = (input_ids == image_token_id).nonzero(as_tuple=True)[0]
+                        partial_positions = image_positions[cumulative:]
+                        input_ids[partial_positions] = self.tokenizer.pad_token_id
+                        attention_mask[partial_positions] = 0
+                        position_ids[:, partial_positions] = 0
+
             # Raw prompt IDs for vLLM (text-only tokenization)
             raw_prompt_ids = self.tokenizer.encode(
                 text_prompt, add_special_tokens=False
@@ -610,7 +742,11 @@ class MultiturnEnvRollout:
             batch_attention_mask.append(attention_mask)
             batch_position_ids.append(position_ids)
             batch_raw_prompt_ids.append(raw_prompt_ids)
-            batch_multi_modal_data.append({"images": images})
+            # Store pre-computed multi-modal tensors (pixel_values, image_grid_thw)
+            # directly from the processor output. This avoids re-processing images
+            # during log-prob computation, which can produce mismatched grid dimensions.
+            multi_modal_inputs = {k: v for k, v in model_inputs.items() if isinstance(v, torch.Tensor)}
+            batch_multi_modal_data.append(multi_modal_inputs)
 
         return {
             "input_ids": torch.stack(batch_input_ids, dim=0),
@@ -702,6 +838,7 @@ class MultiturnEnvRollout:
         )
 
         # ── UIDs: same uid for all n trajectories of the same dataset item ──
+        # (Required for GRPO group normalization in compute_grpo_outcome_advantage.)
         n_items = bs // n_trajectories
         uids = []
         for _ in range(n_items):
@@ -784,6 +921,8 @@ class ObjectNavEnvAdapter:
         self.final_distance: float | None = None
         self.success: bool = False
         self.num_steps: int = 0
+        self.format_scores: list[float] = []
+        self.validity_scores: list[float] = []
 
     def reset(self) -> dict[str, Any]:
         self.env.reset()
@@ -798,6 +937,8 @@ class ObjectNavEnvAdapter:
         self.final_distance = self.initial_distance
         self.success = False
         self.num_steps = 0
+        self.format_scores = []
+        self.validity_scores = []
         return {"observation": initial_state.observation}
 
     def build_prompt(self) -> tuple[list[dict], list[Image.Image]]:
@@ -881,8 +1022,41 @@ class ObjectNavEnvAdapter:
         ]
         return messages, images
 
+    @staticmethod
+    def _check_format(response: str) -> float:
+        """Check if response has <think>...</think> <summary>...</summary> <action>."""
+        pattern = re.compile(
+            r"<think>.*?</think>\s*<summary>.*?</summary>\s*<(?:explore|answer).*?(?:/>|</(?:explore|answer)>)",
+            re.DOTALL,
+        )
+        return 1.0 if pattern.search(response) else 0.0
+
+    @staticmethod
+    def _check_validity(response: str) -> float:
+        """Check if response contains a parseable action with valid coordinates."""
+        # <answer>(x,y)</answer>
+        m = re.search(r"<answer>\s*\(?\s*(\d+)\s*,\s*(\d+)\s*\)?\s*</answer>", response)
+        if m:
+            x, y = int(m.group(1)), int(m.group(2))
+            return 1.0 if 0 <= x <= 1000 and 0 <= y <= 1000 else 0.0
+        # <explore>ground:(x,y)</explore>
+        m = re.search(r"<explore>\s*ground:\s*\(?\s*(\d+)\s*,\s*(\d+)\s*\)?\s*</explore>", response)
+        if m:
+            x, y = int(m.group(1)), int(m.group(2))
+            return 1.0 if 0 <= x <= 1000 and 0 <= y <= 1000 else 0.0
+        # <explore>direction:ANGLE</explore>
+        m = re.search(r"<explore>\s*direction:\s*(-?\d+)\s*</explore>", response)
+        if m:
+            angle = int(m.group(1))
+            return 1.0 if -180 <= angle <= 180 else 0.0
+        return 0.0
+
     def step(self, action_text: str) -> tuple[float, bool, dict[str, Any]]:
         self.num_steps += 1
+
+        # Score format and validity for this step
+        self.format_scores.append(self._check_format(action_text))
+        self.validity_scores.append(self._check_validity(action_text))
 
         # Parse summary
         summary = None
@@ -956,27 +1130,32 @@ class ObjectNavEnvAdapter:
         # Primary reward: success
         if self.success:
             reward += 1.0
-        # Shaped reward: improvement in distance to target (normalized by initial distance)
-        # if self.initial_distance is not None and self.initial_distance > 0.1:
-        #     final = (
-        #         self.final_distance
-        #         if self.final_distance is not None
-        #         else self.initial_distance
-        #     )
-        #     improvement = (self.initial_distance - final) / self.initial_distance
-        #     reward += 0.3 * max(-1.0, min(1.0, improvement))
+        # Format reward: average format score across steps (weight 0.1)
+        if self.format_scores:
+            avg_format = sum(self.format_scores) / len(self.format_scores)
+            reward += 0.1 * avg_format
+        # Validity reward: average validity score across steps (weight 0.15)
+        if self.validity_scores:
+            avg_validity = sum(self.validity_scores) / len(self.validity_scores)
+            reward += 0.15 * avg_validity
         # Step penalty to encourage shorter trajectories
         reward -= 0.005 * self.num_steps
 
+        avg_fmt = sum(self.format_scores) / len(self.format_scores) if self.format_scores else 0.0
+        avg_val = sum(self.validity_scores) / len(self.validity_scores) if self.validity_scores else 0.0
         logging.info(
             f"Trajectory reward: success={self.success}, "
             f"initial_distance={self.initial_distance:.2f}, "
             f"final_distance={self.final_distance:.2f}, "
-            f"num_steps={self.num_steps}, reward={reward:.3f}"
+            f"num_steps={self.num_steps}, "
+            f"avg_format={avg_fmt:.2f}, avg_validity={avg_val:.2f}, "
+            f"reward={reward:.3f}"
         )
         return reward
 
     def get_ground_truth(self) -> str:
+        avg_fmt = sum(self.format_scores) / len(self.format_scores) if self.format_scores else 0.0
+        avg_val = sum(self.validity_scores) / len(self.validity_scores) if self.validity_scores else 0.0
         return json.dumps(
             {
                 "trajectory_reward": self.get_trajectory_reward(),
@@ -984,6 +1163,8 @@ class ObjectNavEnvAdapter:
                 "num_steps": self.num_steps,
                 "initial_distance": self.initial_distance,
                 "final_distance": self.final_distance,
+                "avg_format": avg_fmt,
+                "avg_validity": avg_val,
             }
         )
 

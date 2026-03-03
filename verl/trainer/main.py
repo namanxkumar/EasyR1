@@ -179,14 +179,8 @@ def _create_multiturn_rollout(config: PPOConfig, tokenizer, processor):
     simulator_pools = _create_simulator_pools(mt_cfg, n_gpus=n_gpus)
     logging.info(f"Created {len(simulator_pools)} SimulatorPool(s) across {n_gpus} GPUs")
 
-    # Warm up AI2Thor controllers one pool at a time to avoid GPU memory stampede.
-    # Uses the first dataset item's scene as a dummy scene.
-    dummy_scene = dataset[0]["scene_metadata"]
-    logging.info("Warming up AI2Thor controllers (staggered, one pool at a time)...")
-    for i, pool in enumerate(simulator_pools):
-        count = ray.get(pool.warmup_controllers.remote(dummy_scene))
-        logging.info(f"  Pool {i}: warmed up {count} controller(s)")
-    logging.info("All AI2Thor controllers warmed up")
+    # Controllers are warmed up on-demand in generate_trajectories() and
+    # destroyed after each rollout to free GPU memory for training.
 
     return MultiturnEnvRollout(
         tokenizer=tokenizer,
