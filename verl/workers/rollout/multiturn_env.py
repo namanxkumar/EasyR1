@@ -1112,6 +1112,8 @@ class ObjectNavEnvAdapter:
 
         if isinstance(action, ObjectNavAnswerAction):
             action_type = "answer"
+            # ── DEBUG: save answer image with coordinate and bounding box ──
+            # self._debug_save_answer_image(action, new_state)
         elif isinstance(action, ObjectNavGroundNavigationAction):
             action_type = "explore_ground"
         elif isinstance(action, ObjectNavDirectionalAction):
@@ -1124,6 +1126,73 @@ class ObjectNavEnvAdapter:
             action_type = "unknown"
 
         return new_state.reward, terminated, {"action_type": action_type}
+
+    def _debug_save_answer_image(self, action, new_state) -> None:
+        """Save the observation image with the answer coordinate drawn on it."""
+        try:
+            from PIL import ImageDraw, ImageFont
+
+            debug_dir = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "..", "..", "..", "..", "..", "debug_answer_images",
+            )
+            debug_dir = os.path.normpath(debug_dir)
+            os.makedirs(debug_dir, exist_ok=True)
+
+            # Get the observation image (rendered at answer time)
+            obs = new_state.observation
+            if obs is None:
+                return
+            if isinstance(obs, np.ndarray):
+                img = Image.fromarray(obs)
+            elif isinstance(obs, Image.Image):
+                img = obs.copy()
+            else:
+                return
+
+            draw = ImageDraw.Draw(img)
+            x, y = action.coordinates  # already scaled coordinates
+
+            # Draw the predicted coordinate as a red crosshair
+            r = 12
+            draw.ellipse([x - r, y - r, x + r, y + r], outline="red", width=3)
+            draw.line([x - r, y, x + r, y], fill="red", width=2)
+            draw.line([x, y - r, x, y + r], fill="red", width=2)
+
+            # Try to get and draw the bounding box
+            bbox = None
+            try:
+                bbox = self.env._ai2thor.get_bounding_box_for_object(
+                    self.env.target_object_id
+                )
+            except Exception:
+                pass
+
+            if bbox is not None:
+                x1, y1, x2, y2 = bbox
+                draw.rectangle([x1, y1, x2, y2], outline="green", width=3)
+                # Also draw relaxed bbox
+                relax = self.env.configuration.bounding_box_relaxation
+                draw.rectangle(
+                    [x1 - relax, y1 - relax, x2 + relax, y2 + relax],
+                    outline="lime", width=1,
+                )
+
+            # Add text label
+            success = new_state.reward > 0
+            label = (
+                f"coord=({x},{y}) success={success} "
+                f"step={self.num_steps} target={self.env.target_object_id}"
+            )
+            if bbox:
+                label += f" bbox={bbox}"
+            draw.text((10, 10), label, fill="yellow")
+
+            fname = f"step{self.num_steps:03d}_{uuid.uuid4().hex[:6]}_{'HIT' if success else 'MISS'}.png"
+            img.save(os.path.join(debug_dir, fname))
+            logger.info(f"DEBUG: saved answer image to {os.path.join(debug_dir, fname)}")
+        except Exception as e:
+            logger.warning(f"DEBUG: failed to save answer image: {e}")
 
     def get_trajectory_reward(self) -> float:
         reward = 0.0
