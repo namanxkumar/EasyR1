@@ -221,6 +221,8 @@ class SimulatorPool:
                             "target_object_description", ""
                         ),
                         target_object_id=item_data["target_object_id"],
+                        target_object_synset=item_data.get("target_object_synset"),
+                        synset_to_object_ids=item_data.get("synset_to_object_ids"),
                         target_object_position=item_data["target_object_position"],
                         initial_agent_state=item_data.get("initial_metadata"),
                         existing_controller=cached_ctrl,
@@ -253,6 +255,8 @@ class SimulatorPool:
                         "target_object_description", ""
                     ),
                     target_object_id=item_data["target_object_id"],
+                    target_object_synset=item_data.get("target_object_synset"),
+                    synset_to_object_ids=item_data.get("synset_to_object_ids"),
                     target_object_position=item_data["target_object_position"],
                     initial_agent_state=item_data.get("initial_metadata"),
                 )
