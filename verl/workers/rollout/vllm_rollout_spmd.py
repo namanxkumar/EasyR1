@@ -186,10 +186,29 @@ class vLLMRollout(BaseRollout):
         non_tensor_batch = prompts.non_tensor_batch
         batch_raw_prompt_ids = non_tensor_batch.pop("raw_prompt_ids")
         batch_multi_modal_data = non_tensor_batch.pop("multi_modal_data", None)
+        # raw_images is a 1-D numpy object array of Python lists of PIL images,
+        # stored in non_tensor_batch so it gets properly sharded with the batch.
+        batch_raw_images = non_tensor_batch.pop("raw_images", None)
         if batch_size != len(batch_raw_prompt_ids):
             raise RuntimeError("vllm sharding manager is not work properly.")
 
-        if batch_multi_modal_data is not None:
+        if batch_raw_images is not None:
+            # Use raw PIL images for vLLM generation (multiturn env path)
+            vllm_inputs = []
+            for raw_prompt_ids, raw_images in zip(batch_raw_prompt_ids, batch_raw_images):
+                mm_data = _process_multi_modal_data(
+                    {"images": raw_images},
+                    prompts.meta_info["min_pixels"],
+                    prompts.meta_info["max_pixels"],
+                    prompts.meta_info["video_fps"],
+                )
+                vllm_inputs.append(
+                    {
+                        "prompt_token_ids": list(raw_prompt_ids),
+                        "multi_modal_data": mm_data,
+                    }
+                )
+        elif batch_multi_modal_data is not None:
             vllm_inputs = []
             for raw_prompt_ids, multi_modal_data in zip(batch_raw_prompt_ids, batch_multi_modal_data):
                 vllm_inputs.append(

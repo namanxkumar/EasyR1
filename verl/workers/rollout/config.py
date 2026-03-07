@@ -66,6 +66,8 @@ class MultiturnEnvConfig:
     """rooms_seen levels to include (None = use all episodes)."""
     max_per_difficulty: Optional[int] = None
     """Cap the number of episodes per rooms_seen bucket."""
+    override_indices: Optional[list[int]] = None
+    """Explicit dataset indices to use (bypasses difficulty filtering and max_items)."""
 
 
 @dataclass

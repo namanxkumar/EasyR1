@@ -601,6 +601,7 @@ class MultiturnEnvRollout:
         batch_position_ids = []
         batch_raw_prompt_ids = []
         batch_multi_modal_data = []
+        batch_raw_images = []
 
         for messages, images in zip(prompts, images_list):
             # Convert <image> placeholders in message content to HF format
@@ -629,20 +630,28 @@ class MultiturnEnvRollout:
             # Process images: downscale prior images (all but last) to match
             # the SFT training setup (prior_image_scale), then apply pixel
             # constraints via process_image.
+            # Keep raw_images (after downscale, before process_image) for vLLM
+            # generation — vLLM does its own image processing internally.
             if images:
+                raw_images = []
                 processed_images = []
                 for i, img in enumerate(images):
+                    # Ensure PIL Image (AI2Thor returns numpy arrays)
+                    if isinstance(img, np.ndarray):
+                        img = Image.fromarray(img)
+                    elif isinstance(img, str):
+                        img = Image.open(img)
                     if i < len(images) - 1 and self.prior_image_scale < 1.0:
                         # Downscale prior observation images
-                        if isinstance(img, str):
-                            img = Image.open(img)
                         new_w = max(1, int(img.width * self.prior_image_scale))
                         new_h = max(1, int(img.height * self.prior_image_scale))
                         img = img.resize((new_w, new_h), Image.LANCZOS)
+                    raw_images.append(img)
                     processed_images.append(
                         process_image(img, self.min_pixels, self.max_pixels)
                     )
             else:
+                raw_images = []
                 processed_images = None
 
             # Tokenize with processor
@@ -722,6 +731,15 @@ class MultiturnEnvRollout:
                         model_inputs.pop("pixel_values", None)
                         model_inputs.pop("image_grid_thw", None)
 
+                    if n_keep < len(image_grid_thw):
+                        logger.warning(
+                            f"Right-truncation dropped {len(image_grid_thw) - n_keep} "
+                            f"image(s) (kept {n_keep}/{len(image_grid_thw)}). "
+                            f"If the current observation was truncated, the model "
+                            f"is acting on stale prior observations. Consider "
+                            f"increasing max_prompt_length or reducing max_observations."
+                        )
+
                     # Mask out any leftover partial image tokens
                     excess = n_image_tokens - cumulative
                     if excess > 0:
@@ -737,16 +755,38 @@ class MultiturnEnvRollout:
             )
             if len(raw_prompt_ids) > self.max_prompt_length:
                 raw_prompt_ids = raw_prompt_ids[: self.max_prompt_length]
+                # After truncation, some image placeholders may have been cut.
+                # Trim raw_images to match surviving placeholders so vLLM
+                # doesn't get more images than placeholder tokens.
+                if raw_images:
+                    image_pad_token_id = self.processor.image_token_id
+                    n_surviving = sum(1 for tid in raw_prompt_ids if tid == image_pad_token_id)
+                    if n_surviving < len(raw_images):
+                        logger.warning(
+                            f"raw_prompt_ids truncation dropped {len(raw_images) - n_surviving} "
+                            f"image placeholder(s) (kept {n_surviving}/{len(raw_images)})"
+                        )
+                        raw_images = raw_images[:n_surviving]
 
             batch_input_ids.append(input_ids)
             batch_attention_mask.append(attention_mask)
             batch_position_ids.append(position_ids)
             batch_raw_prompt_ids.append(raw_prompt_ids)
-            # Store pre-computed multi-modal tensors (pixel_values, image_grid_thw)
-            # directly from the processor output. This avoids re-processing images
-            # during log-prob computation, which can produce mismatched grid dimensions.
+            # Pre-computed tensors for training-side log-prob computation
+            # (avoids re-processing which can produce mismatched grids).
             multi_modal_inputs = {k: v for k, v in model_inputs.items() if isinstance(v, torch.Tensor)}
             batch_multi_modal_data.append(multi_modal_inputs)
+            # Raw PIL images stored separately for vLLM generation (vLLM
+            # does its own image processing internally).
+            batch_raw_images.append(raw_images)
+
+        # Build a 1-D numpy object array for raw_images so it gets properly
+        # sharded by DataProto.chunk().  We must NOT use np.array(list, dtype=object)
+        # because when inner lists have equal lengths numpy creates a 2-D array
+        # which wraps individual PIL images in numpy scalars.
+        raw_images_arr = np.empty(len(batch_raw_images), dtype=object)
+        for i, imgs in enumerate(batch_raw_images):
+            raw_images_arr[i] = imgs
 
         return {
             "input_ids": torch.stack(batch_input_ids, dim=0),
@@ -754,6 +794,7 @@ class MultiturnEnvRollout:
             "position_ids": torch.stack(batch_position_ids, dim=0),
             "raw_prompt_ids": np.array(batch_raw_prompt_ids, dtype=object),
             "multi_modal_data": np.array(batch_multi_modal_data, dtype=object),
+            "raw_images": raw_images_arr,
         }
 
     def _build_final_batch(
@@ -1072,6 +1113,9 @@ class ObjectNavEnvAdapter:
         )
         action.response = action_text
 
+        # Capture the observation the agent was looking at when it chose this action
+        prev_observation = self.state_history.get_last_state().observation
+
         # Step the environment
         try:
             new_state = self.env.step(action)
@@ -1113,24 +1157,32 @@ class ObjectNavEnvAdapter:
         if isinstance(action, ObjectNavAnswerAction):
             action_type = "answer"
             # ── DEBUG: save answer image with coordinate and bounding box ──
-            # self._debug_save_answer_image(action, new_state)
+            # self._debug_save_answer_image(action, new_state, prev_observation)
         elif isinstance(action, ObjectNavGroundNavigationAction):
             action_type = "explore_ground"
+            # self._debug_save_explore_image(action, new_state, action_type, prev_observation)
         elif isinstance(action, ObjectNavDirectionalAction):
             action_type = "explore_direction"
+            # self._debug_save_explore_image(action, new_state, action_type, prev_observation)
         elif isinstance(action, ObjectNavStopAction):
             action_type = "stop"
+            # self._debug_save_explore_image(action, new_state, action_type, prev_observation)
         elif isinstance(action, ObjectNavInvalidAction):
             action_type = "invalid"
+            # self._debug_save_explore_image(action, new_state, action_type, prev_observation)
         else:
             action_type = "unknown"
 
         return new_state.reward, terminated, {"action_type": action_type}
 
-    def _debug_save_answer_image(self, action, new_state) -> None:
-        """Save the observation image with the answer coordinate drawn on it."""
+    def _debug_save_answer_image(self, action, new_state, prev_observation=None) -> None:
+        """Save the observation image with the answer coordinate drawn on it.
+
+        Uses *prev_observation* (the image the model saw when choosing this
+        action) so that coordinates align with the correct frame.
+        """
         try:
-            from PIL import ImageDraw, ImageFont
+            from PIL import ImageDraw
 
             debug_dir = os.path.join(
                 os.path.dirname(os.path.abspath(__file__)),
@@ -1139,8 +1191,8 @@ class ObjectNavEnvAdapter:
             debug_dir = os.path.normpath(debug_dir)
             os.makedirs(debug_dir, exist_ok=True)
 
-            # Get the observation image (rendered at answer time)
-            obs = new_state.observation
+            # Use the observation the model was looking at, not the post-action one
+            obs = prev_observation if prev_observation is not None else new_state.observation
             if obs is None:
                 return
             if isinstance(obs, np.ndarray):
@@ -1193,6 +1245,67 @@ class ObjectNavEnvAdapter:
             logger.info(f"DEBUG: saved answer image to {os.path.join(debug_dir, fname)}")
         except Exception as e:
             logger.warning(f"DEBUG: failed to save answer image: {e}")
+
+    def _debug_save_explore_image(self, action, new_state, action_type: str, prev_observation=None) -> None:
+        """Save exploration-step observation with explore-specific overlays.
+
+        Uses *prev_observation* (the image the model saw when choosing this
+        action) so that coordinates align with the correct frame.
+        """
+        try:
+            from PIL import ImageDraw
+
+            debug_dir = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "..", "..", "..", "..", "..", "debug_answer_images",
+            )
+            debug_dir = os.path.normpath(debug_dir)
+            os.makedirs(debug_dir, exist_ok=True)
+
+            # Use the observation the model was looking at, not the post-action one
+            obs = prev_observation if prev_observation is not None else new_state.observation
+            if obs is None:
+                return
+            if isinstance(obs, np.ndarray):
+                img = Image.fromarray(obs)
+            elif isinstance(obs, Image.Image):
+                img = obs.copy()
+            else:
+                return
+
+            draw = ImageDraw.Draw(img)
+
+            # Ground-point exploration has target image coordinates.
+            if hasattr(action, "target_coordinates") and action.target_coordinates is not None:
+                x, y = action.target_coordinates
+                r = 12
+                draw.ellipse([x - r, y - r, x + r, y + r], outline="cyan", width=3)
+                draw.line([x - r, y, x + r, y], fill="cyan", width=2)
+                draw.line([x, y - r, x, y + r], fill="cyan", width=2)
+
+            # Label includes action metadata (e.g., directional turn angle).
+            label = (
+                f"action={action_type} step={self.num_steps} reward={new_state.reward:.3f} "
+                f"target={self.env.target_object_id}"
+            )
+            if hasattr(action, "type"):
+                label += f" dir={action.type}"
+            if hasattr(action, "parameters") and action.parameters:
+                label += f" params={action.parameters}"
+            if hasattr(action, "target_coordinates") and action.target_coordinates is not None:
+                label += f" coord={action.target_coordinates}"
+
+            draw.text((10, 10), label, fill="yellow")
+
+            fname = (
+                f"EXPLORE_step{self.num_steps:03d}_{action_type}_{uuid.uuid4().hex[:6]}"
+                f"_{'TERM' if new_state.is_terminal else 'RUN'}.png"
+            )
+            out_path = os.path.join(debug_dir, fname)
+            img.save(out_path)
+            logger.info(f"DEBUG: saved explore image to {out_path}")
+        except Exception as e:
+            logger.warning(f"DEBUG: failed to save explore image: {e}")
 
     def get_trajectory_reward(self) -> float:
         reward = 0.0

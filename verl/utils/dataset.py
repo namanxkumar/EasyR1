@@ -59,6 +59,14 @@ def process_image(
         image = Image.open(BytesIO(image["bytes"]))
     elif isinstance(image, bytes):
         image = Image.open(BytesIO(image))
+    elif isinstance(image, np.ndarray):
+        if image.dtype != object:
+            image = Image.fromarray(image)
+        elif image.ndim == 0:
+            image = image.item()  # 0-d object array wrapping a PIL image
+        else:
+            # Should not reach here — caller should unpack object arrays
+            image = Image.fromarray(image.astype(np.uint8))
 
     image.load()  # avoid "Too many open files" errors
     if max_pixels is not None and (image.width * image.height) > max_pixels:

@@ -135,9 +135,12 @@ def _create_multiturn_rollout(config: PPOConfig, tokenizer, processor):
 
     data_root = mt_cfg.data_root
 
-    # Filter by difficulty (rooms_seen) if requested
+    # Override indices take priority over difficulty filtering
     filtered_indices = None
-    if mt_cfg.difficulties is not None:
+    if mt_cfg.override_indices is not None:
+        filtered_indices = sorted(mt_cfg.override_indices)
+        logging.info(f"Using override_indices: {len(filtered_indices)} episodes")
+    elif mt_cfg.difficulties is not None:
         from interactive_reasoning.configuration.default_utils import get_val_indices_mapping
         import interactive_reasoning.configuration as _cfg_pkg
 
