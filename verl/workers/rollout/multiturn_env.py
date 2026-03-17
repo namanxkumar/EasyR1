@@ -30,7 +30,8 @@ from .multiturn_tokenizer import TokenizerMixin
 
 # Re-export for backward compatibility (external imports use this module path)
 from .objectnav_adapter import ObjectNavEnvAdapter  # noqa: F401
-from .objectnav_factory import ObjectNavEnvFactory  # noqa: F401
+# NOTE: ObjectNavEnvFactory re-export is at the bottom of this file to avoid
+# circular import (objectnav_factory.py imports EnvFactory from this module).
 
 logger = logging.getLogger(__name__)
 # Ray workers don't inherit the driver's logging config, so set level from env var
@@ -651,3 +652,8 @@ class MultiturnEnvRollout(TokenizerMixin):
             )
 
         return trajectories
+
+
+# Deferred re-export — must come after EnvFactory is defined to break circular
+# import with objectnav_factory.py.
+from .objectnav_factory import ObjectNavEnvFactory  # noqa: F401, E402

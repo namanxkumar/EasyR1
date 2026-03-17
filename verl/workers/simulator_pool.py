@@ -35,7 +35,7 @@ import ray
 logger = logging.getLogger(__name__)
 
 
-@ray.remote(num_gpus=0, num_cpus=1)
+@ray.remote(num_gpus=0, num_cpus=4, max_concurrency=8)
 class SimulatorPool:
     """Manages multiple AI2Thor ObjectNavEnvAdapter instances on a single GPU.
 
@@ -206,6 +206,7 @@ class SimulatorPool:
                 render_height=self.render_height,
                 include_top_down_map=False,
                 capture_extra_info=False,
+                use_object_filter=True,
             )
 
             cached_ctrl = self._cached_controllers[slot_id]
