@@ -596,14 +596,22 @@ class MultiturnEnvRollout(TokenizerMixin):
         total = len(batch)
         if total == 0:
             return []
-        num_pools = len(self.simulator_pools)
 
-        # Round-robin pool assignment
+        # Query available slots per pool so we assign to pools that
+        # actually have capacity (round-robin can fail during refill
+        # when freed slots are concentrated on one pool).
+        pool_infos = ray.get(
+            [p.get_pool_info.remote() for p in self.simulator_pools]
+        )
+        pool_avail = [info["available"] for info in pool_infos]
+
         acquire_meta = []  # (pool, group_id, n_idx)
         acquire_futures = []
-        for i, (group_id, n_idx, item_data) in enumerate(batch):
-            pool_idx = i % num_pools
+        for group_id, n_idx, item_data in batch:
+            # Pick pool with the most available slots
+            pool_idx = max(range(len(self.simulator_pools)), key=lambda k: pool_avail[k])
             pool = self.simulator_pools[pool_idx]
+            pool_avail[pool_idx] -= 1
             acquire_meta.append((pool, group_id, n_idx))
             acquire_futures.append(pool.acquire_env.remote(item_data))
 
