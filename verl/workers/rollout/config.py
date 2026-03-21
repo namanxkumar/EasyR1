@@ -68,6 +68,15 @@ class MultiturnEnvConfig:
     """Cap the number of episodes per rooms_seen bucket."""
     override_indices: Optional[list[int]] = None
     """Explicit dataset indices to use (bypasses difficulty filtering and max_items)."""
+    recycle_controllers_every: int = 2
+    """Destroy and recreate AI2Thor controllers after this many episodes per slot.
+    Prevents GPU memory leaks from AI2Thor rendering (~40-50MB per step per controller).
+    Set to 0 to disable. Each recycle adds ~25-30s for that slot's next acquire but
+    frees ~2-3GB of leaked GPU memory."""
+    image_cache_dir: Optional[str] = "/scratch/namankum/image_cache"
+    """Directory for caching multi-modal tensors to disk between rollout and
+    training. Saves memory by evicting pixel_values after rollout and lazily
+    loading them at training time. Set to None to keep everything in memory."""
 
 
 @dataclass

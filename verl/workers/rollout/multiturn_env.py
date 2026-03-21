@@ -11,6 +11,7 @@ pipeline (KL, advantage, actor update).
 
 from __future__ import annotations
 
+import gc
 import logging
 import os
 import time
@@ -20,6 +21,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
 import numpy as np
+import psutil
 import ray
 import torch
 from PIL import Image
@@ -42,6 +44,25 @@ if not logger.handlers:
     _handler.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
     logger.addHandler(_handler)
     logger.propagate = False  # prevent duplicate output from root logger
+
+
+def _log_memory(context: str) -> None:
+    """Log driver-side CPU/RSS memory and GPU memory for debugging leaks."""
+    proc = psutil.Process()
+    rss_mb = proc.memory_info().rss / (1024 * 1024)
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,memory.used,memory.total",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+        gpu_info = result.stdout.strip() if result.returncode == 0 else "N/A"
+    except Exception:
+        gpu_info = "N/A"
+    logger.info(
+        f"[MEMORY] {context}: driver RSS={rss_mb:.0f}MB | GPU: {gpu_info}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +126,9 @@ class Trajectory:
     last_prompt: list[dict] | None = None
     last_images: list[Any] = field(default_factory=list)
 
+    # Eagerly-tokenized data (set after completion to free heavy PIL images)
+    _tokenized: dict | None = None
+
 
 # ---------------------------------------------------------------------------
 # MultiturnEnvRollout — the core class (parallelized via Ray SimulatorPools)
@@ -134,6 +158,7 @@ class MultiturnEnvRollout(TokenizerMixin):
         min_pixels: int = 102400,
         max_pixels: int = 409600,
         prior_image_scale: float = 0.5,
+        image_cache_dir: str | None = None,
     ):
         self.tokenizer = tokenizer
         self.processor = processor
@@ -145,6 +170,7 @@ class MultiturnEnvRollout(TokenizerMixin):
         self.min_pixels = min_pixels
         self.max_pixels = max_pixels
         self.prior_image_scale = prior_image_scale
+        self.image_cache_dir = image_cache_dir
 
     # ── controller lifecycle ────────────────────────────────────────
 
@@ -201,6 +227,13 @@ class MultiturnEnvRollout(TokenizerMixin):
 
         total = batch_size * n_trajectories
 
+        # Clean up image cache from the previous iteration
+        if self.image_cache_dir:
+            from ...utils.image_cache import cleanup_cache_dir
+            cleanup_cache_dir(self.image_cache_dir)
+
+        _log_memory("rollout START")
+
         # Warm up AI2Thor controllers (destroyed after previous training step)
         self.warmup_controllers()
 
@@ -241,6 +274,7 @@ class MultiturnEnvRollout(TokenizerMixin):
             f"Seeded {len(active_trajectories)} initial trajectories, "
             f"{len(pending_queue)} pending in queue"
         )
+        _log_memory("after seeding initial trajectories")
 
         # ── Continuous episode loop with dynamic slot reuse ──
         self._run_continuous_episode_loop(
@@ -273,13 +307,22 @@ class MultiturnEnvRollout(TokenizerMixin):
             f"avg_steps={avg_steps:.1f} | avg_reward={avg_reward:.3f}"
         )
 
+        _log_memory("rollout DONE (before destroy)")
+
         # ── Free GPU memory for training ──
         self.destroy_controllers()
+        _log_memory("rollout DONE (after destroy)")
 
         # ── Build final DataProto batch ──
-        return self._build_final_batch(
+        result = self._build_final_batch(
             all_trajectories, all_rewards, all_ground_truths, n_trajectories
         )
+
+        # Free all trajectory data now that it's been assembled into tensors
+        del all_trajectories, all_rewards, all_ground_truths
+        gc.collect()
+
+        return result
 
     def _run_continuous_episode_loop(
         self,
@@ -306,6 +349,7 @@ class MultiturnEnvRollout(TokenizerMixin):
             config: training config (for rollout temperature, etc.).
         """
         global_step = 0
+        _mem_log_interval = int(os.environ.get("MEM_LOG_INTERVAL", "1"))
 
         while True:
             # Force-terminate trajectories that hit max_depth
@@ -507,6 +551,9 @@ class MultiturnEnvRollout(TokenizerMixin):
                 + (f", pending={len(pending_queue)}" if pending_queue else "")
             )
 
+            if _mem_log_interval > 0 and global_step % _mem_log_interval == 0:
+                _log_memory(f"step {global_step} end ({len(active)} active, {len(all_trajectories)} total)")
+
             global_step += 1
 
     def _harvest_and_refill(
@@ -519,6 +566,8 @@ class MultiturnEnvRollout(TokenizerMixin):
         """Collect rewards for terminated trajectories, release their slots,
         and start new trajectories from the pending queue.
         """
+        _log_memory(f"harvest/refill start ({len(newly_done)} newly done)")
+        
         # ── Collect rewards and release slots in parallel ──
         reward_futures = [
             t.pool.get_trajectory_reward.remote(t.slot_id)
@@ -557,6 +606,42 @@ class MultiturnEnvRollout(TokenizerMixin):
             else:
                 t.ground_truth = gt_result
 
+        # ── Eagerly tokenize completed trajectories to free heavy PIL images ──
+        done_prompts = []
+        done_images = []
+        done_responses = []
+        for t in newly_done:
+            done_prompts.append(t.last_prompt or [{"role": "user", "content": ""}])
+            done_images.append(t.last_images or [])
+            done_responses.append(
+                t.step_responses[-1] if t.step_responses else ""
+            )
+
+        tokenized = self._tokenize_prompts(done_prompts, done_images)
+        for i, t in enumerate(newly_done):
+            multi_modal_data = tokenized["multi_modal_data"][i]
+            # Save multi-modal tensors to disk to free memory
+            if self.image_cache_dir and multi_modal_data:
+                from ...utils.image_cache import save_multi_modal_data
+                multi_modal_data = save_multi_modal_data(
+                    multi_modal_data, self.image_cache_dir
+                )
+            # .clone() to break tensor views — without this, each view
+            # keeps the entire stacked (batch, seq_len) tensor alive
+            t._tokenized = {
+                "input_ids": tokenized["input_ids"][i].clone(),
+                "attention_mask": tokenized["attention_mask"][i].clone(),
+                "position_ids": tokenized["position_ids"][i].clone(),
+                "multi_modal_data": multi_modal_data,
+                "response_text": done_responses[i],
+            }
+            # Free heavy data
+            t.last_prompt = None
+            t.last_images = []
+            t.step_responses = []
+
+        del done_prompts, done_images, done_responses, tokenized
+
         # ── Release slots ──
         release_futures = [
             t.pool.release_env.remote(t.slot_id) for t in newly_done
@@ -580,6 +665,12 @@ class MultiturnEnvRollout(TokenizerMixin):
                 f"  released {len(newly_done)} slots (queue empty, no refill)"
             )
 
+        # Free memory from completed trajectories
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        _log_memory(f"after harvest+refill ({len(newly_done)} done)")
+
     # ── private helpers ───────────────────────────────────────────────
 
     def _initialize_batch(
@@ -597,21 +688,27 @@ class MultiturnEnvRollout(TokenizerMixin):
         if total == 0:
             return []
 
-        # Query available slots per pool so we assign to pools that
-        # actually have capacity (round-robin can fail during refill
-        # when freed slots are concentrated on one pool).
-        pool_infos = ray.get(
-            [p.get_pool_info.remote() for p in self.simulator_pools]
+        num_pools = len(self.simulator_pools)
+
+        # Query available slot counts so we assign to pools with capacity
+        # (avoids the round-robin bug where a full pool gets assigned work)
+        avail_counts = ray.get(
+            [p.get_available_count.remote() for p in self.simulator_pools]
         )
-        pool_avail = [info["available"] for info in pool_infos]
 
         acquire_meta = []  # (pool, group_id, n_idx)
         acquire_futures = []
         for group_id, n_idx, item_data in batch:
-            # Pick pool with the most available slots
-            pool_idx = max(range(len(self.simulator_pools)), key=lambda k: pool_avail[k])
+            # Pick the pool with the most available slots
+            pool_idx = max(range(num_pools), key=lambda j: avail_counts[j])
+            if avail_counts[pool_idx] <= 0:
+                raise RuntimeError(
+                    f"No simulator slots available across any pool for "
+                    f"group={group_id}, n={n_idx}. "
+                    f"Increase num_simulators or reduce batch_size."
+                )
+            avail_counts[pool_idx] -= 1
             pool = self.simulator_pools[pool_idx]
-            pool_avail[pool_idx] -= 1
             acquire_meta.append((pool, group_id, n_idx))
             acquire_futures.append(pool.acquire_env.remote(item_data))
 

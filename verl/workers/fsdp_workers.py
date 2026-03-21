@@ -504,6 +504,8 @@ class FSDPWorker(Worker):
             offload_fsdp_optimizer(self.optimizer)
 
     def _process_multi_modal_inputs(self, data: DataProto):
+        from ..utils.image_cache import CACHE_PATH_KEY, load_multi_modal_data
+
         if "multi_modal_data" not in data.non_tensor_batch:
             return
 
@@ -519,7 +521,12 @@ class FSDPWorker(Worker):
             for sample_idx, (index, multi_modal_data) in enumerate(zip(
                 data.non_tensor_batch["uid"], data.non_tensor_batch["multi_modal_data"]
             )):  # process multi modal data per sample
-                if "pixel_values" in multi_modal_data:
+                if CACHE_PATH_KEY in multi_modal_data:
+                    # Lazily load pre-computed tensors saved to disk after rollout
+                    multi_modal_inputs = load_multi_modal_data(multi_modal_data)
+                    multi_modal_inputs = {k: v for k, v in multi_modal_inputs.items() if v is not None}
+                    batch_multi_modal_inputs.append(multi_modal_inputs)
+                elif "pixel_values" in multi_modal_data:
                     # Pre-computed from tokenization — use directly to avoid
                     # image token mismatch from re-processing through a different path.
                     # Do NOT use uid-based caching here: in multi-turn rollouts,

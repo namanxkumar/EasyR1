@@ -113,6 +113,7 @@ def _create_simulator_pools(mt_cfg, n_gpus: int):
             max_depth=mt_cfg.max_depth,
             coordinate_normalization_scale=coord_scale,
             max_observations=mt_cfg.max_observations,
+            recycle_controllers_every=mt_cfg.recycle_controllers_every,
         )
         pools.append(pool)
 
@@ -196,6 +197,7 @@ def _create_multiturn_rollout(config: PPOConfig, tokenizer, processor):
         min_pixels=config.data.min_pixels,
         max_pixels=config.data.max_pixels,
         prior_image_scale=mt_cfg.prior_image_scale,
+        image_cache_dir=mt_cfg.image_cache_dir,
     )
 
 
@@ -297,6 +299,14 @@ def main():
     ppo_config.deep_post_init()
 
     if not ray.is_initialized():
+        # Propagate cache/tmp dirs so Ray workers don't fill /tmp
+        _propagate_env_vars = [
+            "TORCHINDUCTOR_CACHE_DIR",
+            "TRITON_CACHE_DIR",
+            "TORCH_EXTENSIONS_DIR",
+            "TMPDIR",
+        ]
+        _extra_env = {k: os.environ[k] for k in _propagate_env_vars if k in os.environ}
         runtime_env = {
             "env_vars": {
                 "TOKENIZERS_PARALLELISM": "true",
@@ -307,6 +317,7 @@ def main():
                 "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:False",
                 "CUDA_DEVICE_MAX_CONNECTIONS": "1",
                 "VLLM_ALLREDUCE_USE_SYMM_MEM": "0",
+                **_extra_env,
             }
         }
         ray.init(runtime_env=runtime_env)

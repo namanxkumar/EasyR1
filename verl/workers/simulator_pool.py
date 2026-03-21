@@ -35,7 +35,7 @@ import ray
 logger = logging.getLogger(__name__)
 
 
-@ray.remote(num_gpus=0, num_cpus=4, max_concurrency=8)
+@ray.remote(num_gpus=0, num_cpus=1)
 class SimulatorPool:
     """Manages multiple AI2Thor ObjectNavEnvAdapter instances on a single GPU.
 
@@ -54,6 +54,7 @@ class SimulatorPool:
         max_depth: int = 30,
         coordinate_normalization_scale: float = 1.0,
         max_observations: int = 20,
+        recycle_controllers_every: int = 5,
     ):
         # Force AI2Thor to use the specified GPU (set before any CUDA init)
         os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
@@ -66,6 +67,7 @@ class SimulatorPool:
         self.max_depth = max_depth
         self.coordinate_normalization_scale = coordinate_normalization_scale
         self.max_observations = max_observations
+        self.recycle_controllers_every = recycle_controllers_every
 
         # Slot management
         self.slots: list[Optional[Any]] = [None] * num_slots
@@ -73,6 +75,9 @@ class SimulatorPool:
 
         # Cached bare AI2ThorController objects (reused across episodes)
         self._cached_controllers: list[Optional[Any]] = [None] * num_slots
+
+        # Episode count per slot (for controller recycling)
+        self._episodes_per_slot: list[int] = [0] * num_slots
 
         # Shared action proposer (parse-only, no VLM)
         from interactive_reasoning.objectnavtask.agent.action_proposer import (
@@ -91,7 +96,12 @@ class SimulatorPool:
         )
 
     def _log_gpu_memory(self, context: str):
-        """Log GPU memory usage for diagnostics."""
+        """Log GPU + process RSS memory usage for diagnostics."""
+        try:
+            import psutil
+            rss_mb = psutil.Process().memory_info().rss / (1024 * 1024)
+        except Exception:
+            rss_mb = -1
         try:
             import subprocess
             result = subprocess.run(
@@ -105,10 +115,14 @@ class SimulatorPool:
                     used, total, free = parts
                     logger.info(
                         f"[GPU {self.gpu_id}] {context}: "
-                        f"memory used={used}MB / total={total}MB (free={free}MB)"
+                        f"RSS={rss_mb:.0f}MB, "
+                        f"GPU used={used}MB / total={total}MB (free={free}MB)"
                     )
+                    return
         except Exception:
-            pass  # best-effort diagnostics
+            pass
+        if rss_mb >= 0:
+            logger.info(f"[GPU {self.gpu_id}] {context}: RSS={rss_mb:.0f}MB")
 
     # ── warmup ─────────────────────────────────────────────────────────
 
@@ -163,6 +177,10 @@ class SimulatorPool:
             "total": self.num_slots,
             "available": available,
         }
+
+    def get_available_count(self) -> int:
+        """Return the number of available (free) slots."""
+        return sum(self.slot_available)
 
     # ── lifecycle ─────────────────────────────────────────────────────
 
@@ -300,9 +318,60 @@ class SimulatorPool:
         """Release a slot, keeping the AI2Thor controller cached for reuse."""
         if slot_id < 0 or slot_id >= self.num_slots:
             return
-        # Clear the adapter but keep the cached controller
+        self._log_gpu_memory(f"release_env slot={slot_id} BEFORE")
+        adapter = self.slots[slot_id]
+        if adapter is not None:
+            # IMPORTANT: break controller -> env bound-method reference cycle.
+            #
+            # ObjectNavEnvironment sets AI2Thor restart callback to
+            # `env._restore_state_on_restart` (a bound method). If we cache the
+            # controller and drop only `self.slots[slot_id]`, the cached
+            # controller still strongly references the old env via this callback,
+            # keeping full episode state/history alive.
+            #
+            # Under dynamic slot reuse this causes memory to grow gradually as
+            # more unique slot/env instances are touched. We detach callback on
+            # release; the next acquire() will set a fresh callback on the new
+            # env instance.
+            try:
+                cached_ctrl = self._cached_controllers[slot_id]
+                if cached_ctrl is not None:
+                    cached_ctrl.set_restart_callback(None)
+            except Exception:
+                pass
+
+            # Best-effort cleanup of large per-episode Python objects.
+            try:
+                adapter.state_history = None
+            except Exception:
+                pass
+
+        # Periodically destroy and recreate controllers to free leaked GPU memory.
+        # Unity's rendering pipeline leaks ~40-50MB per step per controller;
+        # the only way to reclaim it is killing the Unity process.
+        self._episodes_per_slot[slot_id] += 1
+        if (
+            self.recycle_controllers_every > 0
+            and self._episodes_per_slot[slot_id] >= self.recycle_controllers_every
+        ):
+            ctrl = self._cached_controllers[slot_id]
+            if ctrl is not None:
+                logger.info(
+                    f"Recycling controller for slot {slot_id} on gpu {self.gpu_id} "
+                    f"after {self._episodes_per_slot[slot_id]} episodes"
+                )
+                try:
+                    ctrl.close_controller()
+                except Exception:
+                    pass
+                self._cached_controllers[slot_id] = None
+            self._episodes_per_slot[slot_id] = 0
+            gc.collect()
+
+        # Clear the adapter but keep the cached controller (if not recycled)
         self.slots[slot_id] = None
         self.slot_available[slot_id] = True
+        self._log_gpu_memory(f"release_env slot={slot_id} AFTER")
 
     def release_all(self) -> None:
         """Release all slots (keeps controllers cached)."""
@@ -315,9 +384,10 @@ class SimulatorPool:
         for i in range(self.num_slots):
             self.slots[i] = None
             self.slot_available[i] = True
-            if self._cached_controllers[i] is not None:
+            ctrl = self._cached_controllers[i]
+            if ctrl is not None:
                 try:
-                    self._cached_controllers[i].close_controller()
+                    ctrl.close_controller()
                 except Exception:
                     pass
                 self._cached_controllers[i] = None
@@ -374,9 +444,10 @@ class SimulatorPool:
                         f"Slot {i} on gpu {self.gpu_id} appears broken: {e}. "
                         f"Destroying cached controller."
                     )
-                    if self._cached_controllers[i] is not None:
+                    ctrl = self._cached_controllers[i]
+                    if ctrl is not None:
                         try:
-                            self._cached_controllers[i].close_controller()
+                            ctrl.close_controller()
                         except Exception:
                             pass
                         self._cached_controllers[i] = None

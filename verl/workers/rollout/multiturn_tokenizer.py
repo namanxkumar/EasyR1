@@ -277,23 +277,52 @@ class TokenizerMixin:
         For each trajectory, takes the last step's prompt (full history up to
         the final observation) and the model's last response. Tokenizes both
         and assembles into the standard format.
+
+        Trajectories may have been eagerly tokenized (``_tokenized`` is set)
+        to free heavy PIL images early. If so, the cached tensors are used
+        directly instead of re-tokenizing.
         """
-        prompt_texts = []
-        all_images = []
-        response_texts = []
+        # ── Separate eagerly-tokenized vs not-yet-tokenized trajectories ──
+        need_tokenization = [t for t in trajectories if t._tokenized is None]
 
-        for traj in trajectories:
-            prompt_texts.append(traj.last_prompt or [{"role": "user", "content": ""}])
-            all_images.append(traj.last_images or [])
-            response_texts.append(
-                traj.step_responses[-1] if traj.step_responses else ""
-            )
+        if need_tokenization:
+            prompt_texts = [
+                t.last_prompt or [{"role": "user", "content": ""}]
+                for t in need_tokenization
+            ]
+            images = [t.last_images or [] for t in need_tokenization]
+            tok = self._tokenize_prompts(prompt_texts, images)
+            image_cache_dir = getattr(self, "image_cache_dir", None)
+            for i, t in enumerate(need_tokenization):
+                multi_modal_data = tok["multi_modal_data"][i]
+                if image_cache_dir and multi_modal_data:
+                    from ...utils.image_cache import save_multi_modal_data
+                    multi_modal_data = save_multi_modal_data(
+                        multi_modal_data, image_cache_dir
+                    )
+                t._tokenized = {
+                    "input_ids": tok["input_ids"][i].clone(),
+                    "attention_mask": tok["attention_mask"][i].clone(),
+                    "position_ids": tok["position_ids"][i].clone(),
+                    "multi_modal_data": multi_modal_data,
+                    "response_text": (
+                        t.step_responses[-1] if t.step_responses else ""
+                    ),
+                }
+                # Free heavy data now that it's tokenized
+                t.last_prompt = None
+                t.last_images = []
+                t.step_responses = []
+            del prompt_texts, images, tok
 
-        # ── tokenize prompts (with images) ──
-        tokenized = self._tokenize_prompts(prompt_texts, all_images)
-        prompt_ids = tokenized["input_ids"]  # (bs, prompt_len)
-        prompt_mask = tokenized["attention_mask"]  # (bs, prompt_len)
-        prompt_pos = tokenized["position_ids"]  # (bs, 4, prompt_len)
+        # ── Assemble from per-trajectory tokenized data ──
+        prompt_ids = torch.stack([t._tokenized["input_ids"] for t in trajectories])
+        prompt_mask = torch.stack([t._tokenized["attention_mask"] for t in trajectories])
+        prompt_pos = torch.stack([t._tokenized["position_ids"] for t in trajectories])
+        response_texts = [t._tokenized["response_text"] for t in trajectories]
+        batch_multi_modal_data = np.array(
+            [t._tokenized["multi_modal_data"] for t in trajectories], dtype=object
+        )
 
         # ── tokenize responses ──
         max_resp_len = self.max_response_length
@@ -357,7 +386,7 @@ class TokenizerMixin:
         non_tensor = {
             "uid": np.array(uids, dtype=object),
             "ground_truth": np.array(ground_truths, dtype=object),
-            "multi_modal_data": tokenized["multi_modal_data"],
+            "multi_modal_data": batch_multi_modal_data,
         }
 
         # ── place trajectory reward at last response token ──
