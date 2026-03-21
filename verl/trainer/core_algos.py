@@ -381,7 +381,11 @@ def compute_rewards(
 
 
 def average_loss(
-    values: torch.Tensor, mask: torch.Tensor, mode: Literal["token", "seq"], eps: float = 1e-8
+    values: torch.Tensor,
+    mask: torch.Tensor,
+    mode: Literal["token", "seq", "traj"],
+    eps: float = 1e-8,
+    trajectory_id: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Average the policy loss.
 
@@ -390,11 +394,16 @@ def average_loss(
             shape: (bs, response_length)
         mask: `(torch.Tensor)`
             shape: (bs, response_length)
-        mode: `(Literal["token", "seq"])`
+        mode: `(Literal["token", "seq", "traj"])`
             "token": average the loss in the whole batch
             "seq": average the loss in each sequence then average the mean of the means
+            "traj": normalize by trajectory membership so each trajectory contributes
+                equally regardless of its number of steps, then average across
+                trajectories. Requires *trajectory_id*.
         eps: `(float)`
             epsilon value
+        trajectory_id: `(torch.Tensor)` optional
+            shape: (bs,) — integer trajectory IDs. Required when mode="traj".
 
     Returns:
         loss: `a scalar torch.Tensor`
@@ -403,6 +412,17 @@ def average_loss(
         return VF.masked_mean(values, mask, eps=eps)
     elif mode == "seq":
         return ((values * mask).sum(-1) / (mask.sum(-1) + eps)).mean()
+    elif mode == "traj":
+        assert trajectory_id is not None, "trajectory_id is required for mode='traj'"
+        # Per-sequence token-mean loss
+        seq_losses = (values * mask).sum(-1) / (mask.sum(-1) + eps)  # (bs,)
+        # Count how many rows (steps) belong to each trajectory
+        ids = trajectory_id.view(-1)
+        id_counts = torch.zeros(ids.max() + 1, device=ids.device, dtype=torch.float32)
+        id_counts.scatter_add_(0, ids.long(), torch.ones_like(ids, dtype=torch.float32))
+        per_row_weight = 1.0 / (id_counts[ids.long()] + eps)  # (bs,)
+        # Weighted mean: each trajectory contributes equally
+        return (seq_losses * per_row_weight).sum() / (per_row_weight.sum() + eps)
     else:
         raise NotImplementedError(f"Unknown mode: {mode}.")
 
@@ -418,7 +438,8 @@ def compute_policy_loss(
     tau_positive: float,
     tau_negative: float,
     loss_type: Literal["default", "gspo", "gspo_token", "cispo", "sapo"],
-    loss_avg_mode: Literal["token", "seq"],
+    loss_avg_mode: Literal["token", "seq", "traj"],
+    trajectory_id: torch.Tensor | None = None,
     **kwargs,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Compute the clipped policy objective and related metrics for PPO.
@@ -483,7 +504,7 @@ def compute_policy_loss(
     # pg metrics
     metrics = {"ppo_kl": -negative_approx_kl}
     # use negative log probs as an estimator of entropy loss
-    metrics["entropy_loss"] = average_loss(-log_probs, response_mask, mode=loss_avg_mode)
+    metrics["entropy_loss"] = average_loss(-log_probs, response_mask, mode=loss_avg_mode, trajectory_id=trajectory_id)
 
     if loss_type == "cispo":
         final_pg_loss = -advantages * log_probs * clipped_ratio.detach()
@@ -504,7 +525,7 @@ def compute_policy_loss(
         final_pg_loss = torch.where(advantages < 0, clipped_pg_loss_lower, clipped_pg_loss_higher)
         metrics["pg_clipfrac_lower"] = (clipped_pg_loss_higher > pg_loss3).float() * (advantages < 0).float()
 
-    final_pg_loss = average_loss(final_pg_loss, response_mask, mode=loss_avg_mode)
+    final_pg_loss = average_loss(final_pg_loss, response_mask, mode=loss_avg_mode, trajectory_id=trajectory_id)
     metrics = {k: VF.masked_mean(v, response_mask).detach().item() for k, v in metrics.items()}
     return final_pg_loss, metrics
 

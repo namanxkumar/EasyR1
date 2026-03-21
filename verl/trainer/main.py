@@ -198,6 +198,7 @@ def _create_multiturn_rollout(config: PPOConfig, tokenizer, processor):
         max_pixels=config.data.max_pixels,
         prior_image_scale=mt_cfg.prior_image_scale,
         image_cache_dir=mt_cfg.image_cache_dir,
+        trajectory_cache_dir=mt_cfg.trajectory_cache_dir,
     )
 
 

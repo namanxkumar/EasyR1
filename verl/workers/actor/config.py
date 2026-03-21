@@ -111,7 +111,9 @@ class ActorConfig:
     clip_ratio_dual: float = 3.0
     """constant C in dual-clip PPO, clips when advantage < -C"""
     loss_avg_mode: str = "token"
-    """loss average mode: `token`, `seq`"""
+    """loss average mode: `token`, `seq`, `traj` (normalizes by trajectory so
+    each trajectory contributes equally regardless of step count; requires
+    `trajectory_id` in the batch, set automatically by multi-turn rollout)"""
     loss_type: str = "default"
     """loss type: `default`, `gspo`, `cispo`"""
     ppo_epochs: int = 1

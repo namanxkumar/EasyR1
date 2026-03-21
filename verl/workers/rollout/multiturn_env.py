@@ -12,6 +12,7 @@ pipeline (KL, advantage, actor update).
 from __future__ import annotations
 
 import gc
+import json
 import logging
 import os
 import time
@@ -98,6 +99,25 @@ class EnvFactory(ABC):
 
 
 @dataclass
+class StepRecord:
+    """Lightweight per-step data for credit assignment.
+
+    Stores the prompt, full image path list, and response for a single step
+    so that all steps can be included in the training batch.
+
+    ``image_paths`` is the complete ordered list of images for this step's
+    prompt (prior observations + current).  Images accumulate across steps,
+    so step *i*'s paths are a superset of step *i-1*'s.  Only the genuinely
+    new images are written to disk at each step — prior paths are reused
+    from earlier records.
+    """
+
+    prompt: list[dict]         # chat-format messages used for this step
+    image_paths: list[str]     # ALL image paths for this step (prior + current)
+    response: str              # model's decoded response text
+
+
+@dataclass
 class Trajectory:
     """Tracks a single in-progress or completed trajectory.
 
@@ -113,8 +133,8 @@ class Trajectory:
     group_id: int = -1   # which dataset item / GRPO group
     n_idx: int = 0       # which trajectory within the group (0..n-1)
 
-    # Accumulated per-step data
-    step_responses: list[str] = field(default_factory=list)
+    # Per-step records for credit assignment (prompt, image_paths, response)
+    step_records: list[StepRecord] = field(default_factory=list)
     terminated: bool = False
     num_steps: int = 0
 
@@ -122,12 +142,8 @@ class Trajectory:
     reward: float | None = None
     ground_truth: str | None = None
 
-    # Cached prompt/images from the last generation step (for final batch)
-    last_prompt: list[dict] | None = None
-    last_images: list[Any] = field(default_factory=list)
-
-    # Eagerly-tokenized data (set after completion to free heavy PIL images)
-    _tokenized: dict | None = None
+    # Path to serialized step records on disk (set after harvest to free memory)
+    _cache_path: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -159,6 +175,7 @@ class MultiturnEnvRollout(TokenizerMixin):
         max_pixels: int = 409600,
         prior_image_scale: float = 0.5,
         image_cache_dir: str | None = None,
+        trajectory_cache_dir: str | None = None,
     ):
         self.tokenizer = tokenizer
         self.processor = processor
@@ -171,6 +188,7 @@ class MultiturnEnvRollout(TokenizerMixin):
         self.max_pixels = max_pixels
         self.prior_image_scale = prior_image_scale
         self.image_cache_dir = image_cache_dir
+        self.trajectory_cache_dir = trajectory_cache_dir
 
     # ── controller lifecycle ────────────────────────────────────────
 
@@ -227,10 +245,15 @@ class MultiturnEnvRollout(TokenizerMixin):
 
         total = batch_size * n_trajectories
 
-        # Clean up image cache from the previous iteration
+        # Clean up caches from the previous iteration
         if self.image_cache_dir:
             from ...utils.image_cache import cleanup_cache_dir
             cleanup_cache_dir(self.image_cache_dir)
+        if self.trajectory_cache_dir:
+            import shutil
+            if os.path.exists(self.trajectory_cache_dir):
+                shutil.rmtree(self.trajectory_cache_dir)
+            os.makedirs(self.trajectory_cache_dir, exist_ok=True)
 
         _log_memory("rollout START")
 
@@ -412,10 +435,11 @@ class MultiturnEnvRollout(TokenizerMixin):
                 global_step += 1
                 continue
 
-            # Cache prompt/images for final batch construction
+            # Temporarily hold prompt/images until after generation + env step,
+            # when we create a StepRecord with the response.
             for local_i, t in valid:
-                t.last_prompt = prompts[local_i]
-                t.last_images = list(images_list[local_i])
+                t._pending_prompt = prompts[local_i]
+                t._pending_images = list(images_list[local_i])
 
             if logger.isEnabledFor(logging.DEBUG):
                 for local_i, t in valid:
@@ -517,7 +541,24 @@ class MultiturnEnvRollout(TokenizerMixin):
             n_terminated_this_step = 0
             n_failed_this_step = 0
             for i, (_, t) in enumerate(valid):
-                t.step_responses.append(responses[i])
+                # Save per-step record for credit assignment.
+                # Reuse image paths from prior steps; only save genuinely
+                # new images to disk (each env step adds ~1 observation).
+                all_images = getattr(t, "_pending_images", [])
+                prior_paths = t.step_records[-1].image_paths if t.step_records else []
+                n_prior = len(prior_paths)
+                new_images = all_images[n_prior:]
+                new_paths = self._save_step_images(
+                    t, t.num_steps, new_images
+                )
+                full_paths = list(prior_paths) + new_paths
+                t.step_records.append(StepRecord(
+                    prompt=getattr(t, "_pending_prompt", []),
+                    image_paths=full_paths,
+                    response=responses[i],
+                ))
+                t._pending_prompt = None
+                t._pending_images = None
                 t.num_steps += 1
 
                 result = step_results[i]
@@ -606,41 +647,13 @@ class MultiturnEnvRollout(TokenizerMixin):
             else:
                 t.ground_truth = gt_result
 
-        # ── Eagerly tokenize completed trajectories to free heavy PIL images ──
-        done_prompts = []
-        done_images = []
-        done_responses = []
+        # ── Serialize step records to disk to free memory ──
+        trajectory_cache_dir = getattr(self, "trajectory_cache_dir", None)
         for t in newly_done:
-            done_prompts.append(t.last_prompt or [{"role": "user", "content": ""}])
-            done_images.append(t.last_images or [])
-            done_responses.append(
-                t.step_responses[-1] if t.step_responses else ""
-            )
-
-        tokenized = self._tokenize_prompts(done_prompts, done_images)
-        for i, t in enumerate(newly_done):
-            multi_modal_data = tokenized["multi_modal_data"][i]
-            # Save multi-modal tensors to disk to free memory
-            if self.image_cache_dir and multi_modal_data:
-                from ...utils.image_cache import save_multi_modal_data
-                multi_modal_data = save_multi_modal_data(
-                    multi_modal_data, self.image_cache_dir
-                )
-            # .clone() to break tensor views — without this, each view
-            # keeps the entire stacked (batch, seq_len) tensor alive
-            t._tokenized = {
-                "input_ids": tokenized["input_ids"][i].clone(),
-                "attention_mask": tokenized["attention_mask"][i].clone(),
-                "position_ids": tokenized["position_ids"][i].clone(),
-                "multi_modal_data": multi_modal_data,
-                "response_text": done_responses[i],
-            }
-            # Free heavy data
-            t.last_prompt = None
-            t.last_images = []
-            t.step_responses = []
-
-        del done_prompts, done_images, done_responses, tokenized
+            if trajectory_cache_dir and t.step_records:
+                cache_path = self._serialize_step_records(t, trajectory_cache_dir)
+                t._cache_path = cache_path
+                t.step_records = []  # free memory
 
         # ── Release slots ──
         release_futures = [
@@ -672,6 +685,64 @@ class MultiturnEnvRollout(TokenizerMixin):
         _log_memory(f"after harvest+refill ({len(newly_done)} done)")
 
     # ── private helpers ───────────────────────────────────────────────
+
+    def _save_step_images(
+        self, trajectory: Trajectory, step_idx: int, images: list[Any]
+    ) -> list[str]:
+        """Save per-step PIL images to disk and return their file paths."""
+        cache_dir = self.trajectory_cache_dir
+        if not cache_dir or not images:
+            return []
+
+        traj_dir = os.path.join(cache_dir, trajectory.episode_id)
+        os.makedirs(traj_dir, exist_ok=True)
+
+        paths = []
+        for img_idx, img in enumerate(images):
+            if isinstance(img, np.ndarray):
+                img = Image.fromarray(img)
+            path = os.path.join(traj_dir, f"step{step_idx}_img{img_idx}.jpg")
+            img.save(path)
+            paths.append(path)
+        return paths
+
+    @staticmethod
+    def _serialize_step_records(
+        trajectory: Trajectory, cache_dir: str
+    ) -> str:
+        """Serialize a trajectory's step records to a JSONL file on disk."""
+        traj_dir = os.path.join(cache_dir, trajectory.episode_id)
+        os.makedirs(traj_dir, exist_ok=True)
+        cache_path = os.path.join(traj_dir, "steps.jsonl")
+        with open(cache_path, "w") as f:
+            for i, rec in enumerate(trajectory.step_records):
+                json.dump(
+                    {
+                        "step": i,
+                        "prompt": rec.prompt,
+                        "image_paths": rec.image_paths,
+                        "response": rec.response,
+                    },
+                    f,
+                )
+                f.write("\n")
+        return cache_path
+
+    @staticmethod
+    def _load_step_records(cache_path: str) -> list[StepRecord]:
+        """Load step records from a JSONL file."""
+        records = []
+        with open(cache_path) as f:
+            for line in f:
+                d = json.loads(line)
+                records.append(
+                    StepRecord(
+                        prompt=d["prompt"],
+                        image_paths=d["image_paths"],
+                        response=d["response"],
+                    )
+                )
+        return records
 
     def _initialize_batch(
         self, batch: list[tuple[int, int, dict]]

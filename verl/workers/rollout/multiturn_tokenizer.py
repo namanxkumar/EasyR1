@@ -272,59 +272,96 @@ class TokenizerMixin:
         ground_truths: list[str],
         n_trajectories: int,
     ) -> DataProto:
-        """Construct the DataProto that the rest of the GRPO pipeline expects.
+        """Construct a DataProto with **all** steps from every trajectory.
 
-        For each trajectory, takes the last step's prompt (full history up to
-        the final observation) and the model's last response. Tokenizes both
-        and assembles into the standard format.
+        Each (prompt_i, response_i) pair from every trajectory becomes a
+        separate training sample.  All steps within a trajectory receive
+        the same trajectory-level reward.  GRPO groups all N trajectories
+        of the same dataset item under a shared UID.
 
-        Trajectories may have been eagerly tokenized (``_tokenized`` is set)
-        to free heavy PIL images early. If so, the cached tensors are used
-        directly instead of re-tokenizing.
+        A ``trajectory_id`` tensor is included so that ``average_loss``
+        with ``mode="traj"`` can normalize each trajectory's contribution
+        regardless of its number of steps.
         """
-        # ── Separate eagerly-tokenized vs not-yet-tokenized trajectories ──
-        need_tokenization = [t for t in trajectories if t._tokenized is None]
+        from .multiturn_env import StepRecord
 
-        if need_tokenization:
-            prompt_texts = [
-                t.last_prompt or [{"role": "user", "content": ""}]
-                for t in need_tokenization
-            ]
-            images = [t.last_images or [] for t in need_tokenization]
-            tok = self._tokenize_prompts(prompt_texts, images)
-            image_cache_dir = getattr(self, "image_cache_dir", None)
-            for i, t in enumerate(need_tokenization):
-                multi_modal_data = tok["multi_modal_data"][i]
-                if image_cache_dir and multi_modal_data:
-                    from ...utils.image_cache import save_multi_modal_data
-                    multi_modal_data = save_multi_modal_data(
-                        multi_modal_data, image_cache_dir
-                    )
-                t._tokenized = {
-                    "input_ids": tok["input_ids"][i].clone(),
-                    "attention_mask": tok["attention_mask"][i].clone(),
-                    "position_ids": tok["position_ids"][i].clone(),
-                    "multi_modal_data": multi_modal_data,
-                    "response_text": (
-                        t.step_responses[-1] if t.step_responses else ""
-                    ),
-                }
-                # Free heavy data now that it's tokenized
-                t.last_prompt = None
-                t.last_images = []
-                t.step_responses = []
-            del prompt_texts, images, tok
+        # ── Materialise step records (may be on disk or in memory) ──
+        all_step_records: list[list[StepRecord]] = []
+        for t in trajectories:
+            if t._cache_path is not None:
+                from .multiturn_env import MultiturnEnvRollout
+                records = MultiturnEnvRollout._load_step_records(t._cache_path)
+            elif t.step_records:
+                records = t.step_records
+            else:
+                # Trajectory with no step records (shouldn't happen, but be safe)
+                records = []
+            all_step_records.append(records)
 
-        # ── Assemble from per-trajectory tokenized data ──
-        prompt_ids = torch.stack([t._tokenized["input_ids"] for t in trajectories])
-        prompt_mask = torch.stack([t._tokenized["attention_mask"] for t in trajectories])
-        prompt_pos = torch.stack([t._tokenized["position_ids"] for t in trajectories])
-        response_texts = [t._tokenized["response_text"] for t in trajectories]
-        batch_multi_modal_data = np.array(
-            [t._tokenized["multi_modal_data"] for t in trajectories], dtype=object
+        # ── Flatten: one row per (trajectory, step) ──
+        flat_prompts: list[list[dict]] = []
+        flat_images: list[list[Image.Image]] = []
+        flat_responses: list[str] = []
+        flat_rewards: list[float] = []
+        flat_ground_truths: list[str] = []
+        flat_group_ids: list[int] = []       # dataset item index (for GRPO UID)
+        flat_trajectory_ids: list[int] = []  # unique per trajectory (for loss norm)
+
+        for traj_idx, (t, records) in enumerate(zip(trajectories, all_step_records)):
+            reward = rewards[traj_idx]
+            gt = ground_truths[traj_idx]
+            for rec in records:
+                flat_prompts.append(rec.prompt)
+                # Load images from paths (or empty list)
+                imgs = []
+                for p in rec.image_paths:
+                    try:
+                        imgs.append(Image.open(p))
+                    except Exception:
+                        logger.warning(f"Failed to load step image: {p}")
+                flat_images.append(imgs)
+                flat_responses.append(rec.response)
+                flat_rewards.append(reward)
+                flat_ground_truths.append(gt)
+                flat_group_ids.append(t.group_id)
+                flat_trajectory_ids.append(traj_idx)
+
+        bs = len(flat_prompts)
+        if bs == 0:
+            raise RuntimeError(
+                "No step records found across any trajectory. "
+                "This likely means all trajectories had 0 steps."
+            )
+
+        logger.info(
+            f"Building multi-step batch: {len(trajectories)} trajectories "
+            f"expanded to {bs} (prompt, response) training samples"
         )
 
-        # ── tokenize responses ──
+        # ── Tokenize all step prompts ──
+        tok = self._tokenize_prompts(flat_prompts, flat_images)
+        prompt_ids = tok["input_ids"]      # (bs, max_prompt_length)
+        prompt_mask = tok["attention_mask"]  # (bs, max_prompt_length)
+        prompt_pos = tok["position_ids"]    # (bs, 4, max_prompt_length) for mrope
+
+        # Save multi-modal data to disk to free memory
+        image_cache_dir = getattr(self, "image_cache_dir", None)
+        mmd_array = tok.get("multi_modal_data", None)
+        batch_multi_modal_data = []
+        for i in range(bs):
+            multi_modal_data = mmd_array[i] if mmd_array is not None else None
+            if image_cache_dir and multi_modal_data:
+                from ...utils.image_cache import save_multi_modal_data
+                multi_modal_data = save_multi_modal_data(
+                    multi_modal_data, image_cache_dir
+                )
+            batch_multi_modal_data.append(multi_modal_data)
+        batch_multi_modal_data = np.array(batch_multi_modal_data, dtype=object)
+
+        # Free loaded images
+        del flat_images, tok
+
+        # ── Tokenize responses ──
         max_resp_len = self.max_response_length
         eos_id = self.tokenizer.eos_token_id
         pad_id = self.tokenizer.pad_token_id
@@ -332,7 +369,7 @@ class TokenizerMixin:
         batch_resp_ids = []
         batch_resp_mask = []
 
-        for resp_text in response_texts:
+        for resp_text in flat_responses:
             ids = self.tokenizer.encode(resp_text, add_special_tokens=False)
             ids.append(eos_id)
             if len(ids) > max_resp_len:
@@ -347,8 +384,7 @@ class TokenizerMixin:
         response_ids_t = torch.tensor(batch_resp_ids, dtype=prompt_ids.dtype)
         response_mask_t = torch.tensor(batch_resp_mask, dtype=prompt_mask.dtype)
 
-        # ── concatenate prompt + response ──
-        bs = prompt_ids.shape[0]
+        # ── Concatenate prompt + response ──
         full_ids = torch.cat([prompt_ids, response_ids_t], dim=-1)
         full_mask = torch.cat([prompt_mask, response_mask_t], dim=-1)
 
@@ -362,7 +398,7 @@ class TokenizerMixin:
         resp_pos = prompt_pos[..., -1:] + delta
         full_pos = torch.cat([prompt_pos, resp_pos], dim=-1)
 
-        # ── build TensorDict ──
+        # ── Build TensorDict ──
         td = TensorDict(
             {
                 "prompts": prompt_ids,
@@ -371,29 +407,31 @@ class TokenizerMixin:
                 "attention_mask": full_mask,
                 "response_mask": response_mask_t,
                 "position_ids": full_pos,
+                "trajectory_id": torch.tensor(flat_trajectory_ids, dtype=torch.long),
             },
             batch_size=bs,
         )
 
-        # ── UIDs: same uid for all n trajectories of the same dataset item ──
-        # (Required for GRPO group normalization in compute_grpo_outcome_advantage.)
-        n_items = bs // n_trajectories
+        # ── UIDs: same uid for all N trajectories of the same dataset item ──
+        # All steps from all trajectories of the same GRPO group share a UID.
+        group_to_uid: dict[int, str] = {}
         uids = []
-        for _ in range(n_items):
-            uid = str(uuid.uuid4())
-            uids.extend([uid] * n_trajectories)
+        for gid in flat_group_ids:
+            if gid not in group_to_uid:
+                group_to_uid[gid] = str(uuid.uuid4())
+            uids.append(group_to_uid[gid])
 
         non_tensor = {
             "uid": np.array(uids, dtype=object),
-            "ground_truth": np.array(ground_truths, dtype=object),
+            "ground_truth": np.array(flat_ground_truths, dtype=object),
             "multi_modal_data": batch_multi_modal_data,
         }
 
-        # ── place trajectory reward at last response token ──
+        # ── Place trajectory reward at last response token of each step ──
         token_level_scores = torch.zeros_like(
             response_ids_t, dtype=torch.float32
         )
-        for i, reward in enumerate(rewards):
+        for i, reward in enumerate(flat_rewards):
             rlen = int(response_mask_t[i].sum().item())
             if rlen > 0:
                 token_level_scores[i, rlen - 1] = reward

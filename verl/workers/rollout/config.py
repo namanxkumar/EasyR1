@@ -77,6 +77,10 @@ class MultiturnEnvConfig:
     """Directory for caching multi-modal tensors to disk between rollout and
     training. Saves memory by evicting pixel_values after rollout and lazily
     loading them at training time. Set to None to keep everything in memory."""
+    trajectory_cache_dir: Optional[str] = "/scratch/namankum/trajectory_cache"
+    """Directory for caching per-step trajectory data (prompts, image paths,
+    responses) to disk during rollout. Keeps memory bounded when training on
+    all steps of each trajectory. Set to None to keep in memory."""
 
 
 @dataclass

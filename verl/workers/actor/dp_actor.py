@@ -218,6 +218,8 @@ class DataParallelPPOActor(BasePPOActor):
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid slient error
         select_keys = ["input_ids", "attention_mask", "position_ids", "responses", "response_mask"]
         select_keys.extend(["old_log_probs", "ref_log_probs", "advantages"])
+        if "trajectory_id" in data.batch:
+            select_keys.append("trajectory_id")
         non_tensor_select_keys = ["multi_modal_inputs"]
 
         # Split to make minibatch iterator for updating the actor
@@ -258,6 +260,7 @@ class DataParallelPPOActor(BasePPOActor):
                         tau_negative=self.config.tau_negative,
                         loss_type=self.config.loss_type,
                         loss_avg_mode=self.config.loss_avg_mode,
+                        trajectory_id=model_inputs.get("trajectory_id", None),
                     )
                     if self.config.use_kl_loss and "ref_log_probs" in model_inputs:
                         ref_log_probs = model_inputs["ref_log_probs"]
@@ -267,7 +270,10 @@ class DataParallelPPOActor(BasePPOActor):
                             ref_log_probs=ref_log_probs,
                             kl_penalty=self.config.kl_penalty,
                         )
-                        kl_loss = average_loss(kld, response_mask, mode=self.config.loss_avg_mode)
+                        kl_loss = average_loss(
+                            kld, response_mask, mode=self.config.loss_avg_mode,
+                            trajectory_id=model_inputs.get("trajectory_id", None),
+                        )
                         loss = pg_loss + kl_loss * self.config.kl_coef
                         metrics["actor/kl_loss"] = kl_loss.detach().item()
                         metrics["actor/kl_coef"] = self.config.kl_coef
