@@ -46,9 +46,11 @@ if not logger.handlers:
     logger.addHandler(_handler)
     logger.propagate = False  # prevent duplicate output from root logger
 
+_log_vllm_metrics_warned = False
+
 
 def _log_memory(context: str) -> None:
-    """Log driver-side CPU/RSS memory and GPU memory for debugging leaks."""
+    """Log driver-side CPU/RSS memory and per-GPU memory for debugging leaks."""
     proc = psutil.Process()
     rss_mb = proc.memory_info().rss / (1024 * 1024)
     try:
@@ -58,12 +60,77 @@ def _log_memory(context: str) -> None:
              "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=5,
         )
-        gpu_info = result.stdout.strip() if result.returncode == 0 else "N/A"
+        if result.returncode == 0:
+            gpu_lines = []
+            for line in result.stdout.strip().split("\n"):
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) == 3:
+                    idx, used, total = parts
+                    gpu_lines.append(f"GPU{idx}={used}/{total}MB")
+            gpu_info = ", ".join(gpu_lines) if gpu_lines else "N/A"
+        else:
+            gpu_info = "N/A"
     except Exception:
         gpu_info = "N/A"
     logger.info(
-        f"[MEMORY] {context}: driver RSS={rss_mb:.0f}MB | GPU: {gpu_info}"
+        f"[MEMORY] {context}: driver RSS={rss_mb:.0f}MB | {gpu_info}"
     )
+
+
+def _log_vllm_metrics(
+    context: str, actor_rollout_ref_wg, *, prev_metrics: list[dict] | None = None
+) -> list[dict]:
+    """Query vLLM engine metrics from all rollout workers and log them.
+
+    Returns the current per-rank metrics list so callers can pass it as
+    ``prev_metrics`` on the next call to show deltas.
+    """
+    try:
+        all_metrics = actor_rollout_ref_wg.execute_all_sync("get_vllm_metrics")
+    except Exception:
+        # Silently skip — the worker group may not expose get_vllm_metrics
+        # (e.g. WorkerDict wrapping ActorHandles). Only log once.
+        global _log_vllm_metrics_warned
+        if not _log_vllm_metrics_warned:
+            logger.debug("[vLLM-METRICS] get_vllm_metrics not available on worker group, skipping")
+            _log_vllm_metrics_warned = True
+        return prev_metrics or []
+
+    if not all_metrics:
+        return prev_metrics or []
+
+    lines = [f"[vLLM-METRICS] {context}:"]
+    for i, m in enumerate(all_metrics):
+        if not isinstance(m, dict) or not m:
+            continue
+        rank = m.get("rank", i)
+        alloc = m.get("gpu_allocated_mb", 0)
+        reserved = m.get("gpu_reserved_mb", 0)
+        kv_usage = m.get("vllm:kv_cache_usage_perc", None)
+        prefix_hit = m.get("vllm:prefix_cache_hits", None)
+
+        parts = [f"rank{rank}: alloc={alloc:.0f}MB, reserved={reserved:.0f}MB"]
+        if kv_usage is not None:
+            parts.append(f"kv_cache={kv_usage:.1f}%")
+        if prefix_hit is not None:
+            parts.append(f"prefix_cache_hits={prefix_hit}")
+
+        # Show delta from previous if available
+        if prev_metrics and i < len(prev_metrics):
+            prev = prev_metrics[i]
+            d_alloc = alloc - prev.get("gpu_allocated_mb", alloc)
+            d_reserved = reserved - prev.get("gpu_reserved_mb", reserved)
+            if abs(d_alloc) > 1 or abs(d_reserved) > 1:
+                parts.append(f"delta(alloc={d_alloc:+.0f}MB, reserved={d_reserved:+.0f}MB)")
+            if kv_usage is not None:
+                prev_kv = prev.get("vllm:kv_cache_usage_perc")
+                if prev_kv is not None:
+                    parts.append(f"delta(kv={kv_usage - prev_kv:+.1f}%)")
+
+        lines.append("  " + ", ".join(parts))
+
+    logger.info("\n".join(lines))
+    return all_metrics
 
 
 # ---------------------------------------------------------------------------
@@ -110,11 +177,19 @@ class StepRecord:
     so step *i*'s paths are a superset of step *i-1*'s.  Only the genuinely
     new images are written to disk at each step — prior paths are reused
     from earlier records.
+
+    ``tensor_cache_path`` (optional) points to a ``.pt`` file containing
+    pre-tokenized tensors (input_ids, attention_mask, position_ids,
+    multi_modal_inputs) saved during rollout.  When present,
+    ``_build_final_batch`` loads these directly instead of re-tokenizing —
+    avoiding redundant image processing and mrope computation.
     """
 
     prompt: list[dict]         # chat-format messages used for this step
     image_paths: list[str]     # ALL image paths for this step (prior + current)
     response: str              # model's decoded response text
+    tensor_cache_path: str | None = None  # path to cached tokenized tensors
+    old_log_probs: list[float] | None = None  # per-token log probs from vLLM generation
 
 
 @dataclass
@@ -299,6 +374,9 @@ class MultiturnEnvRollout(TokenizerMixin):
         )
         _log_memory("after seeding initial trajectories")
 
+        # Baseline vLLM metrics before first generation step
+        _log_vllm_metrics("pre-rollout baseline", actor_rollout_ref_wg)
+
         # ── Continuous episode loop with dynamic slot reuse ──
         self._run_continuous_episode_loop(
             active_trajectories, all_trajectories,
@@ -373,6 +451,8 @@ class MultiturnEnvRollout(TokenizerMixin):
         """
         global_step = 0
         _mem_log_interval = int(os.environ.get("MEM_LOG_INTERVAL", "1"))
+        _gc_interval = int(os.environ.get("GC_INTERVAL", "5"))
+        _prev_vllm_metrics: list[dict] | None = None
 
         while True:
             # Force-terminate trajectories that hit max_depth
@@ -402,6 +482,7 @@ class MultiturnEnvRollout(TokenizerMixin):
                 t.pool.build_prompt.remote(t.slot_id) for t in active
             ]
             prompt_results_raw = ray.get(prompt_futures)
+            del prompt_futures
 
             # Filter out trajectories whose prompt build failed
             valid = []          # (local_idx, trajectory)
@@ -470,8 +551,27 @@ class MultiturnEnvRollout(TokenizerMixin):
                     logger.debug("\n".join(lines))
 
             # ── Tokenize into DataProto format ──
+            # Generate cache paths so tokenized tensors (input_ids,
+            # attention_mask, position_ids, multi_modal_inputs) are saved
+            # to disk per step.  _build_final_batch loads these directly,
+            # avoiding a full re-tokenization of all ~1500 step-level samples.
             t_gen = time.time()
-            tokenized = self._tokenize_prompts(prompts, images_list, for_generation=True)
+            _cache_paths: list[str] | None = None
+            if self.trajectory_cache_dir:
+                _cache_paths = []
+                for _local_i, _t in valid:
+                    _tdir = os.path.join(
+                        self.trajectory_cache_dir, _t.episode_id
+                    )
+                    os.makedirs(_tdir, exist_ok=True)
+                    _cache_paths.append(
+                        os.path.join(_tdir, f"step_{_t.num_steps}_tokens.pt")
+                    )
+            tokenized = self._tokenize_prompts(
+                prompts, images_list,
+                for_generation=True,
+                tensor_cache_paths=_cache_paths,
+            )
             meta_info = {
                 "eos_token_id": self.tokenizer.eos_token_id,
                 "min_pixels": self.min_pixels,
@@ -486,14 +586,14 @@ class MultiturnEnvRollout(TokenizerMixin):
             )
 
             # ── Generate model responses via vLLM ──
-            if logger.isEnabledFor(logging.DEBUG):
-                prompt_lens = [len(ids) for ids in tokenized["raw_prompt_ids"]]
-                logger.debug(
-                    f"  [step {global_step}] TOKENIZED: "
-                    f"n_prompts={len(prompt_lens)}, "
-                    f"token_counts={prompt_lens}, "
-                    f"input_ids_shape={tokenized['input_ids'].shape}"
-                )
+            prompt_lens = [len(ids) for ids in tokenized["raw_prompt_ids"]]
+            n_images_per_prompt = [len(imgs) for imgs in images_list]
+            logger.info(
+                f"  [step {global_step}] GEN: n_prompts={len(prompt_lens)}, "
+                f"tokens(min={min(prompt_lens)}, max={max(prompt_lens)}, "
+                f"total={sum(prompt_lens)}), "
+                f"images(min={min(n_images_per_prompt)}, max={max(n_images_per_prompt)})"
+            )
 
             gen_batch, pad_size = pad_dataproto_to_divisor(
                 gen_batch, actor_rollout_ref_wg.world_size
@@ -502,9 +602,17 @@ class MultiturnEnvRollout(TokenizerMixin):
             gen_output = unpad_dataproto(gen_output, pad_size)
             t_gen_elapsed = time.time() - t_gen
 
+            # Log vLLM engine metrics (KV cache, GPU memory) after generation
+            _prev_vllm_metrics = _log_vllm_metrics(
+                f"step {global_step} post-gen", actor_rollout_ref_wg,
+                prev_metrics=_prev_vllm_metrics,
+            )
+
             # Decode responses
             response_ids = gen_output.batch["responses"]
             response_mask = gen_output.batch["response_mask"]
+            # Extract per-token log probs collected during vLLM generation
+            step_log_probs = gen_output.batch.get("old_log_probs", None)
             responses = []
             for i in range(len(valid)):
                 length = int(response_mask[i].sum().item())
@@ -521,6 +629,8 @@ class MultiturnEnvRollout(TokenizerMixin):
                         f"RESPONSE ({resp_len} tokens):\n"
                         f'  [ASSISTANT] Text: "{responses[i]}"'
                     )
+
+            del gen_output, gen_batch, tokenized, response_ids, response_mask
 
             # ── Step environments in parallel via Ray ──
             step_futures = [
@@ -556,6 +666,8 @@ class MultiturnEnvRollout(TokenizerMixin):
                     prompt=getattr(t, "_pending_prompt", []),
                     image_paths=full_paths,
                     response=responses[i],
+                    tensor_cache_path=_cache_paths[i] if _cache_paths else None,
+                    old_log_probs=step_log_probs[i].tolist() if step_log_probs is not None else None,
                 ))
                 t._pending_prompt = None
                 t._pending_images = None
@@ -592,6 +704,12 @@ class MultiturnEnvRollout(TokenizerMixin):
                 + (f", pending={len(pending_queue)}" if pending_queue else "")
             )
 
+            del prompt_results_raw, prompts, images_list, valid
+            del step_futures, step_results, responses
+            if _gc_interval > 0 and global_step % _gc_interval == 0:
+                gc.collect()
+                torch.cuda.empty_cache()
+
             if _mem_log_interval > 0 and global_step % _mem_log_interval == 0:
                 _log_memory(f"step {global_step} end ({len(active)} active, {len(all_trajectories)} total)")
 
@@ -608,7 +726,7 @@ class MultiturnEnvRollout(TokenizerMixin):
         and start new trajectories from the pending queue.
         """
         _log_memory(f"harvest/refill start ({len(newly_done)} newly done)")
-        
+
         # ── Collect rewards and release slots in parallel ──
         reward_futures = [
             t.pool.get_trajectory_reward.remote(t.slot_id)
@@ -722,6 +840,8 @@ class MultiturnEnvRollout(TokenizerMixin):
                         "prompt": rec.prompt,
                         "image_paths": rec.image_paths,
                         "response": rec.response,
+                        "tensor_cache_path": rec.tensor_cache_path,
+                        "old_log_probs": rec.old_log_probs,
                     },
                     f,
                 )
@@ -740,6 +860,8 @@ class MultiturnEnvRollout(TokenizerMixin):
                         prompt=d["prompt"],
                         image_paths=d["image_paths"],
                         response=d["response"],
+                        tensor_cache_path=d.get("tensor_cache_path"),
+                        old_log_probs=d.get("old_log_probs"),
                     )
                 )
         return records

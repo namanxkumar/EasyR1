@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import os
 from contextlib import contextmanager
 from typing import Any, Optional, Union
@@ -31,6 +32,8 @@ from ...utils.torch_dtypes import PrecisionType
 from ...utils.vllm_utils import VLLMHijack
 from .base import BaseRollout
 from .config import RolloutConfig
+
+logger = logging.getLogger(__name__)
 
 
 def _repeat_interleave(value: Union[torch.Tensor, np.ndarray], repeats: int) -> Union[torch.Tensor, np.ndarray]:
@@ -149,6 +152,7 @@ class vLLMRollout(BaseRollout):
             "max_tokens": config.response_length,
             "detokenize": False,
             "logit_bias": _get_logit_bias(processor),
+            "logprobs": 1,  # return per-token log probs (used as old_log_probs)
         }
         default_sampling_params = SamplingParams()
         for key in config.to_dict().keys():
@@ -247,6 +251,31 @@ class vLLMRollout(BaseRollout):
                 response_ids, self.pad_token_id, max_length=self.config.response_length
             ).to(input_ids.device)
 
+            # Extract per-token log probs of sampled tokens (free from vLLM
+            # generation).  These serve as old_log_probs for GRPO, avoiding
+            # an expensive FSDP recomputation pass.
+            response_log_probs = None
+            if self.sampling_params.logprobs is not None and self.sampling_params.logprobs > 0:
+                max_resp_len = self.config.response_length
+                log_probs_list = []
+                for completion in completions:
+                    for output in completion.outputs:
+                        token_log_probs = []
+                        if output.logprobs:
+                            for pos, logprob_dict in enumerate(output.logprobs):
+                                token_id = output.token_ids[pos]
+                                if token_id in logprob_dict:
+                                    token_log_probs.append(logprob_dict[token_id].logprob)
+                                else:
+                                    token_log_probs.append(0.0)
+                        # Pad to max_response_length (right-pad with 0.0)
+                        n = len(token_log_probs)
+                        token_log_probs += [0.0] * (max_resp_len - n)
+                        log_probs_list.append(token_log_probs[:max_resp_len])
+                response_log_probs = torch.tensor(
+                    log_probs_list, dtype=torch.float32, device=input_ids.device
+                )
+
             if self.sampling_params.n > 1:
                 batch_size = batch_size * self.sampling_params.n
                 input_ids = _repeat_interleave(input_ids, self.sampling_params.n)
@@ -273,20 +302,45 @@ class vLLMRollout(BaseRollout):
         attention_mask = torch.cat((attention_mask, response_mask), dim=-1)
 
         # all the tp ranks should contain the same data here. data in all ranks are valid
-        batch = TensorDict(
-            {
-                "prompts": input_ids,
-                "responses": response_ids,
-                "input_ids": sequence_ids,  # here input_ids become the whole sentences
-                "attention_mask": attention_mask,
-                "response_mask": response_mask,
-                "position_ids": position_ids,
-            },
-            batch_size=batch_size,
-        )
+        batch_dict = {
+            "prompts": input_ids,
+            "responses": response_ids,
+            "input_ids": sequence_ids,  # here input_ids become the whole sentences
+            "attention_mask": attention_mask,
+            "response_mask": response_mask,
+            "position_ids": position_ids,
+        }
+        if response_log_probs is not None:
+            batch_dict["old_log_probs"] = response_log_probs
+        batch = TensorDict(batch_dict, batch_size=batch_size)
         if batch_multi_modal_data is not None:
             non_tensor_batch = {"multi_modal_data": batch_multi_modal_data}
         else:
             non_tensor_batch = {}
 
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch, meta_info=prompts.meta_info)
+
+    def get_vllm_metrics(self) -> dict:
+        """Return a snapshot of vLLM engine metrics (KV cache usage, etc.).
+
+        Works with both V0 and V1 engines.  Returns an empty dict if metrics
+        are unavailable (e.g. stats collection is disabled).
+        """
+        metrics: dict = {"rank": self.rank}
+        try:
+            raw = self.inference_engine.get_metrics()
+            for m in raw:
+                # Flatten prometheus Metric/Gauge/Counter into simple key-value
+                name = getattr(m, "name", None)
+                value = getattr(m, "value", getattr(m, "values", None))
+                if name and value is not None:
+                    metrics[name] = value
+        except Exception as e:
+            logger.debug(f"Failed to collect vLLM metrics: {e}")
+
+        # GPU memory from PyTorch (always available)
+        if torch.cuda.is_available():
+            dev = torch.cuda.current_device()
+            metrics["gpu_allocated_mb"] = torch.cuda.memory_allocated(dev) / (1024 * 1024)
+            metrics["gpu_reserved_mb"] = torch.cuda.memory_reserved(dev) / (1024 * 1024)
+        return metrics

@@ -572,7 +572,11 @@ class DataProto:
         ]
 
     def split(self, split_size: int) -> list["DataProto"]:
-        """Split the batch among dim=0 into chunks. The meta_info is passed to each DataProto after split.
+        """Split the batch among dim=0 into chunks of ``split_size``.
+
+        The last chunk may be smaller than ``split_size`` when the batch
+        length is not evenly divisible.  The meta_info is passed to each
+        DataProto after split.
 
         Args:
             split_size (int): the size of each split
@@ -580,11 +584,12 @@ class DataProto:
         Returns:
             List[DataProto]: a list of DataProto after splitting
         """
-        assert len(self) % split_size == 0, (
-            f"only support equal split. Got size of DataProto {len(self)} and split {split_size}."
-        )
-        chunks = len(self) // split_size
-        return self.chunk(chunks)
+        n = len(self)
+        results = []
+        for start in range(0, n, split_size):
+            end = min(start + split_size, n)
+            results.append(self[start:end])
+        return results
 
     @staticmethod
     def concat(data: list["DataProto"]) -> "DataProto":

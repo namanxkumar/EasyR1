@@ -68,7 +68,7 @@ class MultiturnEnvConfig:
     """Cap the number of episodes per rooms_seen bucket."""
     override_indices: Optional[list[int]] = None
     """Explicit dataset indices to use (bypasses difficulty filtering and max_items)."""
-    recycle_controllers_every: int = 2
+    recycle_controllers_every: int = 0
     """Destroy and recreate AI2Thor controllers after this many episodes per slot.
     Prevents GPU memory leaks from AI2Thor rendering (~40-50MB per step per controller).
     Set to 0 to disable. Each recycle adds ~25-30s for that slot's next acquire but
@@ -100,7 +100,7 @@ class RolloutConfig:
     tensor_parallel_size: int = 2
     max_model_len: Optional[int] = None
     max_num_batched_tokens: int = 8192
-    disable_log_stats: bool = True
+    disable_log_stats: bool = False  # enable stats for KV cache usage monitoring
     disable_tqdm: bool = False
     val_override_config: dict[str, Any] = field(default_factory=dict)
     # below are auto keys

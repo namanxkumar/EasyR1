@@ -574,6 +574,11 @@ class FSDPWorker(Worker):
         assert self._has_actor
 
         self._process_multi_modal_inputs(data)
+        # Defragment CUDA memory before the backward pass — when
+        # compute_log_probs is skipped (vLLM log probs path), there is no
+        # prior forward pass to warm up the caching allocator, which can cause
+        # OOM from fragmentation during loss.backward().
+        torch.cuda.empty_cache()
         data = data.to(torch.cuda.current_device())
 
         if self._use_param_offload:
@@ -623,12 +628,36 @@ class FSDPWorker(Worker):
         return output
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def clear_multi_modal_cache(self):
+        """Free cached multi-modal inputs and GPU memory between training steps.
+
+        Clears:
+        1. CPU pixel_values cache (self._cache) to free CPU RAM before vLLM
+           weight loading.
+        2. PyTorch CUDA cached blocks from the training phase (gradients,
+           activations, batch tensors). Without this, ~8GB of cached blocks
+           accumulate across steps and cause OOM during the next rollout.
+        """
+        import gc
+
+        self._cache.clear()
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def prepare_rollout_engine(self):
         self.rollout_sharding_manager.load_vllm_and_sync_weights()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def release_rollout_engine(self):
         self.rollout_sharding_manager.offload_vllm()
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def get_vllm_metrics(self):
+        """Return vLLM engine metrics (KV cache usage, GPU memory) from this rank."""
+        if self._has_rollout and hasattr(self.rollout, "get_vllm_metrics"):
+            return self.rollout.get_vllm_metrics()
+        return {}
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def generate_sequences(self, prompts: DataProto):

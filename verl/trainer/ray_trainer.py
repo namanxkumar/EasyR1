@@ -211,7 +211,9 @@ class RayPPOTrainer:
         if config.algorithm.adv_estimator not in list(AdvantageEstimator):
             raise NotImplementedError(f"Unknown advantage estimator: {config.algorithm.adv_estimator}.")
 
-        if config.data.rollout_batch_size % config.worker.actor.global_batch_size != 0:
+        if not config.worker.multiturn_env.enabled and (
+            config.data.rollout_batch_size % config.worker.actor.global_batch_size != 0
+        ):
             raise ValueError("Rollout batch size must be divisible by actor global batch size.")
 
         if (
@@ -608,6 +610,26 @@ class RayPPOTrainer:
                     batch = self._make_batch_data(metrics=metrics)
                     self.actor_rollout_ref_wg.release_rollout_engine()
 
+                logging.info(
+                    f"[step {self.global_step}] gen done: "
+                    f"batch_size={len(batch)}, "
+                    f"gen={timing_raw.get('gen', 0):.1f}s"
+                )
+
+                # Downsample batch to be divisible by world_size (multi-step
+                # expansion produces a variable number of rows).  We trim
+                # rather than pad to avoid duplicate rows biasing GRPO
+                # advantage computation.
+                world_size = self.actor_rollout_ref_wg.world_size
+                remainder = len(batch) % world_size
+                if remainder != 0:
+                    drop_n = remainder
+                    logging.info(
+                        f"Trimming {drop_n} rows from batch ({len(batch)} -> "
+                        f"{len(batch) - drop_n}) for world_size={world_size} divisibility"
+                    )
+                    batch = batch[:len(batch) - drop_n]
+
                 # balance the number of valid tokens on each dp rank.
                 # NOTE: this breaks the order of data inside the batch.
                 # Please take care when you implement group based adv computation such as GRPO and rloo
@@ -621,16 +643,35 @@ class RayPPOTrainer:
                     with timer("reward", timing_raw):
                         reward_ref = self.reward_fn.compute_reward.remote(batch)
 
-                # recompute old_log_probs
-                with timer("old", timing_raw):
-                    old_log_probs = self.actor_rollout_ref_wg.compute_log_probs(batch)
-                    batch = batch.union(old_log_probs)
+                # recompute old_log_probs (skip if already collected from vLLM)
+                if "old_log_probs" in batch.batch:
+                    # Set temperature in meta_info — normally done by
+                    # compute_log_probs in fsdp_workers, but we skip that call.
+                    batch.meta_info["temperature"] = self.config.worker.rollout.temperature
+                    logging.info(
+                        f"[step {self.global_step}] old_log_probs: using vLLM-collected "
+                        f"(skipping FSDP recomputation)"
+                    )
+                else:
+                    with timer("old", timing_raw):
+                        old_log_probs = self.actor_rollout_ref_wg.compute_log_probs(batch)
+                        batch = batch.union(old_log_probs)
+
+                    logging.info(
+                        f"[step {self.global_step}] old_log_probs done: "
+                        f"{timing_raw.get('old', 0):.1f}s"
+                    )
 
                 # compute ref_log_probs
                 if self.use_reference_policy:
                     with timer("ref", timing_raw):
                         ref_log_probs = self.actor_rollout_ref_wg.compute_ref_log_probs(batch)
                         batch = batch.union(ref_log_probs)
+
+                    logging.info(
+                        f"[step {self.global_step}] ref_log_probs done: "
+                        f"{timing_raw.get('ref', 0):.1f}s"
+                    )
 
                 # compute values
                 if self.use_critic:
@@ -662,6 +703,11 @@ class RayPPOTrainer:
                         lam=self.config.algorithm.lam,
                     )
 
+                logging.info(
+                    f"[step {self.global_step}] advantage done: "
+                    f"{timing_raw.get('adv', 0):.1f}s"
+                )
+
                 # update critic
                 if self.use_critic:
                     with timer("update_critic", timing_raw):
@@ -677,6 +723,15 @@ class RayPPOTrainer:
 
                     actor_metrics = reduce_metrics(actor_output.non_tensor_batch)
                     metrics.update(actor_metrics)
+
+                    logging.info(
+                        f"[step {self.global_step}] update_actor done: "
+                        f"{timing_raw.get('update_actor', 0):.1f}s"
+                    )
+
+                # Free cached multi-modal inputs on workers (pixel_values in
+                # CPU RAM) before the next step's vLLM weight loading.
+                self.actor_rollout_ref_wg.clear_multi_modal_cache()
 
                 # validate
                 if (
@@ -698,6 +753,15 @@ class RayPPOTrainer:
             metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
             metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
             metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, num_gpus=num_gpus))
+
+            # Print timing breakdown to stdout/slurm log
+            timing_parts = " | ".join(
+                f"{k}={v:.1f}s" for k, v in timing_raw.items()
+            )
+            logging.info(
+                f"[step {self.global_step}] TIMING: {timing_parts} | "
+                f"batch_size={len(batch)}"
+            )
 
             self.logger.log(data=metrics, step=self.global_step)
 

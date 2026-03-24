@@ -38,6 +38,7 @@ class TokenizerMixin:
         prompts: list[list[dict]],
         images_list: list[list[Image.Image]],
         for_generation: bool = False,
+        tensor_cache_paths: list[str] | None = None,
     ) -> dict[str, Any]:
         """Tokenize prompts with images into the format expected by generate_sequences.
 
@@ -49,6 +50,14 @@ class TokenizerMixin:
             for_generation: if True, skip computing multi_modal_data
                 (pixel_values tensors) since only raw_images are needed
                 for vLLM generation. Saves significant CPU memory.
+            tensor_cache_paths: if provided, a list of file paths (one per
+                prompt) where tokenized tensors (input_ids, attention_mask,
+                position_ids, multi_modal_inputs) will be saved via
+                ``torch.save``.  This caches the expensive tokenization
+                work so that ``_build_final_batch`` can load directly
+                instead of re-tokenizing.  Compatible with
+                ``for_generation=True`` — tensors are saved to disk and
+                then freed, so memory usage stays low.
 
         Returns a dict with:
           - input_ids: (bs, max_prompt_length) tensor, left-padded
@@ -67,7 +76,7 @@ class TokenizerMixin:
         batch_multi_modal_data = []
         batch_raw_images = []
 
-        for messages, images in zip(prompts, images_list):
+        for _prompt_idx, (messages, images) in enumerate(zip(prompts, images_list)):
             # Convert <image> placeholders in message content to HF format
             hf_messages = []
             for msg in messages:
@@ -242,6 +251,24 @@ class TokenizerMixin:
                 # (avoids re-processing which can produce mismatched grids).
                 multi_modal_inputs = {k: v for k, v in model_inputs.items() if isinstance(v, torch.Tensor)}
                 batch_multi_modal_data.append(multi_modal_inputs)
+
+            # Cache tokenized tensors to disk so _build_final_batch can
+            # skip re-tokenizing.  Works with for_generation=True: we grab
+            # the tensors that are already computed and save before they're
+            # freed at the end of the rollout step.
+            if tensor_cache_paths is not None:
+                cache_data = {
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask,
+                    "position_ids": position_ids,
+                }
+                # model_inputs still has pixel_values/image_grid_thw at this
+                # point (not yet deleted) — save them for training.
+                mm = {k: v for k, v in model_inputs.items() if isinstance(v, torch.Tensor)}
+                if mm:
+                    cache_data["multi_modal_inputs"] = mm
+                torch.save(cache_data, tensor_cache_paths[_prompt_idx])
+
             # Raw PIL images stored separately for vLLM generation (vLLM
             # does its own image processing internally).
             batch_raw_images.append(raw_images)
@@ -282,8 +309,15 @@ class TokenizerMixin:
         A ``trajectory_id`` tensor is included so that ``average_loss``
         with ``mode="traj"`` can normalize each trajectory's contribution
         regardless of its number of steps.
+
+        When step records have ``tensor_cache_path`` set (cached during
+        rollout), tokenized tensors are loaded directly from disk —
+        avoiding the expensive re-tokenization of all step-level samples.
         """
+        import time as _time
         from .multiturn_env import StepRecord
+
+        t0 = _time.time()
 
         # ── Materialise step records (may be on disk or in memory) ──
         all_step_records: list[list[StepRecord]] = []
@@ -299,20 +333,78 @@ class TokenizerMixin:
             all_step_records.append(records)
 
         # ── Flatten: one row per (trajectory, step) ──
-        flat_prompts: list[list[dict]] = []
-        flat_images: list[list[Image.Image]] = []
         flat_responses: list[str] = []
         flat_rewards: list[float] = []
         flat_ground_truths: list[str] = []
         flat_group_ids: list[int] = []       # dataset item index (for GRPO UID)
         flat_trajectory_ids: list[int] = []  # unique per trajectory (for loss norm)
+        flat_records: list[StepRecord] = []  # keep records for cache/fallback
 
         for traj_idx, (t, records) in enumerate(zip(trajectories, all_step_records)):
             reward = rewards[traj_idx]
             gt = ground_truths[traj_idx]
             for rec in records:
+                flat_records.append(rec)
+                flat_responses.append(rec.response)
+                flat_rewards.append(reward)
+                flat_ground_truths.append(gt)
+                flat_group_ids.append(t.group_id)
+                flat_trajectory_ids.append(traj_idx)
+
+        bs = len(flat_records)
+        if bs == 0:
+            raise RuntimeError(
+                "No step records found across any trajectory. "
+                "This likely means all trajectories had 0 steps."
+            )
+
+        # Check if we have cached tensors for all steps
+        all_cached = all(rec.tensor_cache_path is not None for rec in flat_records)
+        n_cached = sum(1 for rec in flat_records if rec.tensor_cache_path is not None)
+
+        logger.info(
+            f"Building multi-step batch: {len(trajectories)} trajectories "
+            f"expanded to {bs} (prompt, response) training samples "
+            f"({n_cached}/{bs} cached)"
+        )
+
+        image_cache_dir = getattr(self, "image_cache_dir", None)
+
+        if all_cached:
+            # ── Fast path: load pre-tokenized tensors from disk ──
+            batch_input_ids = []
+            batch_attention_mask = []
+            batch_position_ids = []
+            batch_multi_modal_data = []
+
+            for rec in flat_records:
+                cached = torch.load(rec.tensor_cache_path, weights_only=False)
+                batch_input_ids.append(cached["input_ids"])
+                batch_attention_mask.append(cached["attention_mask"])
+                batch_position_ids.append(cached["position_ids"])
+
+                mm = cached.get("multi_modal_inputs")
+                if image_cache_dir and mm:
+                    from ...utils.image_cache import save_multi_modal_data
+                    mm = save_multi_modal_data(mm, image_cache_dir)
+                batch_multi_modal_data.append(mm)
+
+            prompt_ids = torch.stack(batch_input_ids, dim=0)
+            prompt_mask = torch.stack(batch_attention_mask, dim=0)
+            prompt_pos = torch.stack(batch_position_ids, dim=0)
+            batch_multi_modal_data = np.array(batch_multi_modal_data, dtype=object)
+            del batch_input_ids, batch_attention_mask, batch_position_ids
+
+            logger.info(
+                f"Loaded cached tensors in {_time.time() - t0:.1f}s"
+            )
+        else:
+            # ── Slow fallback: re-tokenize from raw prompts + images ──
+            logger.info("No tensor cache available, re-tokenizing all steps")
+            flat_prompts: list[list[dict]] = []
+            flat_images: list[list[Image.Image]] = []
+            for rec in flat_records:
                 flat_prompts.append(rec.prompt)
-                # Load images from paths (or empty list)
                 imgs = []
                 for p in rec.image_paths:
                     try:
@@ -320,46 +412,26 @@ class TokenizerMixin:
                     except Exception:
                         logger.warning(f"Failed to load step image: {p}")
                 flat_images.append(imgs)
-                flat_responses.append(rec.response)
-                flat_rewards.append(reward)
-                flat_ground_truths.append(gt)
-                flat_group_ids.append(t.group_id)
-                flat_trajectory_ids.append(traj_idx)
 
-        bs = len(flat_prompts)
-        if bs == 0:
-            raise RuntimeError(
-                "No step records found across any trajectory. "
-                "This likely means all trajectories had 0 steps."
-            )
+            tok = self._tokenize_prompts(flat_prompts, flat_images)
+            prompt_ids = tok["input_ids"]
+            prompt_mask = tok["attention_mask"]
+            prompt_pos = tok["position_ids"]
 
-        logger.info(
-            f"Building multi-step batch: {len(trajectories)} trajectories "
-            f"expanded to {bs} (prompt, response) training samples"
-        )
+            mmd_array = tok.get("multi_modal_data", None)
+            batch_multi_modal_data = []
+            for i in range(bs):
+                multi_modal_data = mmd_array[i] if mmd_array is not None else None
+                if image_cache_dir and multi_modal_data:
+                    from ...utils.image_cache import save_multi_modal_data
+                    multi_modal_data = save_multi_modal_data(
+                        multi_modal_data, image_cache_dir
+                    )
+                batch_multi_modal_data.append(multi_modal_data)
+            batch_multi_modal_data = np.array(batch_multi_modal_data, dtype=object)
+            del flat_images, flat_prompts, tok
 
-        # ── Tokenize all step prompts ──
-        tok = self._tokenize_prompts(flat_prompts, flat_images)
-        prompt_ids = tok["input_ids"]      # (bs, max_prompt_length)
-        prompt_mask = tok["attention_mask"]  # (bs, max_prompt_length)
-        prompt_pos = tok["position_ids"]    # (bs, 4, max_prompt_length) for mrope
-
-        # Save multi-modal data to disk to free memory
-        image_cache_dir = getattr(self, "image_cache_dir", None)
-        mmd_array = tok.get("multi_modal_data", None)
-        batch_multi_modal_data = []
-        for i in range(bs):
-            multi_modal_data = mmd_array[i] if mmd_array is not None else None
-            if image_cache_dir and multi_modal_data:
-                from ...utils.image_cache import save_multi_modal_data
-                multi_modal_data = save_multi_modal_data(
-                    multi_modal_data, image_cache_dir
-                )
-            batch_multi_modal_data.append(multi_modal_data)
-        batch_multi_modal_data = np.array(batch_multi_modal_data, dtype=object)
-
-        # Free loaded images
-        del flat_images, tok
+        del flat_records
 
         # ── Tokenize responses ──
         max_resp_len = self.max_response_length
@@ -398,19 +470,37 @@ class TokenizerMixin:
         resp_pos = prompt_pos[..., -1:] + delta
         full_pos = torch.cat([prompt_pos, resp_pos], dim=-1)
 
+        # ── Collect vLLM log probs if available ──
+        all_recs = [r for traj_recs in all_step_records for r in traj_recs]
+        has_all_log_probs = all(r.old_log_probs is not None for r in all_recs)
+        vllm_old_log_probs = None
+        if has_all_log_probs:
+            lp_rows = []
+            for rec in all_recs:
+                lp = list(rec.old_log_probs)
+                # Pad/truncate to max_resp_len to match response_ids_t
+                if len(lp) > max_resp_len:
+                    lp = lp[:max_resp_len]
+                else:
+                    lp = lp + [0.0] * (max_resp_len - len(lp))
+                lp_rows.append(lp)
+            vllm_old_log_probs = torch.tensor(lp_rows, dtype=torch.float32)
+            logger.info(f"Including vLLM-collected old_log_probs ({bs} samples)")
+        del all_recs
+
         # ── Build TensorDict ──
-        td = TensorDict(
-            {
-                "prompts": prompt_ids,
-                "responses": response_ids_t,
-                "input_ids": full_ids,
-                "attention_mask": full_mask,
-                "response_mask": response_mask_t,
-                "position_ids": full_pos,
-                "trajectory_id": torch.tensor(flat_trajectory_ids, dtype=torch.long),
-            },
-            batch_size=bs,
-        )
+        td_dict = {
+            "prompts": prompt_ids,
+            "responses": response_ids_t,
+            "input_ids": full_ids,
+            "attention_mask": full_mask,
+            "response_mask": response_mask_t,
+            "position_ids": full_pos,
+            "trajectory_id": torch.tensor(flat_trajectory_ids, dtype=torch.long),
+        }
+        if vllm_old_log_probs is not None:
+            td_dict["old_log_probs"] = vllm_old_log_probs
+        td = TensorDict(td_dict, batch_size=bs)
 
         # ── UIDs: same uid for all N trajectories of the same dataset item ──
         # All steps from all trajectories of the same GRPO group share a UID.

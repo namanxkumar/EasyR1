@@ -1,7 +1,7 @@
-# EasyR1 Fork: Multi-Turn ObjectNav GRPO Integration
+# EasyR1 Fork: Multi-Turn ObjectNav GRPO/DAPO Integration
 
 **Base commit:** `3e4a8799b354469ec4f24d06f9d6cca7a006fd11` (upstream EasyR1/veRL)
-**Purpose:** Transform EasyR1 from a single-turn RL trainer into an online multi-turn environment rollout system for training VLMs to navigate 3D spaces (AI2Thor ObjectNav) using GRPO.
+**Purpose:** Transform EasyR1 from a single-turn RL trainer into an online multi-turn environment rollout system for training VLMs to navigate 3D spaces (AI2Thor ObjectNav) using GRPO/DAPO.
 
 ---
 
@@ -13,6 +13,7 @@
 4. [Modified Files](#4-modified-files)
 5. [Component Deep Dives](#5-component-deep-dives)
 6. [Data Flow Diagrams](#6-data-flow-diagrams)
+7. [Subsequent Improvements](#7-subsequent-improvements)
 
 ---
 
@@ -1036,3 +1037,168 @@ for AI2Thor's image-to-world projection.           depth + camera
               │                          GRPO advantage computation         │
               │                          Actor FSDP gradient update          │
 ```
+
+---
+
+## 7. Subsequent Improvements
+
+After the initial multi-turn GRPO integration, the following improvements were made across 14 commits (`4c46b7c`→`dd9a4f4`):
+
+### 7.1 Dynamic Slot Reuse (`86ab8b9`, bugfix `edec925`)
+
+**Problem:** Sequential chunk processing left simulator slots idle when trajectories terminated early.
+
+**Solution:** A continuous episode loop with a pending queue. When a trajectory finishes, its slot is immediately reused by the next pending trajectory.
+
+```
+Without dynamic reuse (sequential chunks):
+  Chunk 1: [traj_0 ■■■■■■■, traj_1 ■■, traj_2 ■■■■■■■■■, traj_3 ■■■]
+            Slot utilization: ████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+            (traj_1 and traj_3 finish early, slots sit idle)
+
+With dynamic reuse:
+  Active:   [traj_0 ■■■■■■■, traj_1 ■■|traj_4 ■■■■, traj_2 ■■■■■■■■■, traj_3 ■■■|traj_5 ■■■]
+            Slot utilization: ████████████████████████████████████████
+            (finished slots immediately reused by pending trajectories)
+```
+
+**Implementation:**
+- `pending_queue` (deque) tracks all trajectories waiting to start
+- `_harvest_and_refill()` collects rewards, releases slots, starts new trajectories in one step
+- `_run_continuous_episode_loop()` replaces the old sequential chunk processing
+- Bugfix (`edec925`): Query actual available slots per pool instead of round-robin, which failed when freed slots concentrated on one pool
+
+---
+
+### 7.2 Code Modularization (`60124fe`)
+
+Split the monolithic `multiturn_env.py` into separate files:
+
+| File | Responsibility |
+|------|---------------|
+| `multiturn_env.py` | Core orchestration driver (`MultiturnEnvRollout`) |
+| `multiturn_tokenizer.py` | `TokenizerMixin` — multimodal tokenization with mrope |
+| `objectnav_adapter.py` | `ObjectNavEnvAdapter` — ObjectNav-specific prompt/action/reward logic |
+| `objectnav_factory.py` | `ObjectNavEnvFactory` — dataset iteration abstraction |
+
+---
+
+### 7.3 Trajectory-Level Credit Assignment (`dd9a4f4`)
+
+**Problem:** Trajectories have variable step counts. With per-token loss averaging, long trajectories dominate the gradient signal.
+
+**Solution:** New `loss_avg_mode="traj"` that normalizes by trajectory membership so each trajectory contributes equally regardless of its number of steps.
+
+```
+loss_avg_mode = "token"  # average across all tokens in batch (default)
+loss_avg_mode = "seq"    # per-sequence mean, then mean across sequences
+loss_avg_mode = "traj"   # per-sequence mean, weighted so each trajectory
+                          # contributes equally (requires trajectory_id tensor)
+```
+
+**Files changed:**
+- `verl/trainer/core_algos.py` — `average_loss()` gains `mode="traj"` branch with `trajectory_id` tensor
+- `verl/workers/actor/config.py` — `loss_avg_mode` field now accepts `"traj"`
+- `verl/workers/actor/dp_actor.py` — passes `trajectory_id` to `compute_policy_loss()` and `compute_log_probs()`
+- `verl/workers/rollout/multiturn_tokenizer.py` — `_build_final_batch()` assigns `trajectory_id` to all steps
+
+---
+
+### 7.4 Image and Trajectory Disk Caching (`dd9a4f4`, `4a51b3c`)
+
+**Problem:** Multi-turn trajectories accumulate large image tensors. With 20 observations × 30-step trajectories × 512 total trajectories, keeping everything in memory is infeasible.
+
+**Solution:** Disk-based caching for both image tensors and per-step trajectory data.
+
+**New files:**
+- `verl/utils/image_cache.py` — `save_multi_modal_data()` / `load_multi_modal_data()` / `cleanup_cache_dir()` for tensor serialization to `.pt` files
+- `StepRecord` dataclass in `multiturn_env.py` — lightweight per-step record (prompt, image paths, response)
+
+**New config fields:**
+- `image_cache_dir` (default `/scratch/namankum/image_cache`) — evict `pixel_values` after rollout, lazily load at training
+- `trajectory_cache_dir` (default `/scratch/namankum/trajectory_cache`) — cache per-step data to bound memory when training on all steps
+
+---
+
+### 7.5 Controller Memory Management (`recycle_controllers_every`)
+
+**Problem:** AI2Thor controllers leak ~40-50MB GPU memory per step per controller over long episodes.
+
+**Solution:** New config `recycle_controllers_every` (default 0 = disabled). When set, destroys and recreates controllers after N episodes per slot. Each recycle adds ~25-30s but frees ~2-3GB of leaked GPU memory.
+
+---
+
+### 7.6 DAPO Algorithm Support
+
+DAPO (Dynamic Approach Policy Optimization) is supported via standard EasyR1 algorithm config. Key differences from GRPO:
+
+| Setting | GRPO | DAPO |
+|---------|------|------|
+| KL penalty | Enabled (`kl_coef > 0`) | Disabled (`disable_kl=true`) |
+| Clipping | Symmetric (`clip_ratio`) | Asymmetric (`clip_ratio_low=0.2`, `clip_ratio_high=0.28`) |
+| Group filtering | None | `online_filtering=true` — discard groups where all N rollouts score identically |
+| Dual clipping | Tight | `clip_ratio_dual=10.0` (effectively disabled) |
+
+DAPO configs are in the parent project (`configs/objectnav_dapo*.yaml`) and launched via `sbatch_dapo_train*.sh`.
+
+---
+
+### 7.7 Parallelization Improvements (`99941a8`)
+
+- `SimulatorPool` Ray actor: `max_concurrency=8` enables truly parallel prompt building and env stepping
+- Object filtering (`use_object_filter=True`) reduces raycasting overhead in AI2Thor
+- Deferred imports to break circular dependencies
+
+---
+
+### 7.8 SFT-Consistent Prompt Matching (`846b201`, `40ca2ac`)
+
+Prompts are now built in the exact same format as the SFT training pipeline:
+- `render_width=616` matches SFT image resolution
+- `coordinate_normalization_scale = render_width / model_output_scale` (auto-computed)
+- Prior images downscaled by `prior_image_scale` (default 0.5)
+- Step labels (`[Step N]`), summary memory, and step instructions match `sft_data.py` format
+
+---
+
+### 7.9 Difficulty Filtering and Dataset Control (`341449c`)
+
+New config fields for curriculum learning and debugging:
+- `difficulties` — filter episodes by `rooms_seen` difficulty level (e.g. `[0, 1]`)
+- `max_per_difficulty` — cap episodes per difficulty bucket
+- `override_indices` — explicit dataset indices (bypasses all filters)
+
+---
+
+### 7.10 Dependency Updates (`40ca2ac`)
+
+- `requirements.txt`: `torch>=2.9.0`, `vllm>=0.16.0` (removed flash-attn, uses liger-kernel)
+- `qwen3_vl.py`: Updated for new `model.visual()` return type (returns object with `.pooler_output`/`.deepstack_features` instead of tuple)
+- vLLM API compatibility: `disable_mm_preprocessor_cache` field check, `get_tp_group` rename
+
+---
+
+### 7.11 Summary of All Files Changed (922beb7 → HEAD)
+
+| File | Lines | Type |
+|------|-------|------|
+| `EASYR1_CHANGES.md` | +1038 | **NEW** — this document |
+| `CLAUDE.md` | +131 | **NEW** — project guidance |
+| `verl/workers/rollout/multiturn_tokenizer.py` | +448 | **NEW** — multimodal tokenization mixin |
+| `verl/workers/rollout/objectnav_adapter.py` | +319 | **NEW** — ObjectNav env adapter |
+| `verl/workers/rollout/objectnav_factory.py` | +38 | **NEW** — dataset iterator |
+| `verl/utils/image_cache.py` | +65 | **NEW** — disk tensor cache |
+| `verl/workers/rollout/multiturn_env.py` | ±1155 | **MAJOR REFACTOR** — dynamic batching, continuous loop |
+| `verl/workers/simulator_pool.py` | +255 | **MAJOR REFACTOR** — slot reuse, controller recycling |
+| `verl/trainer/main.py` | +87 | **ENHANCED** — multi-turn env init, logging |
+| `verl/trainer/core_algos.py` | +31 | **ENHANCED** — trajectory-level loss averaging |
+| `verl/workers/fsdp_workers.py` | +29 | **ENHANCED** — pre-computed multi-modal data bypass |
+| `verl/workers/rollout/vllm_rollout_spmd.py` | +21 | **ENHANCED** — raw PIL image path for vLLM |
+| `verl/workers/actor/dp_actor.py` | +18 | **ENHANCED** — trajectory_id forwarding |
+| `verl/models/transformers/qwen3_vl.py` | +12 | **UPDATED** — Qwen3-VL visual encoder API |
+| `verl/workers/rollout/config.py` | +40 | **ENHANCED** — new MultiturnEnvConfig fields |
+| `verl/utils/dataset.py` | +8 | **ENHANCED** — numpy array handling |
+| `requirements.txt` | +6 | **UPDATED** — torch>=2.9.0, vllm>=0.16.0 |
+| `verl/workers/actor/config.py` | +4 | **ENHANCED** — loss_avg_mode="traj" |
+| `verl/trainer/ray_trainer.py` | +6 | **ENHANCED** — multiturn_rollout integration |
+| `verl/workers/critic/dp_critic.py` | -10 | **CLEANED** — removed tqdm |
