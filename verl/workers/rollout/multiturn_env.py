@@ -11,6 +11,8 @@ pipeline (KL, advantage, actor update).
 
 from __future__ import annotations
 
+import ctypes
+import gc
 import json
 import logging
 import os
@@ -40,6 +42,27 @@ if not logger.handlers:
     _handler.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
     logger.addHandler(_handler)
     logger.propagate = False  # prevent duplicate output from root logger
+
+
+def _get_rss_mb() -> float:
+    """Return current process RSS in MB (Linux only)."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024  # kB → MB
+    except Exception:
+        pass
+    return 0.0
+
+
+def _force_free_memory():
+    """Aggressive memory cleanup: gc + glibc malloc_trim to return pages to OS."""
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +155,7 @@ class MultiturnEnvRollout:
         min_pixels: int = 102400,
         max_pixels: int = 409600,
         prior_image_scale: float = 0.5,
+        context_mode: str = "multi_turn",
     ):
         self.tokenizer = tokenizer
         self.processor = processor
@@ -143,6 +167,7 @@ class MultiturnEnvRollout:
         self.min_pixels = min_pixels
         self.max_pixels = max_pixels
         self.prior_image_scale = prior_image_scale
+        self.context_mode = context_mode
 
     # ── controller lifecycle ────────────────────────────────────────
 
@@ -271,13 +296,29 @@ class MultiturnEnvRollout:
             f"avg_steps={avg_steps:.1f} | avg_reward={avg_reward:.3f}"
         )
 
+        logger.info(f"[mem] before destroy_controllers: RSS={_get_rss_mb():.0f}MB")
+
         # ── Free GPU memory for training ──
         self.destroy_controllers()
 
+        logger.info(f"[mem] before _build_final_batch: RSS={_get_rss_mb():.0f}MB")
+
         # ── Build final DataProto batch ──
-        return self._build_final_batch(
+        batch = self._build_final_batch(
             all_trajectories, all_rewards, all_ground_truths, n_trajectories
         )
+
+        # ── Eagerly free trajectory image caches ──
+        for t in all_trajectories:
+            t.last_images.clear()
+            t.last_prompt = None
+            t.step_responses.clear()
+        all_trajectories.clear()
+
+        _force_free_memory()
+        logger.info(f"[mem] after _build_final_batch + cleanup: RSS={_get_rss_mb():.0f}MB")
+
+        return batch
 
     def _run_continuous_episode_loop(
         self,
@@ -503,6 +544,7 @@ class MultiturnEnvRollout:
                 + f", gen={t_gen_elapsed:.1f}s, "
                 f"total={time.time() - t_step:.1f}s"
                 + (f", pending={len(pending_queue)}" if pending_queue else "")
+                + f", RSS={_get_rss_mb():.0f}MB"
             )
 
             global_step += 1
@@ -596,11 +638,24 @@ class MultiturnEnvRollout:
             return []
         num_pools = len(self.simulator_pools)
 
-        # Round-robin pool assignment
+        # Query available slot counts so we assign to pools with capacity
+        # (avoids the round-robin bug where a full pool gets assigned work)
+        avail_counts = ray.get(
+            [p.get_available_count.remote() for p in self.simulator_pools]
+        )
+
         acquire_meta = []  # (pool, group_id, n_idx)
         acquire_futures = []
-        for i, (group_id, n_idx, item_data) in enumerate(batch):
-            pool_idx = i % num_pools
+        for group_id, n_idx, item_data in batch:
+            # Pick the pool with the most available slots
+            pool_idx = max(range(num_pools), key=lambda j: avail_counts[j])
+            if avail_counts[pool_idx] <= 0:
+                raise RuntimeError(
+                    f"No simulator slots available across any pool for "
+                    f"group={group_id}, n={n_idx}. "
+                    f"Increase num_simulators or reduce batch_size."
+                )
+            avail_counts[pool_idx] -= 1
             pool = self.simulator_pools[pool_idx]
             acquire_meta.append((pool, group_id, n_idx))
             acquire_futures.append(pool.acquire_env.remote(item_data))
@@ -656,6 +711,7 @@ class MultiturnEnvRollout:
         prompts: list[list[dict]],
         images_list: list[list[Image.Image]],
         for_generation: bool = False,
+        add_generation_prompt: bool = True,
     ) -> dict[str, Any]:
         """Tokenize prompts with images into the format expected by generate_sequences.
 
@@ -706,7 +762,7 @@ class MultiturnEnvRollout:
 
             # Apply chat template
             text_prompt = self.processor.apply_chat_template(
-                hf_messages, add_generation_prompt=True, tokenize=False
+                hf_messages, add_generation_prompt=add_generation_prompt, tokenize=False
             )
 
             # Process images: downscale prior images (all but last) to match
@@ -890,12 +946,23 @@ class MultiturnEnvRollout:
         ground_truths: list[str],
         n_trajectories: int,
     ) -> DataProto:
-        """Construct the DataProto that the rest of the GRPO pipeline expects.
+        """Construct the DataProto that the rest of the GRPO pipeline expects."""
+        if self.context_mode == "multi_turn":
+            return self._build_final_batch_multiturn(
+                trajectories, rewards, ground_truths, n_trajectories
+            )
+        return self._build_final_batch_single_turn(
+            trajectories, rewards, ground_truths, n_trajectories
+        )
 
-        For each trajectory, takes the last step's prompt (full history up to
-        the final observation) and the model's last response. Tokenizes both
-        and assembles into the standard format.
-        """
+    def _build_final_batch_single_turn(
+        self,
+        trajectories: list[Trajectory],
+        rewards: list[float],
+        ground_truths: list[str],
+        n_trajectories: int,
+    ) -> DataProto:
+        """Single-turn batch: prompt = full context, response = last turn only."""
         prompt_texts = []
         all_images = []
         response_texts = []
@@ -998,6 +1065,165 @@ class MultiturnEnvRollout:
             batch=td, non_tensor_batch=non_tensor, meta_info=meta_info
         )
 
+    def _find_assistant_content_ranges(
+        self, token_ids: list[int]
+    ) -> list[tuple[int, int]]:
+        """Find (start, end) ranges of assistant content tokens in a tokenized conversation.
+
+        Returns ranges where start is the first content token (after the
+        ``<|im_start|>assistant\\n`` header) and end is inclusive of ``<|im_end|>``.
+        """
+        im_start_id = self.tokenizer.convert_tokens_to_ids("<|im_start|>")
+        im_end_id = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
+        assistant_role_ids = self.tokenizer.encode(
+            "assistant\n", add_special_tokens=False
+        )
+        header_len = 1 + len(assistant_role_ids)  # <|im_start|> + "assistant\n"
+
+        ranges = []
+        i = 0
+        while i < len(token_ids):
+            if token_ids[i] == im_start_id:
+                h_end = i + header_len
+                if (
+                    h_end <= len(token_ids)
+                    and token_ids[i + 1 : h_end] == assistant_role_ids
+                ):
+                    # Scan to <|im_end|>
+                    j = h_end
+                    while j < len(token_ids) and token_ids[j] != im_end_id:
+                        j += 1
+                    end = j if j < len(token_ids) else j - 1
+                    if h_end <= end:
+                        ranges.append((h_end, end))
+                    i = j + 1
+                    continue
+            i += 1
+        return ranges
+
+    def _build_final_batch_multiturn(
+        self,
+        trajectories: list[Trajectory],
+        rewards: list[float],
+        ground_truths: list[str],
+        n_trajectories: int,
+    ) -> DataProto:
+        """Multi-turn batch: train on ALL assistant responses.
+
+        Tokenizes the complete conversation (all user/assistant turns) as a
+        single sequence.  ``response_mask`` marks all assistant content tokens
+        so the policy gradient loss covers every model response, not just the
+        final one.
+
+        The prompt/response split is placed at the first assistant content
+        boundary (after ``<|im_start|>assistant\\n``).  Everything before that
+        (system + first user turn + assistant header) is the prompt;
+        everything from the first assistant content onward is the response.
+        ``response_mask`` zeros out user turns and assistant headers within
+        the response portion so only assistant content gets gradient.
+        """
+        # ── 1. Build complete conversations (all turns + final response) ──
+        full_messages = []
+        all_images = []
+        for traj in trajectories:
+            msgs = list(traj.last_prompt or [{"role": "user", "content": ""}])
+            if traj.step_responses:
+                msgs.append(
+                    {"role": "assistant", "content": traj.step_responses[-1]}
+                )
+            full_messages.append(msgs)
+            all_images.append(traj.last_images or [])
+
+        # ── 2. Tokenize full conversations ──
+        # Pad/truncate to the same total budget as single-turn
+        # (max_prompt_length + max_response_length) so the response tensor
+        # size stays within the same memory envelope.
+        max_total = self.max_prompt_length + self.max_response_length
+        orig_max = self.max_prompt_length
+        self.max_prompt_length = max_total
+        try:
+            tokenized = self._tokenize_prompts(
+                full_messages, all_images, add_generation_prompt=False
+            )
+        finally:
+            self.max_prompt_length = orig_max
+
+        full_ids = tokenized["input_ids"]  # (bs, max_total) left-padded
+        full_mask = tokenized["attention_mask"]  # (bs, max_total)
+        full_pos = tokenized["position_ids"]  # (bs, 4, max_total)
+        bs, seq_len = full_ids.shape
+
+        # ── 3. Find assistant content ranges and split points ──
+        # For each sample, find all assistant content token ranges and the
+        # position of the first assistant content token (= prompt/response
+        # boundary).
+        response_mask_full = torch.zeros(bs, seq_len, dtype=full_ids.dtype)
+        split_points = []  # per-sample split in the padded sequence
+
+        for b in range(bs):
+            ids = full_ids[b].tolist()
+            ranges = self._find_assistant_content_ranges(ids)
+            for start, end in ranges:
+                response_mask_full[b, start : end + 1] = 1
+            # Split at first assistant content start
+            split_points.append(ranges[0][0] if ranges else seq_len)
+
+        # ── 4. Split at first assistant content boundary ──
+        # Use the earliest split across the batch so all samples align.
+        # Samples with later splits will have some non-assistant tokens at the
+        # start of their response portion, but response_mask=0 handles that.
+        split = min(split_points)
+
+        prompt_ids = full_ids[:, :split]
+        response_ids = full_ids[:, split:]
+        response_mask_t = response_mask_full[:, split:]
+
+        # ── 5. Build TensorDict ──
+        td = TensorDict(
+            {
+                "prompts": prompt_ids,
+                "responses": response_ids,
+                "input_ids": full_ids,
+                "attention_mask": full_mask,
+                "response_mask": response_mask_t,
+                "position_ids": full_pos,
+            },
+            batch_size=bs,
+        )
+
+        # ── UIDs ──
+        n_items = bs // n_trajectories
+        uids = []
+        for _ in range(n_items):
+            uid = str(uuid.uuid4())
+            uids.extend([uid] * n_trajectories)
+
+        non_tensor = {
+            "uid": np.array(uids, dtype=object),
+            "ground_truth": np.array(ground_truths, dtype=object),
+            "multi_modal_data": tokenized["multi_modal_data"],
+        }
+
+        # ── Place trajectory reward at last assistant content token ──
+        token_level_scores = torch.zeros_like(
+            response_ids, dtype=torch.float32
+        )
+        for i, reward in enumerate(rewards):
+            ones = (response_mask_t[i] == 1).nonzero(as_tuple=True)[0]
+            if len(ones) > 0:
+                token_level_scores[i, ones[-1].item()] = reward
+        td["token_level_scores"] = token_level_scores
+
+        meta_info = {
+            "min_pixels": self.min_pixels,
+            "max_pixels": self.max_pixels,
+            "video_fps": 2.0,
+        }
+
+        return DataProto(
+            batch=td, non_tensor_batch=non_tensor, meta_info=meta_info
+        )
+
 
 # ---------------------------------------------------------------------------
 # ObjectNav environment adapter (used inside SimulatorPool, not on driver)
@@ -1022,6 +1248,7 @@ class ObjectNavEnvAdapter:
         action_proposer,
         coordinate_normalization_scale: float = 1.0,
         max_observations: int = 20,
+        context_mode: str = "multi_turn",
     ):
         self.env = env
         self.state_history = state_history
@@ -1029,6 +1256,7 @@ class ObjectNavEnvAdapter:
         self.action_proposer = action_proposer
         self.coordinate_normalization_scale = coordinate_normalization_scale
         self.max_observations = max_observations
+        self.context_mode = context_mode
 
         # Build the per-step instruction matching the SFT annotation format.
         # Uses the same tags as the action_proposer (explore, answer, summary).
@@ -1069,6 +1297,12 @@ class ObjectNavEnvAdapter:
         return {"observation": initial_state.observation}
 
     def build_prompt(self) -> tuple[list[dict], list[Image.Image]]:
+        """Build prompt for the current step. Dispatches based on context_mode."""
+        if self.context_mode == "multi_turn":
+            return self._build_prompt_multiturn()
+        return self._build_prompt_single_turn()
+
+    def _build_prompt_single_turn(self) -> tuple[list[dict], list[Image.Image]]:
         """Build prompt matching the SFT training format from sft_data.py.
 
         SFT format (single user message):
@@ -1147,6 +1381,89 @@ class ObjectNavEnvAdapter:
             {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": user_text},
         ]
+        return messages, images
+
+    def _build_prompt_multiturn(self) -> tuple[list[dict], list[Image.Image]]:
+        """Build prompt as proper multi-turn user/assistant conversation.
+
+        Format:
+            system: system_prompt
+            user: "Your task is to find the **X**.\n\nStep 0. Here is your current observation:\n<image>\n\n[instruction]"
+            assistant: "<think>...</think>\n<summary>...</summary>\n<explore>...</explore>"
+            user: "Step 1. Here is your current observation:\n<image>\n\n[instruction]"
+            assistant: ...
+            user: "Step N. Here is your current observation:\n<image>\n\n[instruction]"
+
+        Error turns (no new observation) omit the image and step label:
+            assistant: "<think>...</think>\n<summary>...</summary>\n<explore>...</explore>"
+            user: "Action execution failed: ...\n\n[instruction]"
+        """
+        from interactive_reasoning.objectnavtask.agent.agent_utils import (
+            _fix_coordinate_normalization_scale_in_text,
+        )
+
+        history_list = self.state_history.to_list()
+        # history_list: [(None, root_state), (action1, state1), (action2, state2), ...]
+
+        messages = [{"role": "system", "content": self.system_prompt}]
+        images = []
+
+        # Step counter only increments when we have a new observation
+        obs_step = 0
+
+        max_actions = self.env.configuration.max_actions
+
+        for i, (action, state) in enumerate(history_list):
+            is_last = i == len(history_list) - 1
+
+            if action is not None:
+                # Assistant turn: the model's raw response from the previous step
+                messages.append({"role": "assistant", "content": action.response})
+
+            # User turn
+            if state.observation is not None:
+                img = Image.fromarray(state.observation) if isinstance(state.observation, np.ndarray) else state.observation
+                images.append(img)
+
+                user_parts = []
+
+                # First turn includes the task description
+                if i == 0:
+                    task_text = _fix_coordinate_normalization_scale_in_text(
+                        state.user_response, self.coordinate_normalization_scale
+                    )
+                    user_parts.append(task_text)
+                    user_parts.append("")  # blank line separator
+
+                user_parts.append(f"Step {obs_step}. Here is your current observation:\n<image>")
+
+                # Instruction block (forced answer on last allowed step)
+                if is_last:
+                    if self.num_steps + 1 >= max_actions:
+                        user_parts.append(self._step_instructions["forced"])
+                    else:
+                        user_parts.append(self._step_instructions["standard"])
+
+                messages.append({"role": "user", "content": "\n".join(user_parts)})
+                obs_step += 1
+
+            elif action is not None:
+                # Error state: no new observation, just the error text
+                user_parts = []
+                error_text = _fix_coordinate_normalization_scale_in_text(
+                    state.user_response, self.coordinate_normalization_scale
+                )
+                user_parts.append(error_text)
+
+                # Instruction block on the current (last) turn
+                if is_last:
+                    if self.num_steps + 1 >= max_actions:
+                        user_parts.append(self._step_instructions["forced"])
+                    else:
+                        user_parts.append(self._step_instructions["standard"])
+
+                messages.append({"role": "user", "content": "\n\n".join(user_parts)})
+
         return messages, images
 
     @staticmethod

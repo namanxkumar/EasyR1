@@ -567,6 +567,11 @@ class FSDPWorker(Worker):
         assert self._has_actor
 
         self._process_multi_modal_inputs(data)
+        # Defragment CUDA memory before the backward pass — when
+        # compute_log_probs is skipped (vLLM log probs path), there is no
+        # prior forward pass to warm up the caching allocator, which can cause
+        # OOM from fragmentation during loss.backward().
+        torch.cuda.empty_cache()
         data = data.to(torch.cuda.current_device())
 
         if self._use_param_offload:
@@ -614,6 +619,32 @@ class FSDPWorker(Worker):
 
         output = output.to("cpu")
         return output
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def clear_multi_modal_cache(self):
+        """Free cached multi-modal inputs and GPU memory between training steps.
+
+        Clears:
+        1. CPU pixel_values cache (self._cache) to free CPU RAM before vLLM
+           weight loading.
+        2. PyTorch CUDA cached blocks from the training phase (gradients,
+           activations, batch tensors). Without this, ~8GB of cached blocks
+           accumulate across steps and cause OOM during the next rollout.
+        3. glibc malloc arenas via malloc_trim — without this, freed CPU
+           allocations (gradient buffers, tokenized batches, etc.) stay in
+           the process RSS due to glibc fragmentation, causing system OOM
+           over many training steps.
+        """
+        import ctypes
+        import gc
+
+        self._cache.clear()
+        gc.collect()
+        torch.cuda.empty_cache()
+        try:
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except Exception:
+            pass
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def prepare_rollout_engine(self):

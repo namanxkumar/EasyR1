@@ -58,6 +58,10 @@ class MultiturnEnvConfig:
     1.0 = no downscaling, 0.5 = half each dimension."""
     max_observations: int = 20
     """Maximum observation images to include in prompt context."""
+    context_mode: str = "multi_turn"
+    """Prompt context mode: 'multi_turn' uses proper user/assistant turn
+    alternation with full reasoning history preserved, 'single_turn' packs
+    all history into one user message (memory-based compression)."""
     num_simulators: int = 8
     """Number of AI2Thor simulator slots per SimulatorPool.
     Should be >= rollout_batch_size * n for full parallelism.

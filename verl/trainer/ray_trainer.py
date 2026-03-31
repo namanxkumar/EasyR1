@@ -211,7 +211,9 @@ class RayPPOTrainer:
         if config.algorithm.adv_estimator not in list(AdvantageEstimator):
             raise NotImplementedError(f"Unknown advantage estimator: {config.algorithm.adv_estimator}.")
 
-        if config.data.rollout_batch_size % config.worker.actor.global_batch_size != 0:
+        if not config.worker.multiturn_env.enabled and (
+            config.data.rollout_batch_size % config.worker.actor.global_batch_size != 0
+        ):
             raise ValueError("Rollout batch size must be divisible by actor global batch size.")
 
         if (
@@ -596,9 +598,19 @@ class RayPPOTrainer:
             if self.config.trainer.val_only:
                 return
 
+        def _driver_rss_mb():
+            try:
+                with open("/proc/self/status") as f:
+                    for line in f:
+                        if line.startswith("VmRSS:"):
+                            return int(line.split()[1]) / 1024
+            except Exception:
+                return 0.0
+
         self.data_iterator = iter(self.train_dataloader)
         while self.global_step < self.training_steps:
             self.global_step += 1
+            logging.info(f"[step {self.global_step}] driver RSS at step start: {_driver_rss_mb():.0f}MB")
 
             metrics, timing_raw = {}, {}
             with timer("step", timing_raw):
@@ -678,6 +690,15 @@ class RayPPOTrainer:
                     actor_metrics = reduce_metrics(actor_output.non_tensor_batch)
                     metrics.update(actor_metrics)
 
+                    logging.info(
+                        f"[step {self.global_step}] update_actor done: "
+                        f"{timing_raw.get('update_actor', 0):.1f}s"
+                    )
+
+                # Free cached multi-modal inputs on workers (pixel_values in
+                # CPU RAM) before the next step's vLLM weight loading.
+                self.actor_rollout_ref_wg.clear_multi_modal_cache()
+
                 # validate
                 if (
                     self.val_reward_fn is not None
@@ -699,8 +720,26 @@ class RayPPOTrainer:
             metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
             metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, num_gpus=num_gpus))
 
+            # Print timing breakdown to stdout/slurm log
+            timing_parts = " | ".join(
+                f"{k}={v:.1f}s" for k, v in timing_raw.items()
+            )
+            logging.info(
+                f"[step {self.global_step}] TIMING: {timing_parts} | "
+                f"batch_size={len(batch)}"
+            )
+
             self.logger.log(data=metrics, step=self.global_step)
 
+            # Free driver-side memory: gc + malloc_trim to return
+            # fragmented pages to the OS between training iterations.
+            import gc, ctypes
+            del batch
+            gc.collect()
+            try:
+                ctypes.CDLL("libc.so.6").malloc_trim(0)
+            except Exception:
+                pass
 
         # perform validation after training
         if self.val_reward_fn is not None:
