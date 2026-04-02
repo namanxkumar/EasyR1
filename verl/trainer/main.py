@@ -198,6 +198,77 @@ def _create_multiturn_rollout(config: PPOConfig, tokenizer, processor):
         max_pixels=config.data.max_pixels,
         prior_image_scale=mt_cfg.prior_image_scale,
         context_mode=mt_cfg.context_mode,
+        force_max_depth=mt_cfg.force_max_depth,
+    )
+
+
+def _create_val_multiturn_rollout(config: PPOConfig, tokenizer, processor, simulator_pools):
+    """Create a MultiturnEnvRollout for validation using a separate episode set.
+
+    Reuses the same SimulatorPool actors as training (shared GPU controllers)
+    but with a different dataset split / difficulty filter.
+    """
+    mt_cfg = config.worker.multiturn_env
+
+    from ..workers.rollout.multiturn_env import MultiturnEnvRollout, ObjectNavEnvFactory
+    from interactive_reasoning.datasets.poliformer import PoliformerDataset
+
+    data_root = mt_cfg.data_root
+    val_split = mt_cfg.val_split
+    val_difficulties = mt_cfg.val_difficulties if mt_cfg.val_difficulties is not None else mt_cfg.difficulties
+
+    # Override indices take priority over difficulty filtering
+    filtered_indices = None
+    if mt_cfg.val_override_indices is not None:
+        filtered_indices = sorted(mt_cfg.val_override_indices)
+        logging.info(f"Val: using override_indices: {len(filtered_indices)} episodes")
+    elif val_difficulties is not None:
+        from interactive_reasoning.configuration.default_utils import get_val_indices_mapping
+        import interactive_reasoning.configuration as _cfg_pkg
+
+        indices_file = os.path.join(
+            os.path.dirname(_cfg_pkg.__file__),
+            f"{val_split}_indices_by_rooms_seen.json",
+        )
+        indices_mapping = get_val_indices_mapping(
+            val_percentage=1.0,
+            indices_file=indices_file,
+            difficulties=val_difficulties,
+            max_per_difficulty=mt_cfg.val_max_per_difficulty,
+        )
+        filtered_indices = sorted(idx for bucket in indices_mapping.values() for idx in bucket)
+        logging.info(
+            f"Val difficulty filter: rooms_seen={val_difficulties}, "
+            f"max_per_difficulty={mt_cfg.val_max_per_difficulty} -> "
+            f"{len(filtered_indices)} episodes "
+            f"(buckets: { {k: len(v) for k, v in sorted(indices_mapping.items())} })"
+        )
+
+    dataset = PoliformerDataset(
+        houses_data_dir=os.path.join(data_root, "objaverse_houses/houses_2023_07_28"),
+        objectnav_data_dir=os.path.join(data_root, "fifteen/ObjectNavType"),
+        assets_data_dir=os.path.join(data_root, "objaverse_assets/2023_07_28"),
+        split=val_split,
+        max_items=mt_cfg.val_max_items,
+        indices=filtered_indices,
+    )
+    logging.info(f"Loaded validation multiturn env dataset with {len(dataset)} episodes (split={val_split})")
+
+    env_factory = ObjectNavEnvFactory(dataset=dataset)
+
+    return MultiturnEnvRollout(
+        tokenizer=tokenizer,
+        processor=processor,
+        env_factory=env_factory,
+        simulator_pools=simulator_pools,
+        max_depth=mt_cfg.max_depth,
+        max_prompt_length=config.data.max_prompt_length,
+        max_response_length=config.data.max_response_length,
+        min_pixels=config.data.min_pixels,
+        max_pixels=config.data.max_pixels,
+        prior_image_scale=mt_cfg.prior_image_scale,
+        context_mode=mt_cfg.context_mode,
+        force_max_depth=mt_cfg.force_max_depth,
     )
 
 
@@ -246,6 +317,7 @@ class Runner:
 
         # Multi-turn env mode: use dummy train dataloader, construct rollout
         multiturn_rollout = None
+        val_multiturn_rollout = None
         if config.worker.multiturn_env.enabled:
             logging.info("Multi-turn environment rollout mode enabled")
             train_dataloader = _DummyDataLoader()
@@ -260,7 +332,13 @@ class Runner:
                 config.trainer.max_steps = 100
                 logging.warning("trainer.max_steps not set, defaulting to 100")
 
-            # All data comes from the environment — no train/val files needed
+            # Create validation rollout (reuses same SimulatorPools)
+            val_multiturn_rollout = _create_val_multiturn_rollout(
+                config, tokenizer, processor,
+                simulator_pools=multiturn_rollout.simulator_pools,
+            )
+            logging.info("Validation multiturn rollout created successfully")
+
             val_dataloader = None
         else:
             train_dataloader, val_dataloader = create_dataloader(config.data, tokenizer, processor)
@@ -276,9 +354,10 @@ class Runner:
             resource_pool_manager=resource_pool_manager,
             ray_worker_group_cls=ray_worker_group_cls,
             reward_fn=reward_fn,
-            val_reward_fn=val_reward_fn if val_dataloader else None,
+            val_reward_fn=val_reward_fn if (val_dataloader or val_multiturn_rollout) else None,
         )
         trainer.multiturn_rollout = multiturn_rollout
+        trainer.val_multiturn_rollout = val_multiturn_rollout
         logging.info("Calling init_workers()...")
         trainer.init_workers()
         logging.info("init_workers() complete, calling fit()...")

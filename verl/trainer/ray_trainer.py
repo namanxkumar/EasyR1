@@ -183,6 +183,7 @@ class RayPPOTrainer:
         self.val_reward_fn = val_reward_fn
 
         self.multiturn_rollout = None  # constructed later if config enables it
+        self.val_multiturn_rollout = None  # constructed later if config enables it
 
         self.val_reward_score = 0.0
         self.best_val_reward_score = -1.0
@@ -399,6 +400,74 @@ class RayPPOTrainer:
         self.logger.log_generation(samples, self.global_step)
 
     def _validate(self) -> dict[str, Any]:
+        # Dispatch: use multiturn validation if available, else dataset-based
+        if self.val_multiturn_rollout is not None:
+            return self._validate_multiturn()
+        return self._validate_dataset()
+
+    def _validate_multiturn(self) -> dict[str, Any]:
+        """Run validation via multi-turn environment rollouts on held-out episodes."""
+        mt_cfg = self.config.worker.multiturn_env
+        val_override = self.config.worker.rollout.val_override_config
+
+        print(f"Start multiturn validation (batch_size={mt_cfg.val_batch_size}, n={mt_cfg.val_n})...")
+
+        val_metrics: dict[str, Any] = {}
+        self.actor_rollout_ref_wg.prepare_rollout_engine()
+
+        batch = self.val_multiturn_rollout.generate_trajectories(
+            actor_rollout_ref_wg=self.actor_rollout_ref_wg,
+            batch_size=mt_cfg.val_batch_size,
+            n_trajectories=mt_cfg.val_n,
+            config=self.config,
+            metrics=val_metrics,
+            override_config=val_override if val_override else None,
+        )
+
+        self.actor_rollout_ref_wg.release_rollout_engine()
+
+        # Compute reward via val_reward_fn (same as training reward, separate instance)
+        reward_tensor, reward_metrics = ray.get(self.val_reward_fn.compute_reward.remote(batch))
+
+        # Parse ground_truth JSON for structured metrics (success_rate, avg_steps, etc.)
+        ground_truths = batch.non_tensor_batch.get("ground_truth", np.array([]))
+        successes, steps_list, format_scores, validity_scores = [], [], [], []
+        for gt_str in ground_truths:
+            try:
+                gt = json.loads(gt_str)
+                successes.append(float(gt.get("success", False)))
+                steps_list.append(float(gt.get("num_steps", 0)))
+                format_scores.append(float(gt.get("avg_format", 0)))
+                validity_scores.append(float(gt.get("avg_validity", 0)))
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        self.val_reward_score = reward_tensor.sum(-1).mean().item()
+        metrics = {
+            "val/reward_score": self.val_reward_score,
+        }
+        # Add per-component reward metrics
+        for key, value in reduce_metrics(reward_metrics).items():
+            metrics[f"val/{key}_reward"] = value
+        # Add structured env metrics
+        if successes:
+            metrics["val/success_rate"] = float(np.mean(successes))
+            metrics["val/avg_steps"] = float(np.mean(steps_list))
+            metrics["val/avg_format"] = float(np.mean(format_scores))
+            metrics["val/avg_validity"] = float(np.mean(validity_scores))
+
+        # Use env/* metrics from generate_trajectories if available
+        for k, v in val_metrics.items():
+            if k.startswith("env/"):
+                metrics[f"val/{k}"] = v
+
+        print(f"Finish multiturn validation: reward={self.val_reward_score:.4f}"
+              + (f", success_rate={metrics.get('val/success_rate', 'N/A')}" if successes else ""))
+
+        return metrics
+
+    def _validate_dataset(self) -> dict[str, Any]:
+        """Standard dataset-based validation (single-turn generate → reward)."""
         reward_tensor_lst = []
         # Lists to collect samples for the table
         sample_inputs, sample_outputs, sample_labels, sample_scores = [], [], [], []

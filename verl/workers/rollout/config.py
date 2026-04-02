@@ -72,6 +72,26 @@ class MultiturnEnvConfig:
     """Cap the number of episodes per rooms_seen bucket."""
     override_indices: Optional[list[int]] = None
     """Explicit dataset indices to use (bypasses difficulty filtering and max_items)."""
+    force_max_depth: bool = False
+    """Force all trajectories to run to max_depth, ignoring early termination
+    from the environment (e.g. answer actions). Useful for stress-testing
+    worst-case memory/context length in multi-turn mode."""
+
+    # ── Validation fields ──────────────────────────────────────────
+    val_split: str = "val"
+    """Dataset split for validation episodes."""
+    val_max_items: Optional[int] = None
+    """Maximum number of validation episodes (None = use all)."""
+    val_difficulties: Optional[list[int]] = None
+    """rooms_seen levels for validation (None = same as training ``difficulties``)."""
+    val_max_per_difficulty: Optional[int] = None
+    """Cap episodes per rooms_seen bucket for validation."""
+    val_override_indices: Optional[list[int]] = None
+    """Explicit validation episode indices (bypasses val_difficulties/val_max_items)."""
+    val_batch_size: int = 16
+    """Number of episodes per validation rollout."""
+    val_n: int = 1
+    """Rollouts per validation episode (typically 1 for deterministic eval)."""
 
 
 @dataclass

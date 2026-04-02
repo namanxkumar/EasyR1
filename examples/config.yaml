@@ -74,8 +74,7 @@ worker:
     tensor_parallel_size: 2
     disable_tqdm: false
     val_override_config:
-      temperature: 0.6
-      top_p: 0.95
+      temperature: 0.5
       n: 1
 
   ref:

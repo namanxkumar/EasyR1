@@ -156,6 +156,7 @@ class MultiturnEnvRollout:
         max_pixels: int = 409600,
         prior_image_scale: float = 0.5,
         context_mode: str = "multi_turn",
+        force_max_depth: bool = False,
     ):
         self.tokenizer = tokenizer
         self.processor = processor
@@ -168,6 +169,7 @@ class MultiturnEnvRollout:
         self.max_pixels = max_pixels
         self.prior_image_scale = prior_image_scale
         self.context_mode = context_mode
+        self.force_max_depth = force_max_depth
 
     # ── controller lifecycle ────────────────────────────────────────
 
@@ -204,6 +206,7 @@ class MultiturnEnvRollout:
         n_trajectories: int,
         config,
         metrics: dict[str, Any],
+        override_config: dict[str, Any] | None = None,
     ) -> DataProto:
         """Run multi-turn rollouts with dynamic slot reuse.
 
@@ -452,6 +455,9 @@ class MultiturnEnvRollout:
                 "temperature": config.worker.rollout.temperature,
                 "top_p": config.worker.rollout.top_p,
             }
+            if override_config:
+                meta_info.update(override_config)
+                meta_info["n"] = 1  # always 1 per-step for multiturn
             gen_batch = DataProto.from_single_dict(
                 tokenized, meta_info=meta_info
             )
@@ -534,8 +540,15 @@ class MultiturnEnvRollout:
                         f"reward={reward:.3f}, terminated={terminated}"
                     )
                 if terminated:
-                    t.terminated = True
-                    n_terminated_this_step += 1
+                    if self.force_max_depth and t.num_steps < self.max_depth:
+                        logger.info(
+                            f"  [step {global_step}][grp {t.group_id}/{t.n_idx}] "
+                            f"force_max_depth: ignoring env termination at step "
+                            f"{t.num_steps}/{self.max_depth}"
+                        )
+                    else:
+                        t.terminated = True
+                        n_terminated_this_step += 1
 
             logger.info(
                 f"  step {global_step}: {len(valid)} active, "
