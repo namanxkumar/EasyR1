@@ -393,7 +393,7 @@ def main():
                 "VLLM_LOGGING_LEVEL": "WARN",
                 "VLLM_ATTENTION_BACKEND": "XFORMERS",
                 "TORCH_NCCL_AVOID_RECORD_STREAMS": "1",
-                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True,max_split_size_mb:256",
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:False",
                 "CUDA_DEVICE_MAX_CONNECTIONS": "1",
                 "VLLM_ALLREDUCE_USE_SYMM_MEM": "0",
                 **_extra_env,

@@ -54,7 +54,7 @@ class SimulatorPool:
         max_depth: int = 30,
         coordinate_normalization_scale: float = 1.0,
         max_observations: int = 20,
-        context_mode: str = "single_turn",
+        context_mode: str = "multi_turn",
     ):
         # Force AI2Thor to use the specified GPU (set before any CUDA init)
         os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)

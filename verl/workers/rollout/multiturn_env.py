@@ -1316,70 +1316,18 @@ class ObjectNavEnvAdapter:
         return self._build_prompt_single_turn()
 
     def _build_prompt_single_turn(self) -> tuple[list[dict], list[Image.Image]]:
-        """Build prompt matching the SFT training format from sft_data.py.
-
-        SFT format (single user message):
-            [Step 0]            ← prior image labels + <image> tags
-            <image>
-            [Step 1]
-            <image>
-            Your task is to find the **X** (desc).
-
-            **Memory from previous steps:**
-            - Step 0: summary0
-            ...
-
-            Step N. Here is your current observation:
-            <image>
-        """
-        from interactive_reasoning.objectnavtask.agent.agent_utils import (
-            build_annotate_style_context_from_history,
+        """Build prompt matching the shared SFT-style compatibility format."""
+        from common.prompting.context_builders import (
+            build_sft_context_from_history,
+            render_sft_flat_prompt,
         )
 
-        model_context = build_annotate_style_context_from_history(
+        model_context = build_sft_context_from_history(
             self.state_history,
             coordinate_normalization_scale=self.coordinate_normalization_scale,
             include_error_feedback=True,
             max_observations=self.max_observations,
         )
-
-        # Separate context into prior images, text-only parts, and the current
-        # observation so we can reorder to match the SFT data layout.
-        prior_image_parts = []   # (label_text, image)
-        text_parts = []          # task description, memory, errors, etc.
-        current_obs_part = None  # (step_text, image) — always the last image entry
-        images = []
-
-        for _assistant_resp, user_response, observation in model_context.context:
-            if observation is not None:
-                img = Image.fromarray(observation) if isinstance(observation, np.ndarray) else observation
-                # The last observation entry is the current step
-                if current_obs_part is not None:
-                    # Previous "current" was actually a prior — demote it
-                    prior_image_parts.append(current_obs_part)
-                current_obs_part = (user_response, img)
-            elif user_response:
-                text_parts.append(user_response)
-
-        # Build user content in SFT order:
-        # 1) Prior images with labels (newline-separated, matching SFT's \n join)
-        user_parts = []
-        for label, img in prior_image_parts:
-            images.append(img)
-            if label:
-                user_parts.append(f"{label}\n<image>")
-            else:
-                user_parts.append("<image>")
-
-        # 2) Text parts (task description, memory, errors) joined by \n\n
-        if text_parts:
-            user_parts.append("\n\n".join(text_parts))
-
-        # 3) Current observation
-        if current_obs_part is not None:
-            step_text, img = current_obs_part
-            images.append(img)
-            user_parts.append(f"{step_text}\n<image>")
 
         # 4) Step instruction (format reminder for the model)
         max_actions = self.env.configuration.max_actions
@@ -1387,97 +1335,51 @@ class ObjectNavEnvAdapter:
             instruction = self._step_instructions["forced"]
         else:
             instruction = self._step_instructions["standard"]
-        user_parts.append(instruction)
-
-        user_text = "\n".join(user_parts)
-        messages = [
-            {"role": "system", "content": self.system_prompt},
-            {"role": "user", "content": user_text},
-        ]
-        return messages, images
+        return render_sft_flat_prompt(
+            system_prompt=self.system_prompt,
+            flat_context=model_context,
+            current_step_suffix=instruction,
+        )
 
     def _build_prompt_multiturn(self) -> tuple[list[dict], list[Image.Image]]:
         """Build prompt as proper multi-turn user/assistant conversation.
 
+        Delegates to the canonical builder in ``src/common/prompting/context_builders.py``
+        so the format is identical to the one used by the hint experiment.
+
         Format:
             system: system_prompt
-            user: "Your task is to find the **X**.\n\nStep 0. Here is your current observation:\n<image>\n\n[instruction]"
-            assistant: "<think>...</think>\n<summary>...</summary>\n<explore>...</explore>"
-            user: "Step 1. Here is your current observation:\n<image>\n\n[instruction]"
+            user: "Your task is to find the **X**.\\n\\nStep 0. Here is your current observation:\\n<image>"
+            assistant: "<think>...</think>\\n<summary>...</summary>\\n<explore>...</explore>"
+            user: "Step 1. Here is your current observation:\\n<image>"
             assistant: ...
-            user: "Step N. Here is your current observation:\n<image>\n\n[instruction]"
+            user: "Step N. Here is your current observation:\\n<image>\\n[instruction]"
 
         Error turns (no new observation) omit the image and step label:
-            assistant: "<think>...</think>\n<summary>...</summary>\n<explore>...</explore>"
-            user: "Action execution failed: ...\n\n[instruction]"
+            assistant: "<think>...</think>\\n<summary>...</summary>\\n<explore>...</explore>"
+            user: "Action execution failed: ...\\n\\n[instruction]"
         """
-        from interactive_reasoning.objectnavtask.agent.agent_utils import (
-            _fix_coordinate_normalization_scale_in_text,
+        from common.prompting.context_builders import (
+            build_multiturn_context,
+            steps_from_state_history,
         )
 
-        history_list = self.state_history.to_list()
-        # history_list: [(None, root_state), (action1, state1), (action2, state2), ...]
-
-        messages = [{"role": "system", "content": self.system_prompt}]
-        images = []
-
-        # Step counter only increments when we have a new observation
-        obs_step = 0
-
         max_actions = self.env.configuration.max_actions
+        instruction = (
+            self._step_instructions["forced"]
+            if self.num_steps + 1 >= max_actions
+            else self._step_instructions["standard"]
+        )
 
-        for i, (action, state) in enumerate(history_list):
-            is_last = i == len(history_list) - 1
-
-            if action is not None:
-                # Assistant turn: the model's raw response from the previous step
-                messages.append({"role": "assistant", "content": action.response})
-
-            # User turn
-            if state.observation is not None:
-                img = Image.fromarray(state.observation) if isinstance(state.observation, np.ndarray) else state.observation
-                images.append(img)
-
-                user_parts = []
-
-                # First turn includes the task description
-                if i == 0:
-                    task_text = _fix_coordinate_normalization_scale_in_text(
-                        state.user_response, self.coordinate_normalization_scale
-                    )
-                    user_parts.append(task_text)
-                    user_parts.append("")  # blank line separator
-
-                user_parts.append(f"Step {obs_step}. Here is your current observation:\n<image>")
-
-                # Instruction block (forced answer on last allowed step)
-                if is_last:
-                    if self.num_steps + 1 >= max_actions:
-                        user_parts.append(self._step_instructions["forced"])
-                    else:
-                        user_parts.append(self._step_instructions["standard"])
-
-                messages.append({"role": "user", "content": "\n".join(user_parts)})
-                obs_step += 1
-
-            elif action is not None:
-                # Error state: no new observation, just the error text
-                user_parts = []
-                error_text = _fix_coordinate_normalization_scale_in_text(
-                    state.user_response, self.coordinate_normalization_scale
-                )
-                user_parts.append(error_text)
-
-                # Instruction block on the current (last) turn
-                if is_last:
-                    if self.num_steps + 1 >= max_actions:
-                        user_parts.append(self._step_instructions["forced"])
-                    else:
-                        user_parts.append(self._step_instructions["standard"])
-
-                messages.append({"role": "user", "content": "\n\n".join(user_parts)})
-
-        return messages, images
+        steps = steps_from_state_history(
+            self.state_history,
+            coordinate_normalization_scale=self.coordinate_normalization_scale,
+        )
+        return build_multiturn_context(
+            system_prompt=self.system_prompt,
+            steps=steps,
+            current_step_suffix=instruction,
+        )
 
     @staticmethod
     def _check_format(response: str) -> float:
