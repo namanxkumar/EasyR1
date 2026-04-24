@@ -272,6 +272,7 @@ class MultiturnEnvRollout:
         self._run_continuous_episode_loop(
             active_trajectories, all_trajectories,
             pending_queue, actor_rollout_ref_wg, config,
+            override_config=override_config,
         )
 
         # Sort by (group_id, n_idx) for deterministic ordering expected by
@@ -330,6 +331,7 @@ class MultiturnEnvRollout:
         pending_queue,
         actor_rollout_ref_wg,
         config,
+        override_config: dict[str, Any] | None = None,
     ) -> None:
         """Run a continuous rollout loop with dynamic slot reuse.
 
@@ -1342,33 +1344,30 @@ class ObjectNavEnvAdapter:
         )
 
     def _build_prompt_multiturn(self) -> tuple[list[dict], list[Image.Image]]:
-        """Build prompt as proper multi-turn user/assistant conversation.
+        """Build prompt matching the SFT / reannotate multi-turn output format.
 
         Delegates to the canonical builder in ``src/common/prompting/context_builders.py``
-        so the format is identical to the one used by the hint experiment.
+        so the format is identical to ``_process_trajectory_multiturn`` in
+        ``src/post_annotation/sft_data.py`` (the format the model was trained on).
 
         Format:
             system: system_prompt
-            user: "Your task is to find the **X**.\\n\\nStep 0. Here is your current observation:\\n<image>"
-            assistant: "<think>...</think>\\n<summary>...</summary>\\n<explore>...</explore>"
-            user: "Step 1. Here is your current observation:\\n<image>"
+            user: "Your task is to find the **X** (desc).\\n\\nStep 0.\\n<image>"
+            assistant: "<think>...</think>\\n<explore>...</explore>"
+            user: "Step 1.\\n<image>"
             assistant: ...
-            user: "Step N. Here is your current observation:\\n<image>\\n[instruction]"
+            user: "Step N.\\n<image>"
+
+        No per-turn instruction suffix and no ``<summary>`` tag — matches the
+        SFT training data exactly.
 
         Error turns (no new observation) omit the image and step label:
-            assistant: "<think>...</think>\\n<summary>...</summary>\\n<explore>...</explore>"
-            user: "Action execution failed: ...\\n\\n[instruction]"
+            assistant: "<think>...</think>\\n<explore>...</explore>"
+            user: "Action execution failed: ..."
         """
         from common.prompting.context_builders import (
             build_multiturn_context,
             steps_from_state_history,
-        )
-
-        max_actions = self.env.configuration.max_actions
-        instruction = (
-            self._step_instructions["forced"]
-            if self.num_steps + 1 >= max_actions
-            else self._step_instructions["standard"]
         )
 
         steps = steps_from_state_history(
@@ -1378,14 +1377,14 @@ class ObjectNavEnvAdapter:
         return build_multiturn_context(
             system_prompt=self.system_prompt,
             steps=steps,
-            current_step_suffix=instruction,
+            simple_step_text=True,
         )
 
     @staticmethod
     def _check_format(response: str) -> float:
-        """Check if response has <think>...</think> <summary>...</summary> <action>."""
+        """Check if response matches the SFT multi-turn format: <think>...</think> <action>."""
         pattern = re.compile(
-            r"<think>.*?</think>\s*<summary>.*?</summary>\s*<(?:explore|answer).*?(?:/>|</(?:explore|answer)>)",
+            r"<think>.*?</think>\s*<(?:explore|answer).*?(?:/>|</(?:explore|answer)>)",
             re.DOTALL,
         )
         return 1.0 if pattern.search(response) else 0.0

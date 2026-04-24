@@ -1,7 +1,7 @@
 """Reward function for object navigation GRPO training.
 
 Scores model responses on three axes:
-  - Format (weight 0.2): Response has <think>...</think> + <summary>...</summary> + action tag
+  - Format (weight 0.2): Response has <think>...</think> + action tag (SFT multi-turn format)
   - Action validity (weight 0.3): Action tag is parseable with valid coordinates
   - Accuracy (weight 0.5): Scored using environment metadata when available (online mode),
     or expert action comparison (offline/SFT mode)
@@ -31,9 +31,9 @@ REWARD_TYPE = "batch"
 
 
 def _check_format(response: str) -> float:
-    """Check if response matches <think>...</think>\\n<summary>...</summary>\\n<action>."""
+    """Check if response matches the SFT multi-turn format: <think>...</think>\\n<action>."""
     pattern = re.compile(
-        r"<think>.*?</think>\s*<summary>.*?</summary>\s*<(?:explore|answer).*?(?:/>|</(?:explore|answer)>)",
+        r"<think>.*?</think>\s*<(?:explore|answer).*?(?:/>|</(?:explore|answer)>)",
         re.DOTALL,
     )
     return 1.0 if pattern.search(response) else 0.0
@@ -232,17 +232,17 @@ if __name__ == "__main__":
     test_cases = [
         # Perfect answer (offline)
         {
-            "response": "<think>\nI see the laptop on the desk.\n</think>\n<summary>Found laptop.</summary>\n<answer>(320,410)</answer>",
+            "response": "<think>\nI see the laptop on the desk.\n</think>\n<answer>(320,410)</answer>",
             "ground_truth": json.dumps({"action_type": "answer", "expert_action": "<answer>(320,410)</answer>", "answer_coordinates": [320, 410]}),
         },
         # Correct format, wrong coordinates (offline)
         {
-            "response": "<think>\nLooking around.\n</think>\n<summary>Exploring.</summary>\n<answer>(800,900)</answer>",
+            "response": "<think>\nLooking around.\n</think>\n<answer>(800,900)</answer>",
             "ground_truth": json.dumps({"action_type": "answer", "expert_action": "<answer>(320,410)</answer>", "answer_coordinates": [320, 410]}),
         },
         # Correct explore (offline)
         {
-            "response": "<think>\nMoving forward.\n</think>\n<summary>Walking to doorway.</summary>\n<explore>ground:(450,720)</explore>",
+            "response": "<think>\nMoving forward.\n</think>\n<explore>ground:(450,720)</explore>",
             "ground_truth": json.dumps({"action_type": "explore_ground", "expert_action": "<explore>ground:(450,720)</explore>", "expert_coordinates": [450, 720]}),
         },
         # Bad format
@@ -252,7 +252,7 @@ if __name__ == "__main__":
         },
         # Online: good distance improvement
         {
-            "response": "<think>\nMoving toward kitchen.\n</think>\n<summary>Walking to kitchen.</summary>\n<explore>ground:(500,600)</explore>",
+            "response": "<think>\nMoving toward kitchen.\n</think>\n<explore>ground:(500,600)</explore>",
             "ground_truth": json.dumps({
                 "distance_to_target_before": 5.0,
                 "distance_to_target_after": 3.0,
@@ -265,7 +265,7 @@ if __name__ == "__main__":
         },
         # Online: answer with visible target
         {
-            "response": "<think>\nI see the target!\n</think>\n<summary>Found it.</summary>\n<answer>(400,350)</answer>",
+            "response": "<think>\nI see the target!\n</think>\n<answer>(400,350)</answer>",
             "ground_truth": json.dumps({
                 "distance_to_target_before": 1.5,
                 "distance_to_target_after": 1.5,
@@ -278,7 +278,7 @@ if __name__ == "__main__":
         },
         # Online: answer when target not visible
         {
-            "response": "<think>\nI think it's here.\n</think>\n<summary>Guessing.</summary>\n<answer>(200,300)</answer>",
+            "response": "<think>\nI think it's here.\n</think>\n<answer>(200,300)</answer>",
             "ground_truth": json.dumps({
                 "distance_to_target_before": 8.0,
                 "distance_to_target_after": 8.0,
