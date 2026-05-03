@@ -33,6 +33,27 @@ from transformers import PreTrainedTokenizer, ProcessorMixin
 
 from ...protocol import DataProto, pad_dataproto_to_divisor, unpad_dataproto
 
+
+def filter_steps_to_kwindow(steps, past_k_steps):
+    """Filter a chronological list of MultiturnStep to the past-K observation window.
+
+    Keeps step 0 (which carries the task description) and the contiguous tail
+    starting at the K-th-from-last observation step. Error steps interspersed
+    in the kept tail are kept; error steps in the dropped middle are dropped.
+
+    When past_k_steps is None, <= 0, or >= total observation steps, returns
+    the input unchanged.
+    """
+    if not past_k_steps or past_k_steps <= 0:
+        return steps
+    obs_positions = [i for i, s in enumerate(steps) if not s.is_error]
+    if len(obs_positions) <= past_k_steps:
+        return steps
+    tail_start = obs_positions[-past_k_steps]
+    if tail_start == 0:
+        return steps
+    return [steps[0]] + list(steps[tail_start:])
+
 logger = logging.getLogger(__name__)
 # Ray workers don't inherit the driver's logging config, so set level from env var
 _log_level = getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO)
@@ -115,6 +136,11 @@ class Trajectory:
 
     # Accumulated per-step data
     step_responses: list[str] = field(default_factory=list)
+    # Per-step assistant token IDs and matching per-token sampled logprobs
+    # captured from vLLM (when parity_log_probs is enabled). Lists are aligned
+    # 1:1 with step_responses; outer list index is step.
+    step_response_token_ids: list[list[int]] = field(default_factory=list)
+    step_response_log_probs: list[list[float]] = field(default_factory=list)
     terminated: bool = False
     num_steps: int = 0
 
@@ -157,6 +183,7 @@ class MultiturnEnvRollout:
         prior_image_scale: float = 0.5,
         context_mode: str = "multi_turn",
         force_max_depth: bool = False,
+        past_k_steps: "int | None" = None,
     ):
         self.tokenizer = tokenizer
         self.processor = processor
@@ -170,6 +197,21 @@ class MultiturnEnvRollout:
         self.prior_image_scale = prior_image_scale
         self.context_mode = context_mode
         self.force_max_depth = force_max_depth
+        self.past_k_steps = past_k_steps if (past_k_steps and past_k_steps > 0) else None
+        if self.past_k_steps is not None and context_mode != "multi_turn":
+            logger.warning(
+                f"past_k_steps={past_k_steps} is only supported with context_mode='multi_turn'; "
+                f"got context_mode='{context_mode}'. Disabling truncation."
+            )
+            self.past_k_steps = None
+        if self.past_k_steps is not None:
+            logger.warning(
+                f"past_k_steps={self.past_k_steps} active. Rollout uses "
+                f"K-window filter + packed-MROPE injection; training uses "
+                f"FlexAttention BlockMask. Train↔rollout parity has NOT yet "
+                f"been verified end-to-end on GPU; treat early runs as a "
+                f"parity smoke test."
+            )
 
     # ── controller lifecycle ────────────────────────────────────────
 
@@ -317,6 +359,8 @@ class MultiturnEnvRollout:
             t.last_images.clear()
             t.last_prompt = None
             t.step_responses.clear()
+            t.step_response_token_ids.clear()
+            t.step_response_log_probs.clear()
         all_trajectories.clear()
 
         _force_free_memory()
@@ -375,15 +419,26 @@ class MultiturnEnvRollout:
             t_step = time.time()
 
             # ── Build prompts in parallel via Ray ──
-            prompt_futures = [
-                t.pool.build_prompt.remote(t.slot_id) for t in active
-            ]
+            # When past_k_steps is set we also need the unfiltered
+            # full-trajectory messages on the driver to compute packed MROPE
+            # positions. Use build_prompt_with_full in that case.
+            use_full = self.past_k_steps is not None
+            if use_full:
+                prompt_futures = [
+                    t.pool.build_prompt_with_full.remote(t.slot_id) for t in active
+                ]
+            else:
+                prompt_futures = [
+                    t.pool.build_prompt.remote(t.slot_id) for t in active
+                ]
             prompt_results_raw = ray.get(prompt_futures)
 
             # Filter out trajectories whose prompt build failed
             valid = []          # (local_idx, trajectory)
             prompts = []
             images_list = []
+            full_prompts: list = []
+            full_images_list: list = []
             for i, t in enumerate(active):
                 result = prompt_results_raw[i]
                 if isinstance(result, Exception):
@@ -396,6 +451,9 @@ class MultiturnEnvRollout:
                 try:
                     prompts.append(result[0])
                     images_list.append(result[1])
+                    if use_full:
+                        full_prompts.append(result[2])
+                        full_images_list.append(result[3])
                     valid.append((len(prompts) - 1, t))
                 except Exception as e:
                     logger.warning(
@@ -412,10 +470,16 @@ class MultiturnEnvRollout:
                 global_step += 1
                 continue
 
-            # Cache prompt/images for final batch construction
+            # Cache prompt/images for final batch construction. With
+            # past_k_steps, training reconstructs the *full* trajectory, so
+            # cache the full pair when available.
             for local_i, t in valid:
-                t.last_prompt = prompts[local_i]
-                t.last_images = list(images_list[local_i])
+                if use_full:
+                    t.last_prompt = full_prompts[local_i]
+                    t.last_images = list(full_images_list[local_i])
+                else:
+                    t.last_prompt = prompts[local_i]
+                    t.last_images = list(images_list[local_i])
 
             if logger.isEnabledFor(logging.DEBUG):
                 for local_i, t in valid:
@@ -447,7 +511,13 @@ class MultiturnEnvRollout:
 
             # ── Tokenize into DataProto format ──
             t_gen = time.time()
-            tokenized = self._tokenize_prompts(prompts, images_list, for_generation=True)
+            tokenized = self._tokenize_prompts(
+                prompts,
+                images_list,
+                for_generation=True,
+                full_prompts=full_prompts if use_full else None,
+                full_images_list=full_images_list if use_full else None,
+            )
             meta_info = {
                 "eos_token_id": self.tokenizer.eos_token_id,
                 "min_pixels": self.min_pixels,
@@ -484,13 +554,23 @@ class MultiturnEnvRollout:
             # Decode responses
             response_ids = gen_output.batch["responses"]
             response_mask = gen_output.batch["response_mask"]
+            rollout_log_probs = gen_output.batch.get("rollout_log_probs")
             responses = []
+            response_token_ids_list: list[list[int]] = []
+            response_log_probs_list: list[list[float]] = []
             for i in range(len(valid)):
                 length = int(response_mask[i].sum().item())
                 text = self.tokenizer.decode(
                     response_ids[i][:length], skip_special_tokens=True
                 )
                 responses.append(text)
+                response_token_ids_list.append(response_ids[i][:length].tolist())
+                if rollout_log_probs is not None:
+                    response_log_probs_list.append(
+                        rollout_log_probs[i][:length].cpu().tolist()
+                    )
+                else:
+                    response_log_probs_list.append([])
 
             if logger.isEnabledFor(logging.DEBUG):
                 for i, (local_i, t) in enumerate(valid):
@@ -521,6 +601,8 @@ class MultiturnEnvRollout:
             n_failed_this_step = 0
             for i, (_, t) in enumerate(valid):
                 t.step_responses.append(responses[i])
+                t.step_response_token_ids.append(response_token_ids_list[i])
+                t.step_response_log_probs.append(response_log_probs_list[i])
                 t.num_steps += 1
 
                 result = step_results[i]
@@ -561,6 +643,30 @@ class MultiturnEnvRollout:
                 + (f", pending={len(pending_queue)}" if pending_queue else "")
                 + f", RSS={_get_rss_mb():.0f}MB"
             )
+
+            # ── Parity-mode context dump: visible turn IDs + prompt extents ──
+            # For the first few traj only, so the log doesn't explode.
+            if rollout_log_probs is not None:
+                prompt_ids_b = gen_batch.batch.get("input_ids")
+                attn_b = gen_batch.batch.get("attention_mask")
+                for i, (_, t) in enumerate(valid[:2]):
+                    if prompt_ids_b is None or attn_b is None:
+                        break
+                    pl = int(attn_b[i].sum().item())
+                    asst_steps = len(t.step_responses)
+                    expected_visible = (
+                        list(range(asst_steps + 1))
+                        if (self.past_k_steps is None or asst_steps < self.past_k_steps)
+                        else [0] + list(
+                            range(asst_steps - self.past_k_steps + 1, asst_steps + 1)
+                        )
+                    )
+                    logger.info(
+                        f"    [parity] step {global_step} traj {i}: "
+                        f"prompt_len={pl}, accumulated_steps={asst_steps}, "
+                        f"expected_visible_obs_turns={expected_visible}, "
+                        f"resp_logprob_mean={float(rollout_log_probs[i][:int(response_mask[i].sum().item())].mean().item() if int(response_mask[i].sum().item()) else 0.0):.3f}"
+                    )
 
             global_step += 1
 
@@ -727,6 +833,8 @@ class MultiturnEnvRollout:
         images_list: list[list[Image.Image]],
         for_generation: bool = False,
         add_generation_prompt: bool = True,
+        full_prompts: list[list[dict]] | None = None,
+        full_images_list: list[list[Image.Image]] | None = None,
     ) -> dict[str, Any]:
         """Tokenize prompts with images into the format expected by generate_sequences.
 
@@ -755,8 +863,15 @@ class MultiturnEnvRollout:
         batch_raw_prompt_ids = []
         batch_multi_modal_data = []
         batch_raw_images = []
+        batch_packed_overrides: list = []  # per-request (positions, delta) or None
 
-        for messages, images in zip(prompts, images_list):
+        compute_packed = (
+            full_prompts is not None
+            and full_images_list is not None
+            and len(full_prompts) == len(prompts)
+        )
+
+        for idx, (messages, images) in enumerate(zip(prompts, images_list)):
             # Convert <image> placeholders in message content to HF format
             hf_messages = []
             for msg in messages:
@@ -922,6 +1037,22 @@ class MultiturnEnvRollout:
                         )
                         raw_images = raw_images[:n_surviving]
 
+            # ── Packed-MROPE override computation (past_k_steps path) ──
+            packed_override = None
+            if compute_packed:
+                try:
+                    packed_override = self._compute_packed_mrope_override(
+                        full_messages=full_prompts[idx],
+                        full_images=full_images_list[idx],
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"packed-mrope override computation failed (idx={idx}): "
+                        f"{e}. Falling back to vLLM default MROPE for this request."
+                    )
+                    packed_override = None
+            batch_packed_overrides.append(packed_override)
+
             batch_input_ids.append(input_ids)
             batch_attention_mask.append(attention_mask)
             batch_position_ids.append(position_ids)
@@ -952,7 +1083,97 @@ class MultiturnEnvRollout:
         }
         if not for_generation:
             result["multi_modal_data"] = np.array(batch_multi_modal_data, dtype=object)
+        if compute_packed:
+            override_arr = np.empty(len(batch_packed_overrides), dtype=object)
+            for i, ov in enumerate(batch_packed_overrides):
+                override_arr[i] = ov
+            result["packed_mrope_overrides"] = override_arr
         return result
+
+    def _compute_packed_mrope_override(
+        self,
+        full_messages: list[dict],
+        full_images: list[Image.Image],
+    ) -> tuple[list[int], torch.Tensor, int] | None:
+        """Compute packed MROPE positions for the K-window prefix.
+
+        Tokenizes the full trajectory, runs ``get_rope_index`` to get full
+        MROPE positions, computes per-token turn_id, and projects onto the
+        K-window using ``filter_kwindow``. Returns
+        ``(kept_token_ids, positions, delta)`` where ``kept_token_ids`` is the
+        processor-expanded token sequence vLLM will see at prefill (used as
+        the SHA-1 hash key on the vLLM side) and ``positions`` has shape
+        (3, L_kwin) with original (gappy) values.
+        """
+        from ._packed_turn_metadata import (
+            assign_turn_metadata,
+            filter_kwindow,
+        )
+
+        # Convert <image> placeholders in full messages
+        hf_messages = []
+        for msg in full_messages:
+            content = msg["content"]
+            if isinstance(content, str) and "<image>" in content:
+                content_list = []
+                for i, part in enumerate(content.split("<image>")):
+                    if i != 0:
+                        content_list.append({"type": "image"})
+                    if part:
+                        content_list.append({"type": "text", "text": part})
+                hf_messages.append({"role": msg["role"], "content": content_list})
+            else:
+                hf_messages.append(msg)
+
+        text_prompt = self.processor.apply_chat_template(
+            hf_messages, add_generation_prompt=True, tokenize=False
+        )
+
+        from ...utils.dataset import process_image
+        processed = []
+        for img in full_images:
+            if isinstance(img, np.ndarray):
+                img = Image.fromarray(img)
+            processed.append(process_image(img, self.min_pixels, self.max_pixels))
+        if not processed:
+            processed = None
+
+        full_inputs = self.processor(
+            processed,
+            [text_prompt],
+            add_special_tokens=False,
+            return_tensors="pt",
+        )
+        full_input_ids = full_inputs["input_ids"][0]
+        full_attn = full_inputs["attention_mask"][0]
+
+        if "Qwen3VLProcessor" in self.processor.__class__.__name__:
+            from ...models.transformers.qwen3_vl import get_rope_index
+        else:
+            from ...models.transformers.qwen2_vl import get_rope_index
+        full_mrope = get_rope_index(
+            self.processor,
+            input_ids=full_input_ids,
+            image_grid_thw=full_inputs.get("image_grid_thw", None),
+            video_grid_thw=None,
+            second_per_grid_ts=None,
+            attention_mask=full_attn,
+        )  # (3, L_full)
+
+        im_start_id = self.tokenizer.convert_tokens_to_ids("<|im_start|>")
+        im_end_id = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
+        turn_id, _kind = assign_turn_metadata(
+            full_input_ids.tolist(), full_messages, im_start_id, im_end_id
+        )
+
+        kept_ids, kept_pos, delta = filter_kwindow(
+            full_input_ids,
+            full_mrope,
+            turn_id,
+            past_k_steps=self.past_k_steps,
+        )
+
+        return kept_ids.tolist(), kept_pos, int(delta)
 
     def _build_final_batch(
         self,
@@ -1175,6 +1396,21 @@ class MultiturnEnvRollout:
         response_mask_full = torch.zeros(bs, seq_len, dtype=full_ids.dtype)
         split_points = []  # per-sample split in the padded sequence
 
+        # If rollout-time logprobs were captured (parity smoke), copy them
+        # into a (bs, seq_len) tensor at the assistant content positions in
+        # step order. NaN at positions without a captured value.
+        rollout_lp_full = torch.full(
+            (bs, seq_len), float("nan"), dtype=torch.float32
+        )
+        rollout_tok_full = torch.full(
+            (bs, seq_len), -1, dtype=torch.int64
+        )
+        any_lp = any(
+            len(t.step_response_log_probs) > 0
+            and any(len(lp) > 0 for lp in t.step_response_log_probs)
+            for t in trajectories
+        )
+
         for b in range(bs):
             ids = full_ids[b].tolist()
             ranges = self._find_assistant_content_ranges(ids)
@@ -1182,6 +1418,27 @@ class MultiturnEnvRollout:
                 response_mask_full[b, start : end + 1] = 1
             # Split at first assistant content start
             split_points.append(ranges[0][0] if ranges else seq_len)
+            # Copy per-step rollout logprobs into the packed positions.
+            if any_lp and b < len(trajectories):
+                t = trajectories[b]
+                for step_idx, (start, end) in enumerate(ranges):
+                    if step_idx >= len(t.step_response_log_probs):
+                        break
+                    span_len = end - start + 1
+                    lp = t.step_response_log_probs[step_idx][:span_len]
+                    if not lp:
+                        continue
+                    rollout_lp_full[b, start : start + len(lp)] = torch.tensor(
+                        lp, dtype=torch.float32
+                    )
+                    # Mirror the rollout-generated token IDs at the same
+                    # positions for parity diagnosis (BPE-boundary check).
+                    if step_idx < len(t.step_response_token_ids):
+                        rt = t.step_response_token_ids[step_idx][:span_len]
+                        if rt:
+                            rollout_tok_full[b, start : start + len(rt)] = torch.tensor(
+                                rt, dtype=torch.int64
+                            )
 
         # ── 4. Split at first assistant content boundary ──
         # Use the earliest split across the batch so all samples align.
@@ -1193,18 +1450,44 @@ class MultiturnEnvRollout:
         response_ids = full_ids[:, split:]
         response_mask_t = response_mask_full[:, split:]
 
-        # ── 5. Build TensorDict ──
-        td = TensorDict(
-            {
-                "prompts": prompt_ids,
-                "responses": response_ids,
-                "input_ids": full_ids,
-                "attention_mask": full_mask,
-                "response_mask": response_mask_t,
-                "position_ids": full_pos,
-            },
-            batch_size=bs,
-        )
+        # ── 5. Build per-token turn_id (for past-K K-window BlockMask) ──
+        # Always emit when context_mode is multi_turn; downstream (actor
+        # forward) uses it only when past_k_steps is enabled. The cost is
+        # one extra (bs, seq_len) int64 tensor.
+        # turn_id sentinels: -2 = left-padding (not visible to attention),
+        # -1 = boundary/system (always-visible anchor in K-window mask).
+        turn_id_full = torch.full((bs, seq_len), -2, dtype=torch.int64)
+        if self.context_mode == "multi_turn":
+            from ._packed_turn_metadata import assign_turn_metadata
+            im_start_id = self.tokenizer.convert_tokens_to_ids("<|im_start|>")
+            im_end_id = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
+            for b, msgs in enumerate(full_messages):
+                ids_b = full_ids[b].tolist()
+                # Skip left-padding to find the unpadded prefix.
+                pad_id = self.tokenizer.pad_token_id
+                first_real = next(
+                    (i for i, t in enumerate(ids_b) if t != pad_id), len(ids_b)
+                )
+                tids, _kind = assign_turn_metadata(
+                    ids_b[first_real:], msgs, im_start_id, im_end_id
+                )
+                turn_id_full[b, first_real : first_real + tids.shape[0]] = tids
+
+        # ── 6. Build TensorDict ──
+        td_dict = {
+            "prompts": prompt_ids,
+            "responses": response_ids,
+            "input_ids": full_ids,
+            "attention_mask": full_mask,
+            "response_mask": response_mask_t,
+            "position_ids": full_pos,
+            "turn_id": turn_id_full,
+        }
+        if any_lp:
+            # Slice to the response portion to align with old_log_probs shape.
+            td_dict["rollout_log_probs"] = rollout_lp_full[:, split:].contiguous()
+            td_dict["rollout_token_ids"] = rollout_tok_full[:, split:].contiguous()
+        td = TensorDict(td_dict, batch_size=bs)
 
         # ── UIDs ──
         n_items = bs // n_trajectories
@@ -1264,6 +1547,8 @@ class ObjectNavEnvAdapter:
         coordinate_normalization_scale: float = 1.0,
         max_observations: int = 20,
         context_mode: str = "multi_turn",
+        past_k_steps: "int | None" = None,
+        reward_mode: str = "continuous",
     ):
         self.env = env
         self.state_history = state_history
@@ -1272,6 +1557,10 @@ class ObjectNavEnvAdapter:
         self.coordinate_normalization_scale = coordinate_normalization_scale
         self.max_observations = max_observations
         self.context_mode = context_mode
+        self.past_k_steps = past_k_steps
+        if reward_mode not in ("continuous", "bimodal"):
+            raise ValueError(f"reward_mode must be 'continuous' or 'bimodal', got {reward_mode!r}")
+        self.reward_mode = reward_mode
 
         # Build the per-step instruction matching the SFT annotation format.
         # Uses the same tags as the action_proposer (explore, answer, summary).
@@ -1343,7 +1632,22 @@ class ObjectNavEnvAdapter:
             current_step_suffix=instruction,
         )
 
-    def _build_prompt_multiturn(self) -> tuple[list[dict], list[Image.Image]]:
+    def build_prompt_with_full(self) -> tuple[list[dict], list[Image.Image], list[dict] | None, list[Image.Image] | None]:
+        """Build both K-window-filtered and full-trajectory prompts.
+
+        When ``past_k_steps`` is None, returns ``(msgs, imgs, None, None)``.
+        When set, returns ``(filtered_msgs, filtered_imgs, full_msgs, full_imgs)``.
+
+        The full pair is what training and packed-MROPE position computation
+        need; the filtered pair is what vLLM actually receives at rollout.
+        """
+        msgs, imgs = self.build_prompt()
+        if self.past_k_steps is None or self.context_mode != "multi_turn":
+            return msgs, imgs, None, None
+        full_msgs, full_imgs = self._build_prompt_multiturn(_kwindow=False)
+        return msgs, imgs, full_msgs, full_imgs
+
+    def _build_prompt_multiturn(self, _kwindow: bool = True) -> tuple[list[dict], list[Image.Image]]:
         """Build prompt matching the SFT / reannotate multi-turn output format.
 
         Delegates to the canonical builder in ``src/common/prompting/context_builders.py``
@@ -1374,6 +1678,8 @@ class ObjectNavEnvAdapter:
             self.state_history,
             coordinate_normalization_scale=self.coordinate_normalization_scale,
         )
+        if _kwindow:
+            steps = filter_steps_to_kwindow(steps, self.past_k_steps)
         return build_multiturn_context(
             system_prompt=self.system_prompt,
             steps=steps,
@@ -1625,29 +1931,37 @@ class ObjectNavEnvAdapter:
             logger.warning(f"DEBUG: failed to save explore image: {e}")
 
     def get_trajectory_reward(self) -> float:
-        reward = 0.0
-        # Primary reward: success
-        if self.success:
-            reward += 1.0
-        # Format reward: average format score across steps (weight 0.1)
-        if self.format_scores:
-            avg_format = sum(self.format_scores) / len(self.format_scores)
-            reward += 0.1 * avg_format
-        # Validity reward: average validity score across steps (weight 0.15)
-        if self.validity_scores:
-            avg_validity = sum(self.validity_scores) / len(self.validity_scores)
-            reward += 0.15 * avg_validity
-        # Step penalty to encourage shorter trajectories
-        reward -= 0.005 * self.num_steps
-
         avg_fmt = sum(self.format_scores) / len(self.format_scores) if self.format_scores else 0.0
-        avg_val = sum(self.validity_scores) / len(self.validity_scores) if self.validity_scores else 0.0
+        avg_validity = sum(self.validity_scores) / len(self.validity_scores) if self.validity_scores else 0.0
+        step_penalty = 0.005 * self.num_steps
+
+        if self.reward_mode == "bimodal":
+            # Original 7588989 baseline.
+            reward = 0.0
+            if self.success:
+                reward += 1.0
+            reward += 0.1 * avg_fmt
+            reward += 0.15 * avg_validity
+            reward -= step_penalty
+            progress = None
+        else:
+            # Continuous distance progress: graded credit even on failed trajectories.
+            if self.initial_distance and self.initial_distance > 0.1:
+                progress = (self.initial_distance - self.final_distance) / self.initial_distance
+                progress = max(-0.5, min(1.0, progress))
+            else:
+                progress = 0.0
+            success_bonus = 1.0 if self.success else 0.0
+            validity_gate = 1.0 if avg_validity > 0.5 else 0.1
+            reward = validity_gate * (0.5 * progress + success_bonus) - step_penalty
+
         logger.info(
-            f"Trajectory reward: success={self.success}, "
+            f"Trajectory reward [{self.reward_mode}]: success={self.success}, "
             f"initial_distance={self.initial_distance:.2f}, "
             f"final_distance={self.final_distance:.2f}, "
+            f"progress={'n/a' if progress is None else f'{progress:+.3f}'}, "
             f"num_steps={self.num_steps}, "
-            f"avg_format={avg_fmt:.2f}, avg_validity={avg_val:.2f}, "
+            f"avg_format={avg_fmt:.2f}, avg_validity={avg_validity:.2f}, "
             f"reward={reward:.3f}"
         )
         return reward

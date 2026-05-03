@@ -83,7 +83,8 @@ class FSDPWorker(Worker):
         self._cache = {}
 
         if not dist.is_initialized():
-            dist.init_process_group(backend="nccl")
+            from datetime import timedelta
+            dist.init_process_group(backend="nccl", timeout=timedelta(seconds=1800))
 
         # improve numerical stability
         torch.backends.cuda.matmul.allow_tf32 = False
@@ -210,12 +211,55 @@ class FSDPWorker(Worker):
         else:
             AutoClass = AutoModelForCausalLM
 
+        # Past-K packed multiturn requires FlexAttention dispatch so we can
+        # pass per-batch BlockMasks. Detected via actor.past_k_steps; when
+        # unset, keep flash_attention_2 as before.
+        actor_past_k = getattr(getattr(self.config, "actor", None), "past_k_steps", None)
+        attn_impl = "flex_attention" if actor_past_k else "flash_attention_2"
+
+        # HF transformers gates flex_attention on the model class via
+        # `_supports_flex_attn`. Qwen3-VL ships with this False even though
+        # its attention layers route through ALL_ATTENTION_FUNCTIONS, so we
+        # flip the flag on the base class to allow attn_implementation=
+        # "flex_attention" to load. Safe: only patches when past_k is set.
+        if actor_past_k:
+            try:
+                from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLPreTrainedModel
+                Qwen3VLPreTrainedModel._supports_flex_attn = True
+            except ImportError:
+                pass
+
+            # Force FlexAttention triton kernel to use 64×64 tiles. Default
+            # autotuner picks BLOCK_M=BLOCK_N=128, whose kernel needs ~106KB
+            # SRAM and exceeds the ~101KB limit on Ampere/Ada (A6000/L40S/
+            # A100). We also build BlockMasks at BLOCK_SIZE=64 in
+            # _packed_kwindow_mask.py; the kernel's BLOCK_M/N must divide the
+            # mask block size, so both must be 64. Tile size only changes
+            # accumulation order — no semantic effect on outputs.
+            try:
+                from transformers.integrations import flex_attention as _hf_flex
+                if not getattr(_hf_flex, "_kwindow_block64_patched", False):
+                    _orig_compile_friendly = _hf_flex.compile_friendly_flex_attention
+
+                    def _compile_friendly_block64(query, key, value, training=False, **kwargs):
+                        ko = dict(kwargs.pop("kernel_options", None) or {})
+                        ko.setdefault("BLOCK_M", 64)
+                        ko.setdefault("BLOCK_N", 64)
+                        return _orig_compile_friendly(
+                            query, key, value, training=training, kernel_options=ko, **kwargs
+                        )
+
+                    _hf_flex.compile_friendly_flex_attention = _compile_friendly_block64
+                    _hf_flex._kwindow_block64_patched = True
+            except ImportError:
+                pass
+
         if (not fsdp_config.enable_rank0_init) or self.device_mesh.get_local_rank("fsdp") == 0:
             model = AutoClass.from_pretrained(
                 model_config.model_path,
                 config=self.model_config,
                 torch_dtype=torch_dtype,
-                attn_implementation="flash_attention_2",
+                attn_implementation=attn_impl,
                 device_map="cpu" if fsdp_config.enable_rank0_init else "cuda",
                 low_cpu_mem_usage=True,
                 trust_remote_code=model_config.trust_remote_code,
@@ -225,7 +269,7 @@ class FSDPWorker(Worker):
                 model = AutoClass.from_config(
                     self.model_config,
                     torch_dtype=torch_dtype,
-                    attn_implementation="flash_attention_2",
+                    attn_implementation=attn_impl,
                     trust_remote_code=model_config.trust_remote_code,
                 )
 
@@ -691,8 +735,81 @@ class FSDPWorker(Worker):
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)
             output = self.actor.compute_log_prob(data=data)
+            tensors_out = {"old_log_probs": output}
+            # ── Parity check: compare against vLLM rollout-time logprobs ──
+            if "rollout_log_probs" in data.batch.keys():
+                try:
+                    rollout_lp = data.batch["rollout_log_probs"].to(output.device)
+                    response_mask = data.batch["response_mask"].to(output.device).bool()
+                    valid = response_mask & ~torch.isnan(rollout_lp)
+                    n_valid = int(valid.sum().item())
+                    if n_valid > 0:
+                        delta = (output - rollout_lp).abs()[valid]
+                        max_d = float(delta.max().item())
+                        mean_d = float(delta.mean().item())
+                        # Per-quartile distribution for fine-grained read.
+                        q = torch.quantile(
+                            delta, torch.tensor([0.5, 0.9, 0.99], device=delta.device)
+                        ).tolist()
+                        import logging as _logging
+                        _logging.getLogger("verl.workers.fsdp_workers").warning(
+                            f"[parity] rollout↔train logprob delta over "
+                            f"{n_valid} response tokens: max={max_d:.4f} "
+                            f"mean={mean_d:.4f} p50={q[0]:.4f} p90={q[1]:.4f} "
+                            f"p99={q[2]:.4f}"
+                        )
+                        # Emit as a tensor so the trainer can log it to wandb.
+                        tensors_out["rollout_train_logprob_delta"] = (
+                            output - rollout_lp
+                        )
+                        # Optional per-token dump for parity triage. Gated by
+                        # PARITY_DEBUG_DIR env var so this is fully reversible.
+                        import os as _os
+                        dump_dir = _os.environ.get("PARITY_DEBUG_DIR")
+                        if dump_dir:
+                            import json as _json
+                            _os.makedirs(dump_dir, exist_ok=True)
+                            rank = int(_os.environ.get("RANK", "0"))
+                            path = _os.path.join(dump_dir, f"parity_rank{rank}.jsonl")
+                            prompts_t = data.batch.get("prompts")
+                            split = int(prompts_t.shape[-1]) if prompts_t is not None else 0
+                            turn_id_full = data.batch.get("turn_id")
+                            position_ids_full = data.batch.get("position_ids")
+                            input_ids_full = data.batch.get("input_ids")
+                            responses_full = data.batch.get("responses")
+                            rollout_tok_ids = data.batch.get("rollout_token_ids")
+                            bs, resp_len = output.shape
+                            with open(path, "a") as _f:
+                                for b in range(bs):
+                                    for t in range(resp_len):
+                                        if not bool(response_mask[b, t].item()):
+                                            continue
+                                        rec = {
+                                            "b": b, "t": t,
+                                            "rollout_lp": float(rollout_lp[b, t].item()),
+                                            "train_lp": float(output[b, t].item()),
+                                            "delta": float((output[b, t] - rollout_lp[b, t]).item()),
+                                        }
+                                        if turn_id_full is not None:
+                                            rec["turn_id"] = int(turn_id_full[b, split + t].item())
+                                        if position_ids_full is not None:
+                                            rec["pos"] = int(position_ids_full[b, 0, split + t].item())
+                                        if input_ids_full is not None:
+                                            rec["train_tok"] = int(input_ids_full[b, split + t].item())
+                                        if responses_full is not None and t < responses_full.shape[1]:
+                                            rec["resp_tok"] = int(responses_full[b, t].item())
+                                        if rollout_tok_ids is not None and t < rollout_tok_ids.shape[1]:
+                                            rt = int(rollout_tok_ids[b, t].item())
+                                            if rt >= 0:
+                                                rec["roll_tok"] = rt
+                                        _f.write(_json.dumps(rec) + "\n")
+                except Exception as _e:
+                    import logging as _logging
+                    _logging.getLogger("verl.workers.fsdp_workers").warning(
+                        f"[parity] comparison failed: {_e}"
+                    )
             output = DataProto.from_dict(
-                tensors={"old_log_probs": output}, meta_info={"temperature": self.config.rollout.temperature}
+                tensors=tensors_out, meta_info={"temperature": self.config.rollout.temperature}
             )
             output = self.ulysses_sharding_manager.postprocess_data(output)
 

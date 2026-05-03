@@ -114,6 +114,8 @@ def _create_simulator_pools(mt_cfg, n_gpus: int):
             coordinate_normalization_scale=coord_scale,
             max_observations=mt_cfg.max_observations,
             context_mode=mt_cfg.context_mode,
+            past_k_steps=mt_cfg.past_k_steps,
+            reward_mode=mt_cfg.reward_mode,
         )
         pools.append(pool)
 
@@ -199,6 +201,7 @@ def _create_multiturn_rollout(config: PPOConfig, tokenizer, processor):
         prior_image_scale=mt_cfg.prior_image_scale,
         context_mode=mt_cfg.context_mode,
         force_max_depth=mt_cfg.force_max_depth,
+        past_k_steps=mt_cfg.past_k_steps,
     )
 
 
@@ -269,6 +272,7 @@ def _create_val_multiturn_rollout(config: PPOConfig, tokenizer, processor, simul
         prior_image_scale=mt_cfg.prior_image_scale,
         context_mode=mt_cfg.context_mode,
         force_max_depth=mt_cfg.force_max_depth,
+        past_k_steps=mt_cfg.past_k_steps,
     )
 
 
@@ -320,6 +324,19 @@ class Runner:
         val_multiturn_rollout = None
         if config.worker.multiturn_env.enabled:
             logging.info("Multi-turn environment rollout mode enabled")
+            # Mirror multiturn_env.past_k_steps → actor.past_k_steps so the
+            # actor builds the matching K-window BlockMask. Force
+            # padding_free=False because the unpad varlen path is
+            # incompatible with FlexAttention BlockMask.
+            mt_past_k = config.worker.multiturn_env.past_k_steps
+            if mt_past_k:
+                config.worker.actor.past_k_steps = mt_past_k
+                if config.worker.actor.padding_free:
+                    logging.warning(
+                        "past_k_steps is set; forcing actor.padding_free=False "
+                        "(BlockMask is incompatible with the unpad varlen path)."
+                    )
+                    config.worker.actor.padding_free = False
             train_dataloader = _DummyDataLoader()
             multiturn_rollout = _create_multiturn_rollout(config, tokenizer, processor)
             logging.info("Multiturn rollout created successfully")

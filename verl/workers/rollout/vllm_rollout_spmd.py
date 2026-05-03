@@ -29,6 +29,7 @@ from ...utils import torch_functional as VF
 from ...utils.dataset import process_image, process_video
 from ...utils.torch_dtypes import PrecisionType
 from ...utils.vllm_utils import VLLMHijack
+from ._packed_mrope_hook import overrides as packed_mrope_overrides_ctx
 from .base import BaseRollout
 from .config import RolloutConfig
 
@@ -140,16 +141,27 @@ class vLLMRollout(BaseRollout):
 
         # Offload vllm model to reduce peak memory usage
         try:
-            self.inference_engine.sleep(level=1)
+            self.inference_engine.sleep(level=2)
         except Exception as e:
-            print(f"WARNING: vLLM sleep(level=1) failed: {e}")
+            print(f"WARNING: vLLM sleep(level=2) failed: {e}")
             print("Continuing without sleep mode — this may increase peak memory usage.")
 
+        # Stop strings require vLLM's incremental detokenizer to compare against
+        # the decoded text — flip detokenize on when any are configured.
+        has_stop_strings = bool(getattr(config, "stop", None))
         sampling_kwargs = {
             "max_tokens": config.response_length,
-            "detokenize": False,
+            "detokenize": has_stop_strings,
             "logit_bias": _get_logit_bias(processor),
         }
+        if has_stop_strings:
+            sampling_kwargs["include_stop_str_in_output"] = True
+        if getattr(config, "parity_log_probs", False):
+            # logprobs=1 returns the sampled token's logprob per step.
+            # Setting 0 caused vLLM to leave the position-0 dict empty,
+            # which silently fell back to 0.0 and corrupted the first
+            # response token of every step in the parity comparison.
+            sampling_kwargs["logprobs"] = 1
         default_sampling_params = SamplingParams()
         for key in config.to_dict().keys():
             if hasattr(default_sampling_params, key):
@@ -189,6 +201,12 @@ class vLLMRollout(BaseRollout):
         # raw_images is a 1-D numpy object array of Python lists of PIL images,
         # stored in non_tensor_batch so it gets properly sharded with the batch.
         batch_raw_images = non_tensor_batch.pop("raw_images", None)
+        # Packed-MROPE side channel: per-request (positions, delta) for past-K
+        # multiturn. When set, vLLM's Qwen3-VL subclass (registered via
+        # _packed_mrope_hook/sitecustomize.py) reads positions from /dev/shm
+        # keyed by sha1(prompt_token_ids). Each entry is (positions, delta) or
+        # None to fall through to vLLM's default MROPE computation.
+        batch_packed_mrope = non_tensor_batch.pop("packed_mrope_overrides", None)
         if batch_size != len(batch_raw_prompt_ids):
             raise RuntimeError("vllm sharding manager is not work properly.")
 
@@ -234,8 +252,24 @@ class vLLMRollout(BaseRollout):
                     LoRARequest(lora_name=f"{lora_int_id}", lora_int_id=lora_int_id, lora_path="/simon-stub-path")
                 ] * batch_size
 
+        # Build packed-MROPE override list (write /dev/shm/<sha1>.bin per
+        # request before generate; auto-unlink after).
+        packed_requests: list = []
+        if batch_packed_mrope is not None:
+            for override in batch_packed_mrope:
+                if override is None:
+                    continue
+                # override is (kept_input_ids, positions, delta) — kept_input_ids
+                # is the processor-expanded token sequence (one image → many
+                # patch tokens). vLLM's MROPE hook hashes the prefill tokens it
+                # actually receives, which are the expanded form, so we key on
+                # kept_input_ids — not on the unexpanded raw_prompt_ids.
+                kept_input_ids, positions, delta = override
+                packed_requests.append((tuple(kept_input_ids), positions, delta))
+
         # users can customize different sampling_params at different run
-        with self.update_sampling_params(**prompts.meta_info):
+        with self.update_sampling_params(**prompts.meta_info), \
+                packed_mrope_overrides_ctx(packed_requests):
             completions: list[RequestOutput] = self.inference_engine.generate(
                 prompts=vllm_inputs,
                 sampling_params=self.sampling_params,
@@ -246,6 +280,24 @@ class vLLMRollout(BaseRollout):
             response_ids = VF.pad_2d_list_to_length(
                 response_ids, self.pad_token_id, max_length=self.config.response_length
             ).to(input_ids.device)
+
+            # Capture per-token sampled logprobs when parity mode is enabled.
+            rollout_log_probs = None
+            if getattr(self.config, "parity_log_probs", False):
+                lp_lists: list[list[float]] = []
+                for completion in completions:
+                    for output in completion.outputs:
+                        lp_per_tok: list[float] = []
+                        # output.logprobs is a list of dicts {token_id: Logprob}
+                        # — one per generated token.
+                        if output.logprobs is not None:
+                            for tok_id, lp_dict in zip(output.token_ids, output.logprobs):
+                                lp = lp_dict.get(tok_id)
+                                lp_per_tok.append(float(lp.logprob) if lp is not None else float("nan"))
+                        lp_lists.append(lp_per_tok)
+                rollout_log_probs = VF.pad_2d_list_to_length(
+                    lp_lists, 0.0, max_length=self.config.response_length
+                ).to(input_ids.device).to(torch.float32)
 
             if self.sampling_params.n > 1:
                 batch_size = batch_size * self.sampling_params.n
@@ -273,17 +325,19 @@ class vLLMRollout(BaseRollout):
         attention_mask = torch.cat((attention_mask, response_mask), dim=-1)
 
         # all the tp ranks should contain the same data here. data in all ranks are valid
-        batch = TensorDict(
-            {
-                "prompts": input_ids,
-                "responses": response_ids,
-                "input_ids": sequence_ids,  # here input_ids become the whole sentences
-                "attention_mask": attention_mask,
-                "response_mask": response_mask,
-                "position_ids": position_ids,
-            },
-            batch_size=batch_size,
-        )
+        batch_dict = {
+            "prompts": input_ids,
+            "responses": response_ids,
+            "input_ids": sequence_ids,  # here input_ids become the whole sentences
+            "attention_mask": attention_mask,
+            "response_mask": response_mask,
+            "position_ids": position_ids,
+        }
+        if rollout_log_probs is not None:
+            # Already (B*n, L) from the `completions[*].outputs[*]` flatten — same
+            # shape as response_ids. No further repeat_interleave needed.
+            batch_dict["rollout_log_probs"] = rollout_log_probs
+        batch = TensorDict(batch_dict, batch_size=batch_size)
         if batch_multi_modal_data is not None:
             non_tensor_batch = {"multi_modal_data": batch_multi_modal_data}
         else:

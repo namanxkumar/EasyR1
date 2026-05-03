@@ -202,7 +202,7 @@ class FSDPVLLMShardingManager(BaseShardingManager):
 
         print_gpu_memory_usage("Before vllm offload in sharding manager")
         free_bytes_before_sleep = torch.cuda.mem_get_info()[0]
-        self.inference_engine.sleep(level=1)
+        self.inference_engine.sleep(level=2)
         free_bytes_after_sleep = torch.cuda.mem_get_info()[0]
         self.freed_bytes = free_bytes_after_sleep - free_bytes_before_sleep
         print_gpu_memory_usage("After vllm offload in sharding manager")

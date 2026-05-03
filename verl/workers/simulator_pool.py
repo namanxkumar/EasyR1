@@ -55,6 +55,8 @@ class SimulatorPool:
         coordinate_normalization_scale: float = 1.0,
         max_observations: int = 20,
         context_mode: str = "multi_turn",
+        past_k_steps: "int | None" = None,
+        reward_mode: str = "continuous",
     ):
         # Force AI2Thor to use the specified GPU (set before any CUDA init)
         os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
@@ -68,6 +70,8 @@ class SimulatorPool:
         self.coordinate_normalization_scale = coordinate_normalization_scale
         self.max_observations = max_observations
         self.context_mode = context_mode
+        self.past_k_steps = past_k_steps
+        self.reward_mode = reward_mode
 
         # Slot management
         self.slots: list[Optional[Any]] = [None] * num_slots
@@ -291,6 +295,8 @@ class SimulatorPool:
                 coordinate_normalization_scale=self.coordinate_normalization_scale,
                 max_observations=self.max_observations,
                 context_mode=self.context_mode,
+                past_k_steps=self.past_k_steps,
+                reward_mode=self.reward_mode,
             )
 
             self.slots[slot_id] = adapter
@@ -390,6 +396,19 @@ class SimulatorPool:
         if adapter is None:
             raise ValueError(f"Slot {slot_id} is empty")
         return adapter.build_prompt()
+
+    def build_prompt_with_full(self, slot_id: int) -> tuple:
+        """Build both K-window-filtered and full-trajectory prompts.
+
+        Returns ``(msgs, imgs, full_msgs, full_imgs)``. The last two are
+        ``None`` when ``past_k_steps`` is disabled. Used by the past-K
+        packed-MROPE path to compute packed position IDs from the full
+        trajectory layout while only sending the K-window to vLLM.
+        """
+        adapter = self.slots[slot_id]
+        if adapter is None:
+            raise ValueError(f"Slot {slot_id} is empty")
+        return adapter.build_prompt_with_full()
 
     def get_trajectory_reward(self, slot_id: int) -> float:
         """Get the trajectory-level reward for a completed episode."""

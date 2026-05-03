@@ -455,6 +455,13 @@ class RayPPOTrainer:
             metrics["val/avg_steps"] = float(np.mean(steps_list))
             metrics["val/avg_format"] = float(np.mean(format_scores))
             metrics["val/avg_validity"] = float(np.mean(validity_scores))
+            # pass@k: trajectories are sorted by (group_id, n_idx), so every
+            # mt_cfg.val_n consecutive entries belong to the same val episode.
+            k = int(mt_cfg.val_n)
+            if k > 1 and len(successes) % k == 0:
+                arr = np.array(successes).reshape(-1, k)
+                metrics[f"val/pass_at_{k}"] = float(arr.max(axis=1).mean())
+                metrics["val/pass_at_1"] = float(arr[:, 0].mean())
 
         # Use env/* metrics from generate_trajectories if available
         for k, v in val_metrics.items():
@@ -702,10 +709,21 @@ class RayPPOTrainer:
                     with timer("reward", timing_raw):
                         reward_ref = self.reward_fn.compute_reward.remote(batch)
 
-                # recompute old_log_probs
+                # recompute old_log_probs (or reuse vLLM rollout logprobs)
                 with timer("old", timing_raw):
-                    old_log_probs = self.actor_rollout_ref_wg.compute_log_probs(batch)
-                    batch = batch.union(old_log_probs)
+                    reuse_rollout = (
+                        getattr(self.config.worker.rollout, "use_rollout_log_probs", False)
+                        and "rollout_log_probs" in batch.batch.keys()
+                    )
+                    if reuse_rollout:
+                        rlp = batch.batch["rollout_log_probs"]
+                        batch.batch["old_log_probs"] = torch.nan_to_num(rlp, nan=0.0)
+                        # compute_log_probs would have set this; update_policy
+                        # reads it via data.meta_info["temperature"].
+                        batch.meta_info["temperature"] = self.config.worker.rollout.temperature
+                    else:
+                        old_log_probs = self.actor_rollout_ref_wg.compute_log_probs(batch)
+                        batch = batch.union(old_log_probs)
 
                 # compute ref_log_probs
                 if self.use_reference_policy:

@@ -58,6 +58,29 @@ class MultiturnEnvConfig:
     1.0 = no downscaling, 0.5 = half each dimension."""
     max_observations: int = 20
     """Maximum observation images to include in prompt context."""
+    past_k_steps: Optional[int] = None
+    """Past-K observation truncation for multi_turn rollout (packed §3b design).
+
+    When set to a positive integer K, each rollout step S sees only system + turn 0
+    (task description) + the last K observation turns; older obs and their <think>+
+    action tokens are hidden. Training packs the full trajectory but applies a
+    structured FlexAttention block mask + custom MROPE positions so that each
+    assistant turn's training view matches its rollout view exactly.
+
+    None or <= 0 disables truncation (current full-history behavior). Only takes
+    effect when context_mode='multi_turn'."""
+    reward_mode: str = "continuous"
+    """Trajectory reward formulation.
+
+    'continuous': validity_gate * (0.5 * progress + success_bonus) - 0.005 * num_steps,
+        where progress = (initial_distance - final_distance) / initial_distance.
+        Gives graded credit on failed trajectories — avoids zero-advantage groups
+        when success rate is high.
+    'bimodal' (original 7588989 baseline): success_bonus + 0.1 * avg_format
+        + 0.15 * avg_validity - 0.005 * num_steps. Reward concentrates on
+        success/no-success binary; format/validity are near-ceiling on the SFT
+        ckpt so this is effectively bimodal {~0.21, ~1.22}.
+    """
     context_mode: str = "multi_turn"
     """Prompt context mode: 'multi_turn' uses proper user/assistant turn
     alternation with full reasoning history preserved, 'single_turn' packs
@@ -114,6 +137,29 @@ class RolloutConfig:
     disable_log_stats: bool = True
     disable_tqdm: bool = False
     val_override_config: dict[str, Any] = field(default_factory=dict)
+    stop: list[str] = field(default_factory=list)
+    """Stop strings passed to vLLM SamplingParams. Generation halts as soon as
+    any of these substrings appears in the decoded output (used for multiturn
+    ObjectNav: ``["</answer>", "</explore>"]`` cuts trailing tokens after the
+    action tag closes). Empty list = no stop strings."""
+    parity_log_probs: bool = False
+    """Capture per-response-token logprobs from vLLM during rollout.
+
+    When True, vLLM is asked to emit ``logprobs=1`` so the actor can compare
+    rollout-time logprobs against FSDP-side ``compute_log_probs`` for every
+    sampled token. Adds a `rollout_log_probs` (B, response_length) tensor to
+    the generate_sequences output. Off by default — used only for the
+    parity smoke test."""
+    use_rollout_log_probs: bool = False
+    """Skip the actor's ``compute_log_probs`` recompute and reuse vLLM's
+    rollout-time logprobs as ``old_log_probs`` for the PPO ratio.
+
+    Eliminates the entire log-prob recompute phase (typically half of the
+    actor's per-step cost). Requires ``parity_log_probs=True`` so the
+    rollout actually emits the tensor. Recommended only when KL is disabled
+    (DAPO-style) since the ref policy still needs an FSDP forward; pairing
+    with KL gives smaller savings. Accepts ~1e-3 numerical drift between
+    vLLM (FP16) and FSDP (BF16); ViGoRL operates in this regime."""
     # below are auto keys
     prompt_length: int = field(default=-1, init=False)
     response_length: int = field(default=-1, init=False)

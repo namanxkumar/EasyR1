@@ -160,6 +160,12 @@ class PPOConfig:
         self.worker.actor.use_kl_loss = self.algorithm.use_kl_loss
         self.worker.actor.kl_penalty = self.algorithm.kl_penalty
         self.worker.actor.kl_coef = self.algorithm.kl_coef
+        # use_rollout_log_probs requires parity_log_probs to actually capture
+        # the tensor from vLLM — auto-enable the capture flag so the user
+        # can't silently mis-configure (would otherwise fall through to FSDP
+        # recompute without warning).
+        if self.worker.rollout.use_rollout_log_probs:
+            self.worker.rollout.parity_log_probs = True
 
     def deep_post_init(self):
         recursive_post_init(self)

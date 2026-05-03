@@ -75,6 +75,27 @@ class DataParallelPPOActor(BasePPOActor):
         position_ids = micro_batch["position_ids"]
         responses = micro_batch["responses"]
         response_length = responses.size(-1)
+        # Past-K packed multiturn: when ``turn_id`` is present and the model
+        # is configured for FlexAttention, build a K-window BlockMask and
+        # pass it as the attention mask. Falls back to the standard mask
+        # when ``turn_id`` is absent or ``past_k_steps`` is None.
+        # NOTE: BlockMask is not compatible with the padding-free / unpad
+        # path; callers must use config.padding_free=False when
+        # past_k_steps is enabled.
+        kwindow_block_mask = None
+        past_k_steps = getattr(self.config, "past_k_steps", None)
+        if past_k_steps and "turn_id" in micro_batch:
+            from verl.workers.rollout._packed_kwindow_mask import (
+                build_kwindow_blockmask,
+            )
+            # block_size=64 keeps the FlexAttention triton kernel under the
+            # ~100KB shared-memory limit on Ampere/Ada GPUs (A6000/L40S/A100).
+            # The default 128 generates a kernel needing 106KB SRAM and
+            # InductorErrors out at autotune. Smaller blocks change tile-order
+            # accumulation only — bit-level fp drift, no semantic effect.
+            kwindow_block_mask = build_kwindow_blockmask(
+                micro_batch["turn_id"], past_k_steps, block_size=64
+            )
         if position_ids.dim() == 3:  # qwen2vl mrope
             position_ids = position_ids.transpose(0, 1)  # (bsz, 4, seqlen) -> (4, bsz, seqlen)
 
@@ -139,9 +160,16 @@ class DataParallelPPOActor(BasePPOActor):
             )
             log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
         else:
+            # When the K-window BlockMask is active, the HF model
+            # (with _attn_implementation="flex_attention") consumes it
+            # via the attention_mask kwarg. The original 2D attention_mask
+            # is unused in that path.
+            attn_kwarg = (
+                kwindow_block_mask if kwindow_block_mask is not None else attention_mask
+            )
             output = self.actor_module(
                 input_ids=input_ids,
-                attention_mask=attention_mask,
+                attention_mask=attn_kwarg,
                 position_ids=position_ids,
                 **multi_modal_inputs,
                 use_cache=False,
@@ -190,6 +218,8 @@ class DataParallelPPOActor(BasePPOActor):
 
         temperature = data.meta_info["temperature"]
         select_keys = ["input_ids", "attention_mask", "position_ids", "responses"]
+        if "turn_id" in data.batch.keys():
+            select_keys.append("turn_id")
         non_tensor_select_keys = ["multi_modal_inputs"]
 
         data = data.select(select_keys, non_tensor_select_keys)
@@ -217,6 +247,8 @@ class DataParallelPPOActor(BasePPOActor):
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid slient error
         select_keys = ["input_ids", "attention_mask", "position_ids", "responses", "response_mask"]
+        if "turn_id" in data.batch.keys():
+            select_keys.append("turn_id")
         select_keys.extend(["old_log_probs", "ref_log_probs", "advantages"])
         non_tensor_select_keys = ["multi_modal_inputs"]
 

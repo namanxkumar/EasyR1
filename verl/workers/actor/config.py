@@ -124,6 +124,11 @@ class ActorConfig:
     """ulysses sequence parallel size"""
     use_torch_compile: bool = True
     """enable torch compile"""
+    past_k_steps: "int | None" = None
+    """K-window size for past-K packed multiturn. When set, the actor builds
+    a FlexAttention BlockMask restricting each query to the last K obs turns
+    + system + anchor turn 0. Mirrors MultiturnEnvConfig.past_k_steps and
+    requires padding_free=False + flex_attention dispatch on the model."""
     tau_positive: float = 1.0
     """temperature for positive tokens"""
     tau_negative: float = 1.05
