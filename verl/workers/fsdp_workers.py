@@ -719,6 +719,44 @@ class FSDPWorker(Worker):
         output = output.to("cpu")
         return output
 
+    # ── Async per-trajectory rollout path (rollout.async_mode=true) ───────
+    # `@register` is required so the methods are bound onto the WorkerDict
+    # actor as `actor_rollout_ref_<name>`. The dispatch_mode is irrelevant
+    # here — the driver bypasses the worker group's collective dispatch by
+    # calling `wg.workers[rank].actor_rollout_ref_<name>.remote(...)` directly,
+    # which addresses one rank at a time.
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    async def generate_one_async(
+        self,
+        request_id: str,
+        prompt_token_ids: list,
+        multi_modal_data: dict | None = None,
+        sampling_overrides: dict | None = None,
+        packed_mrope_override=None,
+        min_pixels: int = 0,
+        max_pixels: int = 0,
+        video_fps: float = 2.0,
+    ):
+        """Submit one prompt to this rank's vLLM engine and return the completion."""
+        assert self._has_rollout
+        return await self.rollout.generate_one(
+            request_id=request_id,
+            prompt_token_ids=prompt_token_ids,
+            multi_modal_data=multi_modal_data,
+            sampling_overrides=sampling_overrides,
+            packed_mrope_override=packed_mrope_override,
+            min_pixels=min_pixels,
+            max_pixels=max_pixels,
+            video_fps=video_fps,
+        )
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    async def wait_rollout_idle(self):
+        """Drain barrier — block until this rank's vLLM engine has no in-flight requests."""
+        assert self._has_rollout
+        await self.rollout.wait_idle()
+
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_log_probs(self, data: DataProto):
         assert self._has_actor

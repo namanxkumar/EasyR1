@@ -160,6 +160,26 @@ class RolloutConfig:
     (DAPO-style) since the ref policy still needs an FSDP forward; pairing
     with KL gives smaller savings. Accepts ~1e-3 numerical drift between
     vLLM (FP16) and FSDP (BF16); ViGoRL operates in this regime."""
+    async_mode: bool = False
+    """Drive the in-process vLLM engine via asyncio so the multiturn rollout
+    can submit one request per trajectory and let vLLM's continuous batching
+    overlap GPU work with environment steps.
+
+    When True, vLLMRollout exposes ``async generate_one(...)`` and
+    ``async wait_idle()`` in addition to the existing batched
+    ``generate_sequences``. The multiturn driver (``MultiturnEnvRollout``)
+    runs each trajectory as its own coroutine, calling ``generate_one`` as
+    soon as the env step returns. The drain barrier (``wait_idle``) fires
+    once per PPO step before FSDP↔vLLM weight sync.
+
+    Constraints:
+    - TP=1 only. With TP>1, every TP rank must call ``engine.step()`` in
+      lockstep with the same in-flight requests; the per-rank async path
+      doesn't yet broadcast new requests across the TP group.
+    - Existing direct-memory weight sync at ``fsdp_vllm.py`` requires the
+      engine to live in the same Python process. Async is intentionally
+      built around the sync ``LLMEngine`` (driven from asyncio) instead of
+      ``AsyncLLM`` (which forks the engine and breaks the weight sync)."""
     # below are auto keys
     prompt_length: int = field(default=-1, init=False)
     response_length: int = field(default=-1, init=False)

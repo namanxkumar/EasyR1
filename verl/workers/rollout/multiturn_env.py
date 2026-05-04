@@ -11,6 +11,7 @@ pipeline (KL, advantage, actor update).
 
 from __future__ import annotations
 
+import asyncio
 import ctypes
 import gc
 import json
@@ -86,6 +87,78 @@ def _force_free_memory():
         pass
 
 
+def _percentile(values: list[float], q: float) -> float:
+    if not values:
+        return 0.0
+    return float(np.percentile(values, q))
+
+
+def _compute_async_phase_metrics(
+    trajectories: list["Trajectory"], total_wall_s: float
+) -> dict[str, float]:
+    """Aggregate per-step phase timings + concurrency from async rollout.
+
+    Emitted under ``rollout/*`` keys. Returns an empty dict when no trajectory
+    recorded timings (e.g. all coroutines failed before the first step).
+    """
+    prompt_ms: list[float] = []
+    gen_ms: list[float] = []
+    env_ms: list[float] = []
+    traj_wall_ms: list[float] = []
+    events: list[tuple[float, int]] = []  # (timestamp, +1 start / -1 end)
+
+    for t in trajectories:
+        for step in t.step_phase_times:
+            prompt_ms.append(step.get("prompt_ms", 0.0))
+            gen_ms.append(step.get("gen_ms", 0.0))
+            env_ms.append(step.get("env_ms", 0.0))
+        if t.traj_start_ts is not None and t.traj_end_ts is not None:
+            traj_wall_ms.append((t.traj_end_ts - t.traj_start_ts) * 1000.0)
+            events.append((t.traj_start_ts, +1))
+            events.append((t.traj_end_ts, -1))
+
+    if not prompt_ms and not traj_wall_ms:
+        return {}
+
+    out: dict[str, float] = {"rollout/total_wall_ms": total_wall_s * 1000.0}
+
+    for name, vals in (
+        ("prompt", prompt_ms),
+        ("gen", gen_ms),
+        ("env", env_ms),
+    ):
+        if not vals:
+            continue
+        out[f"rollout/phase_{name}_ms_avg"] = float(np.mean(vals))
+        out[f"rollout/phase_{name}_ms_p50"] = _percentile(vals, 50)
+        out[f"rollout/phase_{name}_ms_p90"] = _percentile(vals, 90)
+        out[f"rollout/phase_{name}_ms_sum"] = float(np.sum(vals))
+
+    if traj_wall_ms:
+        out["rollout/traj_wall_ms_avg"] = float(np.mean(traj_wall_ms))
+        out["rollout/traj_wall_ms_p50"] = _percentile(traj_wall_ms, 50)
+        out["rollout/traj_wall_ms_p90"] = _percentile(traj_wall_ms, 90)
+
+    # Concurrency: sweep start/end events. Avg is time-weighted, peak is the
+    # max number of simultaneously-running coroutines.
+    if events:
+        events.sort(key=lambda e: (e[0], -e[1]))  # starts before ends at ties
+        peak = 0
+        cur = 0
+        weighted = 0.0
+        prev_t = events[0][0]
+        for ts, delta in events:
+            weighted += cur * (ts - prev_t)
+            cur += delta
+            peak = max(peak, cur)
+            prev_t = ts
+        span = events[-1][0] - events[0][0]
+        out["rollout/concurrency_peak"] = float(peak)
+        out["rollout/concurrency_avg"] = float(weighted / span) if span > 0 else float(peak)
+
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Generic environment interface (kept for ObjectNavEnvAdapter used in pool)
 # ---------------------------------------------------------------------------
@@ -151,6 +224,14 @@ class Trajectory:
     # Cached prompt/images from the last generation step (for final batch)
     last_prompt: list[dict] | None = None
     last_images: list[Any] = field(default_factory=list)
+
+    # Per-step phase timings (async rollout instrumentation). Each entry:
+    # {"prompt_ms": float, "gen_ms": float, "env_ms": float}. Empty when
+    # rollout runs in the synchronous lockstep mode.
+    step_phase_times: list[dict[str, float]] = field(default_factory=list)
+    # Wall-clock window of the trajectory's coroutine (for concurrency stats).
+    traj_start_ts: float | None = None
+    traj_end_ts: float | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -311,11 +392,25 @@ class MultiturnEnvRollout:
         )
 
         # ── Continuous episode loop with dynamic slot reuse ──
-        self._run_continuous_episode_loop(
-            active_trajectories, all_trajectories,
-            pending_queue, actor_rollout_ref_wg, config,
-            override_config=override_config,
-        )
+        # Async mode: each trajectory is its own coroutine; vLLM continuous
+        # batching overlaps GPU work with environment steps. Falls back to
+        # the synchronous lockstep loop when async_mode is off.
+        async_mode = bool(getattr(config.worker.rollout, "async_mode", False))
+        if async_mode:
+            asyncio.run(
+                self._run_async_episode_loop(
+                    active_trajectories, all_trajectories,
+                    pending_queue, actor_rollout_ref_wg, config,
+                    total_slots=total_slots,
+                    override_config=override_config,
+                )
+            )
+        else:
+            self._run_continuous_episode_loop(
+                active_trajectories, all_trajectories,
+                pending_queue, actor_rollout_ref_wg, config,
+                override_config=override_config,
+            )
 
         # Sort by (group_id, n_idx) for deterministic ordering expected by
         # _build_final_batch (UIDs are assigned sequentially per group).
@@ -336,6 +431,11 @@ class MultiturnEnvRollout:
         metrics["env/avg_steps"] = avg_steps
         metrics["env/avg_reward"] = avg_reward
         metrics["reward/overall"] = avg_reward
+        if async_mode:
+            phase_metrics = _compute_async_phase_metrics(
+                all_trajectories, total_wall_s=time.time() - t_start
+            )
+            metrics.update(phase_metrics)
         logger.info(
             f"Rollout complete: {len(all_trajectories)} trajectories in "
             f"{time.time() - t_start:.1f}s | "
@@ -669,6 +769,264 @@ class MultiturnEnvRollout:
                     )
 
             global_step += 1
+
+    # ── Async per-trajectory episode loop (rollout.async_mode=true) ─────
+
+    async def _run_async_episode_loop(
+        self,
+        active: list[Trajectory],
+        all_trajectories: list[Trajectory],
+        pending_queue,
+        actor_rollout_ref_wg,
+        config,
+        total_slots: int,
+        override_config: dict[str, Any] | None = None,
+    ) -> None:
+        """Per-trajectory async rollout: each trajectory is its own coroutine.
+
+        Replaces the lockstep `_run_continuous_episode_loop` with a true
+        per-trajectory model. As soon as a trajectory's env step returns, its
+        coroutine submits the next vLLM request via
+        `wg.workers[rank].generate_one_async.remote(...)` — vLLM's continuous
+        batching handles GPU sharing across all in-flight requests. Stragglers
+        no longer idle the GPU; vLLM no longer idles all simulators.
+
+        Trajectory→DP-rank routing is round-robin; with TP=1 each DP rank has
+        its own engine, so independent trajectories landing on the same rank
+        share that rank's engine via vLLM batching.
+
+        Drain barrier is implicit: this coroutine returns only after every
+        scheduled trajectory has completed (and thus its `generate_one`
+        future has resolved), so the engine is naturally idle by the time
+        the trainer calls `release_rollout_engine`.
+        """
+        n_workers = len(actor_rollout_ref_wg.workers)
+        if n_workers <= 0:
+            raise RuntimeError("actor_rollout_ref_wg.workers is empty; cannot run async rollout.")
+
+        # Counters used as round-robin assignments and for logging.
+        _rank_counter = {"i": 0}
+        _running = {"n": 0}
+        _completed = {"n": 0}
+        _failed_steps = {"n": 0}
+
+        def _next_rank() -> int:
+            r = _rank_counter["i"] % n_workers
+            _rank_counter["i"] += 1
+            return r
+
+        t_start = time.time()
+
+        async def run_traj(t: Trajectory) -> Trajectory:
+            rank = _next_rank()
+            _running["n"] += 1
+            t.traj_start_ts = time.time()
+            try:
+                while not t.terminated and t.num_steps < self.max_depth:
+                    use_full = self.past_k_steps is not None
+                    t_phase_start = time.time()
+                    try:
+                        if use_full:
+                            messages, images, full_messages, full_images = (
+                                await t.pool.build_prompt_with_full.remote(t.slot_id)
+                            )
+                        else:
+                            messages, images = await t.pool.build_prompt.remote(t.slot_id)
+                            full_messages, full_images = None, None
+                    except Exception as e:
+                        logger.warning(
+                            f"  [async grp {t.group_id}/{t.n_idx}] build_prompt failed: {e}. Terminating."
+                        )
+                        t.terminated = True
+                        break
+
+                    # Cache for final batch (full trajectory when past_k is on).
+                    if use_full:
+                        t.last_prompt = full_messages
+                        t.last_images = list(full_images or [])
+                    else:
+                        t.last_prompt = messages
+                        t.last_images = list(images or [])
+
+                    # Tokenize this single prompt; reuse the batch helper with a
+                    # 1-element list to keep packed-MROPE + image-truncation
+                    # logic identical to the sync path.
+                    try:
+                        tokenized = self._tokenize_prompts(
+                            [messages],
+                            [images],
+                            for_generation=True,
+                            full_prompts=[full_messages] if use_full else None,
+                            full_images_list=[full_images] if use_full else None,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"  [async grp {t.group_id}/{t.n_idx}] tokenize failed: {e}. Terminating."
+                        )
+                        t.terminated = True
+                        break
+
+                    raw_prompt_ids = list(tokenized["raw_prompt_ids"][0])
+                    raw_images = tokenized["raw_images"][0]
+                    packed_override = None
+                    if "packed_mrope_overrides" in tokenized:
+                        packed_override = tokenized["packed_mrope_overrides"][0]
+
+                    # vLLM expects the multi-modal dict shape that
+                    # `_process_multi_modal_data` produces (`{"image": [...]}`)
+                    # so the rollout side doesn't need to know about it again.
+                    mm_data = {"images": raw_images} if raw_images else None
+
+                    sampling_overrides: dict[str, Any] = {
+                        # Multiturn always samples 1 response per step. The
+                        # group-of-n enumeration happens at the trajectory level
+                        # (n_trajectories items in the pending queue), not via
+                        # vLLM's `n` parameter.
+                        "n": 1,
+                        "temperature": config.worker.rollout.temperature,
+                        "top_p": config.worker.rollout.top_p,
+                    }
+                    rollout_top_k = getattr(config.worker.rollout, "top_k", -1)
+                    if rollout_top_k != -1:
+                        sampling_overrides["top_k"] = rollout_top_k
+                    if override_config:
+                        for k in ("temperature", "top_p", "top_k"):
+                            if k in override_config:
+                                sampling_overrides[k] = override_config[k]
+
+                    request_id = f"async-{t.episode_id}-step{t.num_steps}-{uuid.uuid4().hex[:6]}"
+                    t_gen_start = time.time()
+                    prompt_ms = (t_gen_start - t_phase_start) * 1000.0
+                    try:
+                        result = await actor_rollout_ref_wg.workers[rank].actor_rollout_ref_generate_one_async.remote(
+                            request_id=request_id,
+                            prompt_token_ids=raw_prompt_ids,
+                            multi_modal_data=mm_data,
+                            sampling_overrides=sampling_overrides,
+                            packed_mrope_override=packed_override,
+                            min_pixels=self.min_pixels,
+                            max_pixels=self.max_pixels,
+                            video_fps=getattr(config.data, "video_fps", 2.0),
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"  [async grp {t.group_id}/{t.n_idx}] generate_one_async failed: {e}. Terminating."
+                        )
+                        t.terminated = True
+                        _failed_steps["n"] += 1
+                        break
+
+                    t_gen_done = time.time()
+                    gen_ms = (t_gen_done - t_gen_start) * 1000.0
+                    text = self.tokenizer.decode(result.token_ids, skip_special_tokens=True)
+                    t.step_responses.append(text)
+                    t.step_response_token_ids.append(list(result.token_ids))
+                    t.step_response_log_probs.append(list(result.logprobs) if result.logprobs is not None else [])
+                    t.num_steps += 1
+
+                    try:
+                        reward, terminated, info = await t.pool.step_env.remote(t.slot_id, text)
+                    except Exception as e:
+                        logger.warning(
+                            f"  [async grp {t.group_id}/{t.n_idx}] step_env failed: {e}. Terminating."
+                        )
+                        t.terminated = True
+                        break
+
+                    env_ms = (time.time() - t_gen_done) * 1000.0
+                    t.step_phase_times.append({
+                        "prompt_ms": prompt_ms,
+                        "gen_ms": gen_ms,
+                        "env_ms": env_ms,
+                    })
+
+                    if terminated:
+                        if self.force_max_depth and t.num_steps < self.max_depth:
+                            logger.info(
+                                f"  [async grp {t.group_id}/{t.n_idx}] force_max_depth: "
+                                f"ignoring env termination at step {t.num_steps}/{self.max_depth}"
+                            )
+                        else:
+                            t.terminated = True
+
+                # Trajectory finished (terminated or hit max_depth). Collect
+                # reward + ground truth, then release the slot.
+                try:
+                    t.reward = float(await t.pool.get_trajectory_reward.remote(t.slot_id))
+                except Exception as e:
+                    logger.warning(
+                        f"  [async grp {t.group_id}/{t.n_idx}] get_trajectory_reward failed: {e}. Using 0.0."
+                    )
+                    t.reward = 0.0
+                try:
+                    t.ground_truth = await t.pool.get_ground_truth.remote(t.slot_id)
+                except Exception as e:
+                    logger.warning(
+                        f"  [async grp {t.group_id}/{t.n_idx}] get_ground_truth failed: {e}."
+                    )
+                    t.ground_truth = "{}"
+                try:
+                    await t.pool.release_env.remote(t.slot_id)
+                except Exception:
+                    pass
+                _completed["n"] += 1
+                t.traj_end_ts = time.time()
+                return t
+            finally:
+                _running["n"] -= 1
+
+        # Schedule the initial set of trajectories and refill from
+        # pending_queue as slots open up. The total number of in-flight
+        # trajectories never exceeds total_slots — we acquire a slot via
+        # `_initialize_batch` only when we're ready to schedule a coroutine.
+        async def scheduler() -> None:
+            tasks: set[asyncio.Task] = {asyncio.create_task(run_traj(t)) for t in active}
+            while tasks:
+                done, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                for d in done:
+                    # Surface coroutine exceptions instead of swallowing them.
+                    exc = d.exception()
+                    if exc is not None:
+                        logger.error(f"async trajectory coroutine raised: {exc!r}")
+                # Refill: each completed trajectory frees one slot. Acquire
+                # new trajectories from the pending queue and schedule them.
+                free_slots = len(done)
+                while free_slots > 0 and pending_queue:
+                    refill_batch = [pending_queue.popleft()]
+                    free_slots -= 1
+                    new_trajs = self._initialize_batch(refill_batch)
+                    all_trajectories.extend(new_trajs)
+                    for nt in new_trajs:
+                        tasks.add(asyncio.create_task(run_traj(nt)))
+
+        # Periodic progress logger so long rollouts don't appear silent.
+        async def progress_logger() -> None:
+            while True:
+                await asyncio.sleep(15.0)
+                logger.info(
+                    f"  [async] running={_running['n']} "
+                    f"completed={_completed['n']} "
+                    f"pending={len(pending_queue)} "
+                    f"failed_steps={_failed_steps['n']} "
+                    f"elapsed={time.time() - t_start:.0f}s "
+                    f"RSS={_get_rss_mb():.0f}MB"
+                )
+
+        plog = asyncio.create_task(progress_logger())
+        try:
+            await scheduler()
+        finally:
+            plog.cancel()
+            try:
+                await plog
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        logger.info(
+            f"  [async] DONE completed={_completed['n']} "
+            f"failed_steps={_failed_steps['n']} "
+            f"elapsed={time.time() - t_start:.1f}s"
+        )
 
     def _harvest_and_refill(
         self,

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import os
 import random
 import re
@@ -426,14 +427,27 @@ def _bind_workers_method_to_parent(cls, key, user_defined_cls):
 
         if hasattr(method, MAGIC_ATTR):
 
-            def generate_function(name):
-                def func(self, *args, **kwargs):
-                    # dispatch to the actual worker
-                    return getattr(self.worker_dict[key], name)(*args, **kwargs)
+            # Async methods (e.g. async per-trajectory rollout) need an async
+            # wrapper so Ray's actor dispatch detects them as coroutine
+            # functions and runs them on the actor's asyncio loop. Sync wraps
+            # would return a coroutine object as the Ray task result.
+            # `@register` wraps with a sync `inner` via @wraps, so check
+            # __wrapped__ (the original) for the async-ness.
+            is_async = inspect.iscoroutinefunction(method) or inspect.iscoroutinefunction(
+                getattr(method, "__wrapped__", None)
+            )
+
+            def generate_function(name, is_async):
+                if is_async:
+                    async def func(self, *args, **kwargs):
+                        return await getattr(self.worker_dict[key], name)(*args, **kwargs)
+                else:
+                    def func(self, *args, **kwargs):
+                        return getattr(self.worker_dict[key], name)(*args, **kwargs)
 
                 return func
 
-            func = generate_function(method_name)
+            func = generate_function(method_name, is_async)
             # pass MAGIC_ATTR for outer worker group
             setattr(func, MAGIC_ATTR, getattr(method, MAGIC_ATTR))
             try:
