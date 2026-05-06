@@ -125,6 +125,46 @@ class DataParallelPPOActor(BasePPOActor):
             # for compute the log_prob
             input_ids_rmpad_rolled = torch.roll(input_ids_rmpad, shifts=-1, dims=1)  # (1, total_nnz)
 
+            # ── Logits-slice optimization (padding-free path only) ─────────
+            # When response_mask is present (multi-turn packed: update_policy
+            # path, and compute_log_prob when the field is forwarded), only
+            # materialize logits at positions whose NEXT token is in the
+            # response. In packed multi-turn ~half the tokens are user-side
+            # (system, user-obs images, headers) and contribute nothing to the
+            # loss — skipping them cuts the (total_nnz, vocab≈152k) lm_head
+            # tensor roughly in half. Only safe without ulysses sp slicing
+            # (sp scrambles the global index map). Gated by
+            # ``ActorConfig.response_only_logits`` (default True). The past-K
+            # / non-padding-free path has its OWN separate trim
+            # (``logits_to_keep=response_length+1``) below and is unaffected
+            # by this toggle.
+            keep_idx = None
+            if (
+                getattr(self.config, "response_only_logits", True)
+                and "response_mask" in micro_batch
+                and self.config.ulysses_size == 1
+            ):
+                response_mask_t = micro_batch["response_mask"]
+                # Embed (bsz, response_length) into (bsz, seqlen) at the
+                # response slice (response_mask covers the trailing portion).
+                response_mask_full = torch.zeros(
+                    batch_size, seqlen,
+                    dtype=response_mask_t.dtype,
+                    device=response_mask_t.device,
+                )
+                response_mask_full[:, -response_length:] = response_mask_t
+                # Position t's logit predicts token t+1 → keep iff next is resp.
+                next_is_resp = torch.roll(response_mask_full, shifts=-1, dims=-1).bool()
+                next_is_resp[:, -1] = False  # roll wraps; final position has no next
+                # Unpad in lockstep with input_ids (same attention_mask order).
+                next_is_resp_rmpad, *_ = unpad_input(
+                    next_is_resp.unsqueeze(-1).to(input_ids.dtype), attention_mask
+                )
+                next_is_resp_rmpad = next_is_resp_rmpad.squeeze(-1).bool()  # (total_nnz,)
+                keep_idx = torch.nonzero(next_is_resp_rmpad, as_tuple=False).squeeze(-1)
+                if keep_idx.numel() == 0:
+                    keep_idx = None  # degenerate; fall back to full path
+
             # pad and slice the inputs if sp > 1
             if self.config.ulysses_size > 1:
                 input_ids_rmpad, position_ids_rmpad, pad_size = ulysses_pad_and_slice_inputs(
@@ -137,17 +177,54 @@ class DataParallelPPOActor(BasePPOActor):
             input_ids_rmpad_rolled = input_ids_rmpad_rolled.squeeze(0)  # ((total_nnz / sp) + pad)
 
             # only pass input_ids and position_ids to enable flash_attn_varlen
+            forward_kwargs = {}
+            if keep_idx is not None:
+                forward_kwargs["logits_to_keep"] = keep_idx
             output = self.actor_module(
                 input_ids=input_ids_rmpad,
                 attention_mask=None,
                 position_ids=position_ids_rmpad,
                 **multi_modal_inputs,
                 use_cache=False,
+                **forward_kwargs,
             )  # prevent model thinks we are generating
-            logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
-            logits_rmpad.div_(temperature)
-            # ((total_nnz / sp) + pad)
-            log_probs = self.log_probs_from_logits(logits=logits_rmpad, labels=input_ids_rmpad_rolled)
+
+            if keep_idx is not None:
+                # output.logits shape: (1, len(keep_idx), vocab) — only the kept
+                # positions had lm_head applied.
+                kept_logits = output.logits.squeeze(0).contiguous()
+                kept_logits.div_(temperature)
+                kept_labels = input_ids_rmpad_rolled[keep_idx].contiguous()
+                # flash_attn cross_entropy_loss requires labels to be exactly
+                # (n_rows,) where n_rows == kept_logits.shape[0]. If the model
+                # returned a different shape than expected, fall back to torch.
+                if kept_logits.dim() != 2 or kept_logits.shape[0] != kept_labels.shape[0]:
+                    raise RuntimeError(
+                        f"keep_idx logits/labels shape mismatch: "
+                        f"kept_logits={tuple(kept_logits.shape)} "
+                        f"kept_labels={tuple(kept_labels.shape)} "
+                        f"keep_idx={tuple(keep_idx.shape)}"
+                    )
+                # Bypass torch.compile wrapper here: the kept-path tensor sizes
+                # vary per micro-batch which can confuse dynamic-shape compile,
+                # and the compute is small (only response positions) so the
+                # un-compiled flash_attn path is fine.
+                kept_log_probs = VF.log_probs_from_logits(
+                    logits=kept_logits, labels=kept_labels
+                )
+                # Scatter back to full rmpad shape; non-kept positions get 0
+                # (downstream loss masks them out via response_mask).
+                log_probs = torch.zeros_like(
+                    input_ids_rmpad_rolled, dtype=kept_log_probs.dtype
+                )
+                log_probs[keep_idx] = kept_log_probs
+            else:
+                logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
+                logits_rmpad.div_(temperature)
+                # ((total_nnz / sp) + pad)
+                log_probs = self.log_probs_from_logits(
+                    logits=logits_rmpad, labels=input_ids_rmpad_rolled
+                )
 
             # gather log_prob if sp > 1
             if self.config.ulysses_size > 1:
@@ -167,16 +244,41 @@ class DataParallelPPOActor(BasePPOActor):
             attn_kwarg = (
                 kwindow_block_mask if kwindow_block_mask is not None else attention_mask
             )
+            # past_k_steps forces padding_free=False, which means output.logits
+            # would otherwise materialize as (bsz, full_seqlen, vocab) — for
+            # Qwen3-VL (vocab≈152k) at max_prompt_length=12288 that's the 60 GiB
+            # OOM hit in job 7740731. logits_to_keep=response_length+1 makes the
+            # HF lm_head only project the trailing window, dropping the cost
+            # ~13× without changing attention or backward semantics. Only apply
+            # when the K-window BlockMask is active so we don't change behavior
+            # for runs that don't need it.
+            forward_kwargs = {}
+            if kwindow_block_mask is not None:
+                forward_kwargs["logits_to_keep"] = response_length + 1
             output = self.actor_module(
                 input_ids=input_ids,
                 attention_mask=attn_kwarg,
                 position_ids=position_ids,
                 **multi_modal_inputs,
                 use_cache=False,
+                **forward_kwargs,
             )
             logits: torch.Tensor = output.logits
             logits.div_(temperature)
-            logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
+            if "logits_to_keep" in forward_kwargs:
+                # Already shape (bsz, response_length+1, vocab); drop trailing
+                # ghost position so we keep the (response_length, vocab) slice
+                # whose token-i logits predict response token i.
+                logits = logits[:, :-1, :]
+            else:
+                logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
+            if logits.shape[:2] != responses.shape:
+                raise RuntimeError(
+                    f"non-padding-free logits/responses shape mismatch: "
+                    f"logits={tuple(logits.shape)} responses={tuple(responses.shape)} "
+                    f"input_ids={tuple(input_ids.shape)} response_length={response_length} "
+                    f"output_logits_full={tuple(output.logits.shape)}"
+                )
             log_probs = self.log_probs_from_logits(logits, responses)  # (bsz, response_length)
 
         return log_probs
@@ -220,6 +322,11 @@ class DataParallelPPOActor(BasePPOActor):
         select_keys = ["input_ids", "attention_mask", "position_ids", "responses"]
         if "turn_id" in data.batch.keys():
             select_keys.append("turn_id")
+        # Forward response_mask when available so _forward_micro_batch can
+        # restrict lm_head materialization to response positions in packed
+        # multi-turn batches.
+        if "response_mask" in data.batch.keys():
+            select_keys.append("response_mask")
         non_tensor_select_keys = ["multi_modal_inputs"]
 
         data = data.select(select_keys, non_tensor_select_keys)

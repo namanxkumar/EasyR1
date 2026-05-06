@@ -258,10 +258,20 @@ def qwen3_vl_model_forward(
     self: "Qwen3VLForConditionalGeneration",
     input_ids: torch.LongTensor,
     labels: Optional[torch.LongTensor] = None,
+    logits_to_keep: "int | torch.Tensor" = 0,
     **kwargs,
 ) -> "Qwen3VLCausalLMOutputWithPast":
     outputs = self.model(input_ids=input_ids, **kwargs)
     hidden_states = outputs[0]
+    # Honor logits_to_keep so the lm_head only projects the requested
+    # positions. int N -> trailing-N slice; LongTensor -> fancy-index along
+    # the seqlen dim. Mirrors HF's stock Qwen3VLForConditionalGeneration
+    # (modeling_qwen3_vl.py:1456).
+    if isinstance(logits_to_keep, int):
+        if logits_to_keep > 0:
+            hidden_states = hidden_states[:, -logits_to_keep:, :]
+    else:
+        hidden_states = hidden_states[:, logits_to_keep, :]
     logits = self.lm_head(hidden_states)
 
     return Qwen3VLCausalLMOutputWithPast(logits=logits)

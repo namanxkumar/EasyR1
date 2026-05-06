@@ -60,8 +60,17 @@ def log_probs_from_logits(logits: torch.Tensor, labels: torch.Tensor) -> torch.T
     """
     batch_dim = logits.shape[:-1]
     vocab_dim = logits.shape[-1]
+    logits_in_shape = tuple(logits.shape)
+    labels_in_shape = tuple(labels.shape)
     logits = logits.contiguous().view(-1, vocab_dim)
     labels = labels.contiguous().view(-1)
+    if logits.shape[0] != labels.shape[0]:
+        raise RuntimeError(
+            f"log_probs_from_logits shape mismatch: "
+            f"logits_in={logits_in_shape} labels_in={labels_in_shape} "
+            f"flat_logits={tuple(logits.shape)} flat_labels={tuple(labels.shape)} "
+            f"vocab_dim={vocab_dim}"
+        )
     if FLAH_ATTN_CROSS_ENTROPY_LOSS_AVAILABLE:
         output = log_probs_from_logits_flash_attn(logits, labels)
     else:  # fall back to torch kernel, upcast logits to fp32

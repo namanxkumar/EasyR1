@@ -129,6 +129,19 @@ class ActorConfig:
     a FlexAttention BlockMask restricting each query to the last K obs turns
     + system + anchor turn 0. Mirrors MultiturnEnvConfig.past_k_steps and
     requires padding_free=False + flex_attention dispatch on the model."""
+    response_only_logits: bool = True
+    """In packed multi-turn (when ``response_mask`` is in the batch), only
+    materialize lm_head logits at positions whose next token is in the
+    response. Cuts the (total_nnz, vocab) tensor by ~half on typical packed
+    batches (user-obs/image tokens contribute no gradient). Falls back to
+    full logits when response_mask is absent or ulysses_size > 1.
+    Set to False to disable (e.g. for parity comparison or debugging).
+
+    SCOPE: gates only the padding-free path's index-tensor
+    logits_to_keep. The past-K (non-padding-free + FlexAttention BlockMask)
+    path has its own separate trim (``logits_to_keep=response_length+1``)
+    that is always on when ``past_k_steps`` is enabled — this toggle does
+    not affect it."""
     tau_positive: float = 1.0
     """temperature for positive tokens"""
     tau_negative: float = 1.05
