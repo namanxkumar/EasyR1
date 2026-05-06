@@ -60,16 +60,20 @@ class _DummyDataLoader:
 def _create_simulator_pools(mt_cfg, n_gpus: int):
     """Create Ray-remote SimulatorPool actors spread across all GPUs.
 
-    Creates one SimulatorPool per GPU, each managing a share of the total
-    ``num_simulators`` slots. AI2Thor controllers share GPU memory with
-    the model (low gpu_memory_utilization leaves room).
+    Creates ``pools_per_gpu`` SimulatorPools per GPU. Each pool is its own
+    Ray actor so acquires are concurrent across pools on the same GPU
+    (within a pool they serialize on Unity scene reset). Total slot count
+    equals ``mt_cfg.num_simulators``, evenly split across all pools.
     """
     from ..workers.simulator_pool import SimulatorPool
 
     num_simulators = mt_cfg.num_simulators
-    # Distribute simulators evenly across GPUs
-    sims_per_gpu = max(1, num_simulators // n_gpus)
-    extra = num_simulators % n_gpus
+    pools_per_gpu = max(1, getattr(mt_cfg, "pools_per_gpu", 1))
+    total_pools = pools_per_gpu * n_gpus
+
+    # Distribute simulators evenly across all pools (across all GPUs).
+    sims_per_pool = max(1, num_simulators // total_pools)
+    extra = num_simulators % total_pools
 
     # Map logical GPU indices to physical device IDs from SLURM
     cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
@@ -94,35 +98,43 @@ def _create_simulator_pools(mt_cfg, n_gpus: int):
     )
 
     pools = []
+    pool_idx = 0
     for gpu_idx in range(min(n_gpus, len(physical_gpu_ids))):
-        n_slots = sims_per_gpu + (1 if gpu_idx < extra else 0)
-        if n_slots == 0:
-            continue
-
         phys_id = physical_gpu_ids[gpu_idx]
-        logging.info(f"Creating SimulatorPool on GPU {gpu_idx} (physical={phys_id}): {n_slots} slots")
-
-        pool = SimulatorPool.options(
-            runtime_env={"env_vars": {"CUDA_VISIBLE_DEVICES": str(phys_id)}},
-        ).remote(
-            gpu_id=phys_id,
-            num_slots=n_slots,
-            system_prompt=system_prompt,
-            render_width=mt_cfg.render_width,
-            render_height=mt_cfg.render_height,
-            max_depth=mt_cfg.max_depth,
-            coordinate_normalization_scale=coord_scale,
-            max_observations=mt_cfg.max_observations,
-            context_mode=mt_cfg.context_mode,
-            past_k_steps=mt_cfg.past_k_steps,
-            reward_mode=mt_cfg.reward_mode,
-        )
-        pools.append(pool)
+        for sub_idx in range(pools_per_gpu):
+            n_slots = sims_per_pool + (1 if pool_idx < extra else 0)
+            if n_slots == 0:
+                pool_idx += 1
+                continue
+            logging.info(
+                f"Creating SimulatorPool {pool_idx} on GPU {gpu_idx} "
+                f"(physical={phys_id}, sub={sub_idx}/{pools_per_gpu}): {n_slots} slots"
+            )
+            pool = SimulatorPool.options(
+                runtime_env={"env_vars": {"CUDA_VISIBLE_DEVICES": str(phys_id)}},
+            ).remote(
+                gpu_id=phys_id,
+                num_slots=n_slots,
+                system_prompt=system_prompt,
+                render_width=mt_cfg.render_width,
+                render_height=mt_cfg.render_height,
+                max_depth=mt_cfg.max_depth,
+                coordinate_normalization_scale=coord_scale,
+                max_observations=mt_cfg.max_observations,
+                context_mode=mt_cfg.context_mode,
+                past_k_steps=mt_cfg.past_k_steps,
+                reward_mode=mt_cfg.reward_mode,
+            )
+            pools.append(pool)
+            pool_idx += 1
 
     # Verify all pools initialized
     infos = ray.get([p.get_pool_info.remote() for p in pools])
     total_slots = sum(info["total"] for info in infos)
-    logging.info(f"Created {len(pools)} SimulatorPools across {n_gpus} GPUs, {total_slots} total slots")
+    logging.info(
+        f"Created {len(pools)} SimulatorPools "
+        f"({pools_per_gpu}/GPU × {n_gpus} GPUs), {total_slots} total slots"
+    )
 
     return pools
 

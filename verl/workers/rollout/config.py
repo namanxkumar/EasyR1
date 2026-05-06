@@ -86,9 +86,22 @@ class MultiturnEnvConfig:
     alternation with full reasoning history preserved, 'single_turn' packs
     all history into one user message (memory-based compression)."""
     num_simulators: int = 8
-    """Number of AI2Thor simulator slots per SimulatorPool.
+    """Total AI2Thor simulator slots across all pools and GPUs.
     Should be >= rollout_batch_size * n for full parallelism.
     Each slot creates one AI2Thor Controller (~300MB GPU memory)."""
+    pools_per_gpu: int = 1
+    """Number of SimulatorPool Ray actors to create per GPU.
+
+    Each SimulatorPool is `@ray.remote(num_cpus=1)` with default Ray
+    concurrency of 1, meaning `acquire_env` (Unity scene reset, ~9-11s) is
+    serialized within a single pool. Splitting `num_simulators` across N
+    pools per GPU lets N acquires proceed concurrently on the same GPU,
+    linearly raising aggregate acquire throughput.
+
+    Total pools = pools_per_gpu * n_gpus_per_node. Slots per pool =
+    num_simulators // (pools_per_gpu * n_gpus_per_node). Tune up when
+    rollout is acquire-bound (queue depth visible in the `acquire_env (N):
+    Xs` log lines exceeds 1-2 trajs)."""
     difficulties: Optional[list[int]] = None
     """rooms_seen levels to include (None = use all episodes)."""
     max_per_difficulty: Optional[int] = None

@@ -297,21 +297,22 @@ class MultiturnEnvRollout:
     # ── controller lifecycle ────────────────────────────────────────
 
     def warmup_controllers(self):
-        """Pre-create AI2Thor controllers on all SimulatorPools in parallel.
+        """Pre-create AI2Thor controllers across all pools in parallel.
 
-        Called before rollout to ensure controllers are ready. Uses the first
-        dataset item's scene as a dummy scene for initialization. All pools
-        warm up concurrently since they're on different GPUs.
+        Stagger disabled: all pools warm concurrently via Ray. Slots within a
+        single pool still warm in series via SimulatorPool.warmup_controllers.
         """
         dummy_scene = self.env_factory.dataset[0]["scene_metadata"]
-        logger.info(f"Warming up AI2Thor controllers across {len(self.simulator_pools)} pools...")
+        n_pools = len(self.simulator_pools)
+        logger.info(f"Warming up AI2Thor controllers across {n_pools} pools (parallel, no stagger)...")
         t0 = time.time()
-        futures = [pool.warmup_controllers.remote(dummy_scene) for pool in self.simulator_pools]
-        counts = ray.get(futures)
+        counts = ray.get([p.warmup_controllers.remote(dummy_scene) for p in self.simulator_pools])
         total = sum(counts)
+        for i, count in enumerate(counts):
+            logger.info(f"  pool {i + 1}/{n_pools}: warmed {count} controllers")
         logger.info(
             f"All AI2Thor controllers warmed up: {total} controllers "
-            f"across {len(self.simulator_pools)} pools in {time.time() - t0:.1f}s"
+            f"across {n_pools} pools in {time.time() - t0:.1f}s"
         )
 
     def destroy_controllers(self):

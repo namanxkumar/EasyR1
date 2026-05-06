@@ -28,11 +28,25 @@ def is_rank0() -> int:
     return (not dist.is_initialized()) or (dist.get_rank() == 0)
 
 
-def print_gpu_memory_usage(prefix: str = "GPU memory usage") -> None:
+def print_gpu_memory_usage(prefix: str = "GPU memory usage", detailed: bool = True) -> None:
     """Report the current GPU VRAM usage."""
     if is_rank0():
         free_mem, total_mem = torch.cuda.mem_get_info()
-        print(f"{prefix}: {(total_mem - free_mem) / (1024**3):.2f} GB / {total_mem / (1024**3):.2f} GB.")
+        used_gb = (total_mem - free_mem) / (1024**3)
+        total_gb = total_mem / (1024**3)
+        msg = f"{prefix}: {used_gb:.2f} GB / {total_gb:.2f} GB."
+        if detailed:
+            stats = torch.cuda.memory_stats()
+            allocated_gb = stats.get("allocated_bytes.all.current", 0) / (1024**3)
+            reserved_gb = stats.get("reserved_bytes.all.current", 0) / (1024**3)
+            inactive_gb = stats.get("inactive_split_bytes.all.current", 0) / (1024**3)
+            active_gb = stats.get("active_bytes.all.current", 0) / (1024**3)
+            msg += (
+                f" [torch alloc={allocated_gb:.2f} active={active_gb:.2f}"
+                f" reserved={reserved_gb:.2f} cached_inactive={inactive_gb:.2f}]"
+                f" [non_torch={used_gb - reserved_gb:.2f}]"
+            )
+        print(msg)
 
 
 def _get_model_size(model: nn.Module, scale: str = "auto") -> Tuple[float, str]:
