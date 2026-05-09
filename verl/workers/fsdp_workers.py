@@ -541,6 +541,28 @@ class FSDPWorker(Worker):
 
         self.checkpoint_manager.load_checkpoint(path)
         dist.barrier()
+
+        # Config-LR override: the checkpoint's optimizer state and lr_scheduler
+        # state restore the loaded run's lr; reapply the YAML config so swapping
+        # configs at resume time actually takes effect.
+        configured_lr = (
+            self.config.actor.optim.lr if self._has_actor else self.config.critic.optim.lr
+        )
+        loaded_lr = self.optimizer.param_groups[0].get("lr", None)
+        if loaded_lr is not None and abs(loaded_lr - configured_lr) > 1e-12:
+            for pg in self.optimizer.param_groups:
+                pg["lr"] = configured_lr
+                if "initial_lr" in pg:
+                    pg["initial_lr"] = configured_lr
+            if hasattr(self.lr_scheduler, "base_lrs"):
+                self.lr_scheduler.base_lrs = [configured_lr] * len(self.lr_scheduler.base_lrs)
+            if hasattr(self.lr_scheduler, "_last_lr"):
+                self.lr_scheduler._last_lr = [configured_lr] * len(self.lr_scheduler._last_lr)
+            if self.rank == 0:
+                print(
+                    f"[load_checkpoint] LR override: {loaded_lr:.2e} (from ckpt) -> {configured_lr:.2e} (from config)"
+                )
+
         if self._use_param_offload:
             offload_fsdp_model(self.fsdp_module)
 
@@ -663,6 +685,19 @@ class FSDPWorker(Worker):
 
         output = output.to("cpu")
         return output
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def clear_cuda_cache(self):
+        """Run gc + empty CUDA cache between phases of a single training step.
+
+        Unlike `clear_multi_modal_cache`, this does NOT touch `self._cache` —
+        the multimodal pixel_values cache is reused across old/ref/update_actor
+        phases within a step and must persist until end-of-step.
+        """
+        import gc
+
+        gc.collect()
+        torch.cuda.empty_cache()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def clear_multi_modal_cache(self):

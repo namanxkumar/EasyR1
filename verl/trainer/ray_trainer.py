@@ -683,6 +683,28 @@ class RayPPOTrainer:
             except Exception:
                 return 0.0
 
+        def _phase_cleanup(phase_name: str, timing_raw: dict):
+            """Clear cached CUDA memory + run gc on driver and workers, log timing."""
+            import gc as _gc
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+            _gc.collect()
+            # Clear CUDA cache on every FSDP worker (where the heavy memory
+            # actually lives). Skipped if the worker group hasn't registered
+            # the method (e.g., critic-only worker groups).
+            try:
+                if hasattr(self.actor_rollout_ref_wg, "clear_cuda_cache"):
+                    self.actor_rollout_ref_wg.clear_cuda_cache()
+            except Exception as e:
+                logging.warning(f"clear_cuda_cache failed in {phase_name}: {e}")
+            logging.info(
+                f"[step {self.global_step}] {phase_name} done: "
+                f"{timing_raw.get(phase_name, 0):.1f}s "
+                f"(driver RSS: {_driver_rss_mb():.0f}MB)"
+            )
+
         self.data_iterator = iter(self.train_dataloader)
         while self.global_step < self.training_steps:
             self.global_step += 1
@@ -695,6 +717,7 @@ class RayPPOTrainer:
                     self.actor_rollout_ref_wg.prepare_rollout_engine()
                     batch = self._make_batch_data(metrics=metrics)
                     self.actor_rollout_ref_wg.release_rollout_engine()
+                _phase_cleanup("gen", timing_raw)
 
                 # balance the number of valid tokens on each dp rank.
                 # NOTE: this breaks the order of data inside the batch.
@@ -724,12 +747,14 @@ class RayPPOTrainer:
                     else:
                         old_log_probs = self.actor_rollout_ref_wg.compute_log_probs(batch)
                         batch = batch.union(old_log_probs)
+                _phase_cleanup("old", timing_raw)
 
                 # compute ref_log_probs
                 if self.use_reference_policy:
                     with timer("ref", timing_raw):
                         ref_log_probs = self.actor_rollout_ref_wg.compute_ref_log_probs(batch)
                         batch = batch.union(ref_log_probs)
+                    _phase_cleanup("ref", timing_raw)
 
                 # compute values
                 if self.use_critic:
@@ -760,6 +785,7 @@ class RayPPOTrainer:
                         gamma=self.config.algorithm.gamma,
                         lam=self.config.algorithm.lam,
                     )
+                _phase_cleanup("adv", timing_raw)
 
                 # update critic
                 if self.use_critic:
@@ -777,10 +803,7 @@ class RayPPOTrainer:
                     actor_metrics = reduce_metrics(actor_output.non_tensor_batch)
                     metrics.update(actor_metrics)
 
-                    logging.info(
-                        f"[step {self.global_step}] update_actor done: "
-                        f"{timing_raw.get('update_actor', 0):.1f}s"
-                    )
+                    _phase_cleanup("update_actor", timing_raw)
 
                 # Free cached multi-modal inputs on workers (pixel_values in
                 # CPU RAM) before the next step's vLLM weight loading.

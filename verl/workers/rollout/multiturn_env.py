@@ -1084,20 +1084,30 @@ class MultiturnEnvRollout:
         ray.get(release_futures)  # batch-collect; failures are non-critical
 
         # ── Refill from pending queue ──
-        n_to_fill = min(len(newly_done), len(pending_queue))
+        # Cap by actual available capacity: reactive shrink in `release_env`
+        # may disable some of the slots we just released (memory pressure),
+        # so newly_done is not the same as newly-available. Without this cap,
+        # _initialize_batch would request more slots than the pool can serve
+        # and raise. Unfilled work stays in pending_queue for the next round.
+        total_available = sum(
+            ray.get([p.get_available_count.remote() for p in self.simulator_pools])
+        )
+        n_to_fill = min(len(newly_done), len(pending_queue), total_available)
         if n_to_fill > 0:
             refill_batch = [pending_queue.popleft() for _ in range(n_to_fill)]
             new_trajs = self._initialize_batch(refill_batch)
             all_trajectories.extend(new_trajs)
             active.extend(new_trajs)
             logger.info(
-                f"  refill: released {len(newly_done)} slots, "
+                f"  refill: released {len(newly_done)} slots "
+                f"(available={total_available}), "
                 f"started {n_to_fill} new trajectories, "
                 f"{len(pending_queue)} still pending"
             )
         elif newly_done:
             logger.info(
-                f"  released {len(newly_done)} slots (queue empty, no refill)"
+                f"  released {len(newly_done)} slots "
+                f"(available={total_available}, queue empty or pool full)"
             )
 
     # ── private helpers ───────────────────────────────────────────────
@@ -1937,6 +1947,8 @@ class ObjectNavEnvAdapter:
         # Track reward components
         self.initial_distance: float | None = None
         self.final_distance: float | None = None
+        self.previous_distance: float | None = None
+        self.progress_sum: float = 0.0
         self.success: bool = False
         self.num_steps: int = 0
         self.format_scores: list[float] = []
@@ -1953,6 +1965,8 @@ class ObjectNavEnvAdapter:
         )
         self.initial_distance = initial_state.shortest_path_distance_to_target
         self.final_distance = self.initial_distance
+        self.previous_distance = self.initial_distance
+        self.progress_sum = 0.0
         self.success = False
         self.num_steps = 0
         self.format_scores = []
@@ -2119,9 +2133,14 @@ class ObjectNavEnvAdapter:
 
         self.state_history.append(action, deepcopy(new_state))
 
-        # Track distance
+        # Track distance + accumulate forward-only progress (ViGoRL style:
+        # cumulative max(0, prev - curr) across turns, raw absolute units).
         if new_state.shortest_path_distance_to_target is not None:
-            self.final_distance = new_state.shortest_path_distance_to_target
+            curr_dist = new_state.shortest_path_distance_to_target
+            if self.previous_distance is not None:
+                self.progress_sum += max(0.0, self.previous_distance - curr_dist)
+            self.previous_distance = curr_dist
+            self.final_distance = curr_dist
 
         terminated = new_state.is_terminal
         if terminated and new_state.reward > 0:
@@ -2295,14 +2314,20 @@ class ObjectNavEnvAdapter:
         step_penalty = 0.005 * self.num_steps
 
         if self.reward_mode == "bimodal":
-            # Original 7588989 baseline.
+            #   0.875 * success + 0.125 * fmt + 0.25 * normalized_net_progress
+            # Progress = fraction of the initial gap closed at trajectory end,
+            # clamped to [0, 1]. Replaces ViGoRL's forward-only Σ max(0, Δdist)
+            # which lets agents farm reward by zigzagging (close, back, close).
+            # No step_penalty, no validity gate.
             reward = 0.0
             if self.success:
-                reward += 1.0
-            reward += 0.1 * avg_fmt
-            reward += 0.15 * avg_validity
-            reward -= step_penalty
-            progress = None
+                reward += 0.875
+            reward += 0.125 * avg_fmt
+            if self.initial_distance and self.initial_distance > 1e-6:
+                progress = max(0.0, min(1.0, (self.initial_distance - self.final_distance) / self.initial_distance))
+            else:
+                progress = 0.0
+            reward += 0.25 * progress
         else:
             # Continuous distance progress: graded credit even on failed trajectories.
             if self.initial_distance and self.initial_distance > 0.1:
@@ -2335,6 +2360,7 @@ class ObjectNavEnvAdapter:
                 "num_steps": self.num_steps,
                 "initial_distance": self.initial_distance,
                 "final_distance": self.final_distance,
+                "progress_sum": self.progress_sum,
                 "avg_format": avg_fmt,
                 "avg_validity": avg_val,
             }

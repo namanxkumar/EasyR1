@@ -80,6 +80,28 @@ class SimulatorPool:
         # Cached bare AI2ThorController objects (reused across episodes)
         self._cached_controllers: list[Optional[Any]] = [None] * num_slots
 
+        # Reactive pool sizing: each slot starts enabled. When a trajectory
+        # finishes (`release_env`), if GPU usage has crossed `_target_used_frac`
+        # of total, that slot is disabled and its controller torn down — the
+        # pool shrinks under live memory pressure rather than guessing at
+        # warmup. Disabled slots come back next warmup if memory recovers.
+        #
+        # Cascading-shrink guard: in-flight `generate()` calls hold activation
+        # memory that doesn't subside instantly. Without throttling, every
+        # release in a burst sees the same high-water mark and keeps shrinking
+        # to zero. We bound it via:
+        #   - `_min_enabled_slots`: never drop below this many enabled slots.
+        #     Trajectories cycle in the continuous loop, so per-pool minimum
+        #     can be much smaller than rollout `n` — 2 is enough to keep work
+        #     flowing while the rest of the cluster carries the load.
+        #   - `_shrink_cooldown_sec`: wall-clock gap between shrinks so the
+        #     freed controller's memory + activations have time to settle.
+        self._slot_enabled: list[bool] = [True] * num_slots
+        self._target_used_frac: float = 0.9
+        self._min_enabled_slots: int = min(num_slots, 2)
+        self._shrink_cooldown_sec: float = 8.0
+        self._last_shrink_time: float = 0.0
+
         # Shared action proposer (parse-only, no VLM)
         from interactive_reasoning.objectnavtask.agent.action_proposer import (
             ActionProposer,
@@ -95,6 +117,26 @@ class SimulatorPool:
         logger.info(
             f"SimulatorPool initialized: gpu_id={gpu_id}, num_slots={num_slots}"
         )
+
+    def _get_gpu_memory(self) -> Optional[tuple[int, int]]:
+        """Query (free_mb, total_mb) via nvidia-smi. Returns None on failure."""
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["nvidia-smi", "--query-gpu=memory.free,memory.total",
+                 "--format=csv,noheader,nounits", f"--id={self.gpu_id}"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0:
+                free_str, total_str = result.stdout.strip().split(", ")
+                return int(free_str), int(total_str)
+        except Exception:
+            pass
+        return None
+
+    def _get_free_gpu_mb(self) -> Optional[int]:
+        mem = self._get_gpu_memory()
+        return mem[0] if mem is not None else None
 
     def _log_gpu_memory(self, context: str):
         """Log GPU + process RSS memory usage for diagnostics."""
@@ -133,6 +175,11 @@ class SimulatorPool:
         Only creates the AI2ThorController (Unity process), not a full
         ObjectNavEnvironment, so no target-object pathfinding is attempted.
 
+        Reactive sizing: re-enables every slot at warmup; mid-rollout
+        `release_env` is the place where slots get disabled under memory
+        pressure. So memory recovers between phases (rollout → train →
+        rollout) the pool comes back to full size.
+
         Returns the number of controllers successfully warmed up.
         """
         from interactive_reasoning.objectnavtask.environment.ai2thor_controller import (
@@ -140,6 +187,8 @@ class SimulatorPool:
             AI2ThorControllerConfiguration,
         )
 
+        # Re-enable every slot; release_env will shrink under live pressure.
+        self._slot_enabled = [True] * self.num_slots
         self._log_gpu_memory(f"before warmup ({self.num_slots} slots)")
         created = 0
         for i in range(self.num_slots):
@@ -172,16 +221,24 @@ class SimulatorPool:
 
     def get_pool_info(self) -> dict:
         """Return pool status."""
-        available = sum(1 for a in self.slot_available if a)
+        enabled = sum(1 for i in range(self.num_slots) if self._slot_enabled[i])
+        available = sum(
+            1 for i in range(self.num_slots)
+            if self._slot_enabled[i] and self.slot_available[i]
+        )
         return {
             "gpu_id": self.gpu_id,
             "total": self.num_slots,
+            "effective": enabled,
             "available": available,
         }
 
     def get_available_count(self) -> int:
-        """Return the number of available (free) slots."""
-        return sum(self.slot_available)
+        """Return the number of available (free) enabled slots."""
+        return sum(
+            1 for i in range(self.num_slots)
+            if self._slot_enabled[i] and self.slot_available[i]
+        )
 
     # ── lifecycle ─────────────────────────────────────────────────────
 
@@ -194,8 +251,8 @@ class SimulatorPool:
         Returns the slot ID, or None if no slots are available.
         """
         slot_id = None
-        for i, avail in enumerate(self.slot_available):
-            if avail:
+        for i in range(self.num_slots):
+            if self._slot_enabled[i] and self.slot_available[i]:
                 slot_id = i
                 break
 
@@ -319,7 +376,13 @@ class SimulatorPool:
         return adapter.reset()
 
     def release_env(self, slot_id: int) -> None:
-        """Release a slot, keeping the AI2Thor controller cached for reuse."""
+        """Release a slot, keeping the AI2Thor controller cached for reuse.
+
+        Reactive shrink: if GPU usage is over `_target_used_frac` after
+        release, disable this slot and tear down its controller — the pool
+        gives up a slot rather than risk a vLLM/AI2Thor OOM on the next
+        rollout. Disabled slots come back at the next `warmup_controllers`.
+        """
         if slot_id < 0 or slot_id >= self.num_slots:
             return
         self._log_gpu_memory(f"release_env slot={slot_id} BEFORE")
@@ -353,6 +416,46 @@ class SimulatorPool:
         # Clear the adapter but keep the cached controller
         self.slots[slot_id] = None
         self.slot_available[slot_id] = True
+
+        # Reactive shrink (with min floor + cooldown): drop this slot's cached
+        # controller iff GPU is over threshold, we still have slots above the
+        # floor, and the previous shrink has had time to settle. Without
+        # the cooldown, in-flight activation memory makes every release in a
+        # burst look like a fresh OOM signal and the pool collapses to zero.
+        enabled_count = sum(self._slot_enabled)
+        if enabled_count <= self._min_enabled_slots:
+            self._log_gpu_memory(f"release_env slot={slot_id} AFTER")
+            return
+        now = time.monotonic()
+        if now - self._last_shrink_time < self._shrink_cooldown_sec:
+            self._log_gpu_memory(f"release_env slot={slot_id} AFTER")
+            return
+        mem = self._get_gpu_memory()
+        if mem is not None:
+            free_mb, total_mb = mem
+            used_frac = (total_mb - free_mb) / total_mb
+            if used_frac > self._target_used_frac:
+                ctrl = self._cached_controllers[slot_id]
+                if ctrl is not None:
+                    try:
+                        ctrl.set_restart_callback(None)
+                        ctrl.close_controller()
+                    except Exception as e:
+                        logger.warning(
+                            f"[GPU {self.gpu_id}] Failed to close shrunk slot "
+                            f"{slot_id}: {e}"
+                        )
+                    self._cached_controllers[slot_id] = None
+                self._slot_enabled[slot_id] = False
+                self.slot_available[slot_id] = False
+                self._last_shrink_time = now
+                logger.warning(
+                    f"[GPU {self.gpu_id}] Reactive shrink: used={100*used_frac:.0f}% "
+                    f"> {int(100*self._target_used_frac)}%, disabled slot {slot_id} "
+                    f"({enabled_count - 1}/{self.num_slots} enabled, "
+                    f"floor={self._min_enabled_slots}, cooldown={self._shrink_cooldown_sec}s)."
+                )
+                gc.collect()
         self._log_gpu_memory(f"release_env slot={slot_id} AFTER")
 
     def release_all(self) -> None:
