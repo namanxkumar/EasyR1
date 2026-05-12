@@ -35,25 +35,7 @@ from transformers import PreTrainedTokenizer, ProcessorMixin
 from ...protocol import DataProto, pad_dataproto_to_divisor, unpad_dataproto
 
 
-def filter_steps_to_kwindow(steps, past_k_steps):
-    """Filter a chronological list of MultiturnStep to the past-K observation window.
-
-    Keeps step 0 (which carries the task description) and the contiguous tail
-    starting at the K-th-from-last observation step. Error steps interspersed
-    in the kept tail are kept; error steps in the dropped middle are dropped.
-
-    When past_k_steps is None, <= 0, or >= total observation steps, returns
-    the input unchanged.
-    """
-    if not past_k_steps or past_k_steps <= 0:
-        return steps
-    obs_positions = [i for i, s in enumerate(steps) if not s.is_error]
-    if len(obs_positions) <= past_k_steps:
-        return steps
-    tail_start = obs_positions[-past_k_steps]
-    if tail_start == 0:
-        return steps
-    return [steps[0]] + list(steps[tail_start:])
+from common.prompting.context_builders import filter_steps_to_kwindow  # noqa: E402
 
 logger = logging.getLogger(__name__)
 # Ray workers don't inherit the driver's logging config, so set level from env var
