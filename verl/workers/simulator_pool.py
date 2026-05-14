@@ -244,8 +244,18 @@ class SimulatorPool:
             return i, AI2ThorController(configuration=config)
 
         if slots_to_create:
+            # Cap per-pool concurrency. With one pool per GPU, all pools warm
+            # up simultaneously, so per-pool W workers => node-wide ≈ 8·W
+            # concurrent Unity launches. At 256 sims (32 slots/pool) the
+            # unbounded path tried 256 concurrent Unity boots and each create
+            # timed out at 300s (job 121584). 8/pool keeps node peak ~64,
+            # matching the regime that worked for 128-sim runs (121576 OK in
+            # 2:48). Override via SIMULATOR_POOL_WARMUP_WORKERS.
+            warmup_workers = int(
+                os.environ.get("SIMULATOR_POOL_WARMUP_WORKERS", "8")
+            )
             with safe_signal_patch(), ThreadPoolExecutor(
-                max_workers=len(slots_to_create),
+                max_workers=min(warmup_workers, len(slots_to_create)),
                 thread_name_prefix=f"warmup-gpu{self.gpu_id}",
             ) as ex:
                 futures = {ex.submit(_create_one, i): i for i in slots_to_create}
