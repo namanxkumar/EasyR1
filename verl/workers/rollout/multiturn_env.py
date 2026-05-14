@@ -396,6 +396,15 @@ class MultiturnEnvRollout:
 
         t_start = time.time()
 
+        # Sync-mode phase accumulators (async path has its own instrumentation).
+        # _run_continuous_episode_loop adds to these per turn so we can split
+        # rollout wall-time into gen vs env vs prompt-build.
+        self._sync_gen_seconds = 0.0
+        self._sync_env_seconds = 0.0
+        self._sync_prompt_build_seconds = 0.0
+        self._sync_step_total_seconds = 0.0
+        self._sync_n_turns = 0
+
         # Pre-collect all dataset items (ensures deterministic ordering)
         all_items = []
         for _ in range(batch_size):
@@ -465,6 +474,23 @@ class MultiturnEnvRollout:
                 all_trajectories, total_wall_s=time.time() - t_start
             )
             metrics.update(phase_metrics)
+        else:
+            # Sync-path phase breakdown. Each value is the summed wall-clock
+            # across all turns (turns run sequentially so this also equals the
+            # in-loop wall-time spent in that phase). "other" captures
+            # bookkeeping not attributed to any tracked phase.
+            total_turns_wall = self._sync_step_total_seconds
+            tracked = (
+                self._sync_gen_seconds
+                + self._sync_env_seconds
+                + self._sync_prompt_build_seconds
+            )
+            metrics["rollout/sync_gen_seconds"] = self._sync_gen_seconds
+            metrics["rollout/sync_env_step_seconds"] = self._sync_env_seconds
+            metrics["rollout/sync_prompt_build_seconds"] = self._sync_prompt_build_seconds
+            metrics["rollout/sync_turns_wall_seconds"] = total_turns_wall
+            metrics["rollout/sync_other_seconds"] = max(0.0, total_turns_wall - tracked)
+            metrics["rollout/sync_n_turns"] = self._sync_n_turns
         logger.info(
             f"Rollout complete: {len(all_trajectories)} trajectories in "
             f"{time.time() - t_start:.1f}s | "
@@ -559,6 +585,7 @@ class MultiturnEnvRollout:
             # When past_k_steps is set we also need the unfiltered
             # full-trajectory messages on the driver to compute packed MROPE
             # positions. Use build_prompt_with_full in that case.
+            t_pb = time.time()
             use_full = self.past_k_steps is not None
             if use_full:
                 prompt_futures = [
@@ -569,6 +596,7 @@ class MultiturnEnvRollout:
                     t.pool.build_prompt.remote(t.slot_id) for t in active
                 ]
             prompt_results_raw = ray.get(prompt_futures)
+            self._sync_prompt_build_seconds += time.time() - t_pb
 
             # Filter out trajectories whose prompt build failed
             valid = []          # (local_idx, trajectory)
@@ -769,6 +797,7 @@ class MultiturnEnvRollout:
                     )
 
             # ── Step environments in parallel via Ray ──
+            t_env = time.time()
             step_futures = [
                 t.pool.step_env.remote(t.slot_id, responses[i])
                 for i, (_, t) in enumerate(valid)
@@ -782,6 +811,10 @@ class MultiturnEnvRollout:
                     step_results.append(ray.get(f))
                 except Exception as e:
                     step_results.append(e)
+            t_env_elapsed = time.time() - t_env
+            self._sync_env_seconds += t_env_elapsed
+            self._sync_gen_seconds += t_gen_elapsed
+            self._sync_n_turns += 1
 
             # Process step results
             n_terminated_this_step = 0
@@ -824,12 +857,14 @@ class MultiturnEnvRollout:
                         t.terminated = True
                         n_terminated_this_step += 1
 
+            t_step_elapsed = time.time() - t_step
+            self._sync_step_total_seconds += t_step_elapsed
             logger.info(
                 f"  step {global_step}: {len(valid)} active, "
                 f"{n_terminated_this_step} done"
                 + (f" ({n_failed_this_step} failed)" if n_failed_this_step else "")
-                + f", gen={t_gen_elapsed:.1f}s, "
-                f"total={time.time() - t_step:.1f}s"
+                + f", gen={t_gen_elapsed:.1f}s, env={t_env_elapsed:.1f}s, "
+                f"total={t_step_elapsed:.1f}s"
                 + (f", pending={len(pending_queue)}" if pending_queue else "")
                 + f", RSS={_get_rss_mb():.0f}MB"
             )
