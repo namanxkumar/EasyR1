@@ -150,6 +150,18 @@ def compute_advantage(data: DataProto, adv_estimator: AdvantageEstimator, gamma:
     if "reward_baselines" in data.batch:
         adv_inputs["reward_baselines"] = data.batch["reward_baselines"]
 
+    # Thread V4 branching metadata when the guided rollout has populated it.
+    # Keys are written by GuidedMultiturnEnvRollout._build_final_batch_multiturn.
+    if getattr(adv_estimator, "value", adv_estimator) == "grpo_branching":
+        if "step_token_spans" in data.non_tensor_batch:
+            adv_inputs["step_token_spans"] = data.non_tensor_batch["step_token_spans"]
+        if "branch_chain" in data.non_tensor_batch:
+            adv_inputs["branch_chains"] = data.non_tensor_batch["branch_chain"]
+        if "dagger_iter_index" in data.non_tensor_batch:
+            adv_inputs["dagger_iter_index"] = data.non_tensor_batch["dagger_iter_index"]
+        if "chain_id" in data.non_tensor_batch:
+            adv_inputs["chain_id"] = data.non_tensor_batch["chain_id"]
+
     advantages, returns = compute_advantage_return(adv_estimator, **adv_inputs)
     data.batch["advantages"] = advantages
     data.batch["returns"] = returns

@@ -13,8 +13,8 @@
 # limitations under the License.
 
 
-from .config import MultiturnEnvConfig, RolloutConfig
+from .config import GuidedRolloutConfig, MultiturnEnvConfig, RolloutConfig
 from .vllm_rollout_spmd import vLLMRollout
 
 
-__all__ = ["MultiturnEnvConfig", "RolloutConfig", "vLLMRollout"]
+__all__ = ["GuidedRolloutConfig", "MultiturnEnvConfig", "RolloutConfig", "vLLMRollout"]

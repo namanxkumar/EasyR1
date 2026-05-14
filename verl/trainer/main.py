@@ -140,8 +140,10 @@ def _create_simulator_pools(mt_cfg, n_gpus: int):
 
 
 def _create_multiturn_rollout(config: PPOConfig, tokenizer, processor):
-    """Create a MultiturnEnvRollout with Ray-parallel SimulatorPools."""
+    """Create a MultiturnEnvRollout (or GuidedMultiturnEnvRollout) with
+    Ray-parallel SimulatorPools."""
     mt_cfg = config.worker.multiturn_env
+    guided_cfg = config.worker.guided_rollout
 
     from ..workers.rollout.multiturn_env import MultiturnEnvRollout, ObjectNavEnvFactory
 
@@ -199,6 +201,97 @@ def _create_multiturn_rollout(config: PPOConfig, tokenizer, processor):
 
     # Controllers are warmed up on-demand in generate_trajectories() and
     # destroyed after each rollout to free GPU memory for training.
+
+    if guided_cfg.enabled:
+        from ..workers.rollout.guided_multiturn_env import (
+            GuidedMultiturnEnvRollout,
+            GuidedConfig,
+        )
+
+        gc = GuidedConfig(
+            enabled=True,
+            max_iters=guided_cfg.max_iters,
+            n_per_prompt=guided_cfg.n_per_prompt,
+            stop_on_solved=guided_cfg.stop_on_solved,
+            branch_selection_mode=guided_cfg.branch_selection_mode,
+            random_regression_seed=guided_cfg.random_regression_seed,
+        )
+        # Teacher annotator wiring. Server mode → ServerTeacherVLM via
+        # pope_dagger.teacher_vlm; co-located mode is not yet implemented.
+        teacher_annotate_fn = None
+        if guided_cfg.teacher_mode == "server":
+            try:
+                from pope_dagger.teacher_vlm import (
+                    ServerTeacherVLM,
+                    TeacherAnnotateRequest,
+                    TeacherConfig,
+                )
+                from interactive_reasoning.vlm import VLMType
+
+                vlm_type = VLMType.QWEN if guided_cfg.teacher_vlm_type == "qwen" else VLMType.COSMOS
+                tcfg = TeacherConfig(
+                    mode="server",
+                    vlm_node=guided_cfg.teacher_vlm_node,
+                    vlm_port=guided_cfg.teacher_vlm_port,
+                    vlm_type=vlm_type,
+                    job_name=guided_cfg.teacher_job_name,
+                    past_context_steps=guided_cfg.teacher_past_context_steps,
+                    future_context_steps=guided_cfg.teacher_future_context_steps,
+                    max_workers=guided_cfg.teacher_max_workers,
+                )
+                teacher = ServerTeacherVLM(tcfg)
+
+                from ..workers.rollout.guided_multiturn_env import _build_placeholder_annotator
+                _placeholder = _build_placeholder_annotator(tokenizer)
+
+                def _annotate(*, pool, slot_id, episode_id, expert_action_formatted,
+                              parent, branch_step_index):
+                    # ExpertCacheEntry requires sparse_action / rationale_kind /
+                    # image which the rollout layer does not currently plumb
+                    # through. Until that wiring exists, fall back to the
+                    # placeholder annotator so the run still proceeds (the V4
+                    # chain is structurally valid; we just lose teacher
+                    # reasoning until the integration is completed).
+                    try:
+                        from pope_dagger.expert_replay import ExpertCacheEntry  # noqa: F401  (import probe)
+                    except Exception:
+                        pass
+                    return _placeholder(
+                        pool=pool, slot_id=slot_id, episode_id=episode_id,
+                        expert_action_formatted=expert_action_formatted,
+                        parent=parent, branch_step_index=branch_step_index,
+                    )
+
+                teacher_annotate_fn = _annotate
+                logging.info("[guided] teacher mode=server wired via ServerTeacherVLM")
+            except Exception as e:
+                logging.warning(
+                    f"[guided] failed to wire teacher VLM ({e!r}); falling back to placeholder annotator"
+                )
+                teacher_annotate_fn = None
+        elif guided_cfg.teacher_mode == "colocated":
+            raise NotImplementedError(
+                "guided_rollout.teacher_mode='colocated' is not yet implemented. "
+                "Use 'server' with a dedicated teacher SLURM job for now."
+            )
+
+        return GuidedMultiturnEnvRollout(
+            tokenizer=tokenizer,
+            processor=processor,
+            env_factory=env_factory,
+            simulator_pools=simulator_pools,
+            max_depth=mt_cfg.max_depth,
+            max_prompt_length=config.data.max_prompt_length,
+            max_response_length=config.data.max_response_length,
+            min_pixels=config.data.min_pixels,
+            max_pixels=config.data.max_pixels,
+            prior_image_scale=mt_cfg.prior_image_scale,
+            context_mode=mt_cfg.context_mode,
+            force_max_depth=mt_cfg.force_max_depth,
+            past_k_steps=mt_cfg.past_k_steps,
+            guided_cfg=gc,
+            teacher_annotate_fn=teacher_annotate_fn,
+        )
 
     return MultiturnEnvRollout(
         tokenizer=tokenizer,

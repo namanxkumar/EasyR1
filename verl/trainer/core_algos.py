@@ -81,6 +81,7 @@ class AdvantageEstimator(str, Enum):
     GAE = "gae"
     GRPO = "grpo"
     GRPO_PASSK = "grpo_passk"
+    GRPO_BRANCHING = "grpo_branching"
     REINFORCE_PLUS_PLUS = "reinforce_plus_plus"
     REMAX = "remax"
     RLOO = "rloo"
@@ -214,6 +215,157 @@ def compute_grpo_outcome_advantage(
 
     returns = scores.unsqueeze(-1) * response_mask
     return returns, returns
+
+
+def _hashable_uid(x):
+    """Make a numpy/torch scalar (or string) safely hashable for dict keys."""
+    try:
+        return x.item()  # numpy/torch scalar
+    except AttributeError:
+        return x
+
+
+def _lcp_step(
+    iter_i: int,
+    chain_i: list,
+    iter_j: int,
+    chain_j: list,
+    chain_id_i: int = 0,
+    chain_id_j: int = 0,
+) -> int:
+    """Step index at which trajectories i and j diverge.
+
+    Within the same uid group, multiple independent V4/V5 chains may be emitted
+    (baseline + iters, then a new chain for padding, etc.). Cross-chain pairs
+    (``chain_id_i != chain_id_j``) diverge at step 0 because each chain starts
+    from a fresh env reset with stochastic sampling — no shared prefix.
+
+    For two trajectories in the same chain with ``dagger_iter_index a <= b``:
+      * a == b: same trajectory (caller should skip self).
+      * a < b:  LCP_step = chain_high[a]  (the (a+1)-th branch step of the
+        longer chain, since j inherits i's prefix through step
+        chain_high[a] - 1 and diverges at step chain_high[a]).
+
+    Legacy ``dagger_iter_index == -1`` still marks standalone on-policy padding
+    (kept for backward compatibility with batches built before chain_id).
+    """
+    if chain_id_i != chain_id_j:
+        return 0
+    if iter_i < 0 or iter_j < 0:
+        return 0
+    a, b = (iter_i, iter_j) if iter_i <= iter_j else (iter_j, iter_i)
+    chain_high = chain_j if iter_j >= iter_i else chain_i
+    # chain_high length == max(iter_i, iter_j); index a gives the divergence step.
+    if a < len(chain_high):
+        return int(chain_high[a])
+    return 0
+
+
+@register_adv_estimator(AdvantageEstimator.GRPO_BRANCHING)
+def compute_grpo_branching_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index,
+    step_token_spans=None,
+    branch_chains=None,
+    dagger_iter_index=None,
+    chain_id=None,
+    eps: float = 1e-6,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-step pairwise-cohort GRPO advantage for V4 branching rollouts.
+
+    For each trajectory i and step k of that trajectory, the cohort is the set
+    of other trajectories in the same uid group that have *already diverged*
+    from i by step k — i.e. ``LCP_step(i, j) <= k``. Advantage is the
+    leave-one-in z-score of trajectory rewards over (cohort ∪ {i}), broadcast
+    over the response-token span of step k. Steps fully inside a shared
+    prefix (empty cohort) get zero advantage and contribute no gradient.
+
+    Args:
+        token_level_rewards: (bs, response_length) per-token reward
+            (trajectory-level rewards summed to a scalar per row).
+        response_mask: (bs, response_length) response token mask.
+        index: (bs,) uid per trajectory.
+        step_token_spans: per-trajectory list of (start, end) response-token
+            offsets for each emitted step. Falls back to standard GRPO if None.
+        branch_chains: per-trajectory list of branch-step indices
+            ``[B_1, ..., B_k]`` from V4 ancestry; empty for baseline/padding.
+        dagger_iter_index: per-trajectory int, the V4 iter index. 0 = baseline,
+            k >= 1 = guided iter, -1 = standalone on-policy padding.
+        eps: epsilon for std stabilization.
+
+    Returns:
+        (advantages, returns): both (bs, response_length); equal for outcome-
+        style estimators.
+    """
+    bs, resp_len = token_level_rewards.shape
+    scores = token_level_rewards.sum(dim=-1)
+    advantages = torch.zeros_like(token_level_rewards)
+
+    # Fallback to group-wide GRPO if branching metadata is missing — keeps
+    # this estimator safe when wired into non-guided runs.
+    if step_token_spans is None or branch_chains is None or dagger_iter_index is None:
+        return compute_grpo_outcome_advantage(
+            token_level_rewards=token_level_rewards,
+            response_mask=response_mask,
+            index=index,
+            eps=eps,
+        )
+
+    by_uid: dict[Any, list[int]] = defaultdict(list)
+    for i in range(bs):
+        by_uid[_hashable_uid(index[i])].append(i)
+
+    for members in by_uid.values():
+        if len(members) <= 1:
+            continue
+        for i in members:
+            spans_i = step_token_spans[i]
+            num_steps_i = len(spans_i) if spans_i is not None else 0
+            if num_steps_i == 0:
+                continue
+            iter_i = int(dagger_iter_index[i])
+            chain_i = list(branch_chains[i]) if branch_chains[i] is not None else []
+            cid_i = int(chain_id[i]) if chain_id is not None else 0
+
+            for k in range(num_steps_i):
+                start_end = spans_i[k]
+                if start_end is None:
+                    continue
+                start, end = int(start_end[0]), int(start_end[1])
+                if start < 0 or end < start or start >= resp_len:
+                    continue
+                end = min(end, resp_len - 1)
+
+                cohort_scores = []
+                for j in members:
+                    if j == i:
+                        continue
+                    iter_j = int(dagger_iter_index[j])
+                    chain_j = list(branch_chains[j]) if branch_chains[j] is not None else []
+                    cid_j = int(chain_id[j]) if chain_id is not None else 0
+                    lcp = _lcp_step(iter_i, chain_i, iter_j, chain_j, cid_i, cid_j)
+                    if lcp <= k:
+                        cohort_scores.append(scores[j])
+
+                if not cohort_scores:
+                    continue
+
+                combined = torch.stack([scores[i]] + cohort_scores)
+                mean = combined.mean()
+                # Match standard GRPO: torch.std() defaults to unbiased=True.
+                # Falls back to 0 for n=1 (single-element cohort) — caller would
+                # then divide by eps; that's fine, advantage is just the deviation.
+                if combined.numel() > 1:
+                    std = combined.std()
+                else:
+                    std = torch.zeros_like(combined.sum())
+                a_val = (scores[i] - mean) / (std + eps)
+                advantages[i, start : end + 1] = a_val
+
+    advantages = advantages * response_mask
+    return advantages, advantages
 
 
 @register_adv_estimator(AdvantageEstimator.GRPO_PASSK)
@@ -461,6 +613,17 @@ def compute_policy_loss(
             a float number indicating the mean entropy loss
 
     """
+    # Teacher tokens (V4 forced steps emitted by the teacher VLM) carry mask=1
+    # in `teacher_token_mask`. They were not sampled from the student policy,
+    # so applying a policy-gradient update to them is incoherent. Zero them
+    # out of the gradient-bearing mask, but keep `response_mask` for entropy
+    # and KL summaries (those are population statistics over response tokens).
+    teacher_token_mask = kwargs.get("teacher_token_mask")
+    if teacher_token_mask is not None:
+        effective_mask = response_mask * (1.0 - teacher_token_mask.to(response_mask.dtype))
+    else:
+        effective_mask = response_mask
+
     negative_approx_kl = log_probs - old_log_probs
     if loss_type in ["gspo", "gspo_token"]:
         # compute sequence-level importance ratio
@@ -504,7 +667,7 @@ def compute_policy_loss(
         final_pg_loss = torch.where(advantages < 0, clipped_pg_loss_lower, clipped_pg_loss_higher)
         metrics["pg_clipfrac_lower"] = (clipped_pg_loss_higher > pg_loss3).float() * (advantages < 0).float()
 
-    final_pg_loss = average_loss(final_pg_loss, response_mask, mode=loss_avg_mode)
+    final_pg_loss = average_loss(final_pg_loss, effective_mask, mode=loss_avg_mode)
     metrics = {k: VF.masked_mean(v, response_mask).detach().item() for k, v in metrics.items()}
     return final_pg_loss, metrics
 

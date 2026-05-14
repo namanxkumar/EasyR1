@@ -356,6 +356,14 @@ class SimulatorPool:
                 reward_mode=self.reward_mode,
             )
 
+            # Stash the dataset item on the adapter so guided rollouts can
+            # synthesize the pope-dagger expert trajectory without re-fetching.
+            try:
+                adapter.dataset_item = item_data
+                adapter.expert_trajectory_cache = None
+            except Exception:
+                pass
+
             self.slots[slot_id] = adapter
             return slot_id
 
@@ -526,6 +534,61 @@ class SimulatorPool:
         if adapter is None:
             return "{}"
         return adapter.get_ground_truth()
+
+    # ── pope-dagger guided rollout hook ──────────────────────────────
+    def compute_expert_action(self, slot_id: int) -> str:
+        """Return the next pope-dagger oracle action for this slot.
+
+        Bridges ``GuidedMultiturnEnvRollout`` into pope-dagger's navmesh
+        expert. ``compute_expert_actions_via_sparsify`` synthesizes the full
+        expert SparseTrajectory (depends only on the dataset item / navmesh,
+        not on the student's history) so we compute it once per episode and
+        cache it on the adapter. Each call returns the action at index
+        ``adapter.num_steps + 1`` (steps[0] is the no-op ``initial`` step).
+        """
+        adapter = self.slots[slot_id]
+        if adapter is None:
+            raise ValueError(f"Slot {slot_id} is empty")
+        try:
+            from pope_dagger.expert_replay import compute_expert_actions_via_sparsify
+        except Exception as e:
+            logger.warning(f"pope_dagger import failed: {e!r}")
+            return "<explore>direction:0</explore>"
+
+        env = getattr(adapter, "env", None)
+        dataset_item = getattr(adapter, "dataset_item", None) or getattr(adapter, "item_data", None)
+        if env is None or dataset_item is None:
+            logger.warning(
+                f"Slot {slot_id}: missing env or dataset_item on adapter "
+                f"(env={env is not None}, item={dataset_item is not None})"
+            )
+            return "<explore>direction:0</explore>"
+
+        cache = getattr(adapter, "expert_trajectory_cache", None)
+        if cache is None:
+            try:
+                cache = compute_expert_actions_via_sparsify(env=env, dataset_item=dataset_item)
+            except Exception as e:
+                logger.warning(f"compute_expert_actions_via_sparsify failed: {e!r}")
+                return "<explore>direction:0</explore>"
+            try:
+                adapter.expert_trajectory_cache = cache
+            except Exception:
+                pass
+
+        # SparseTrajectory.steps[0] is the no-op "initial" step; steps[1:]
+        # are real expert actions. The next student action would be at index
+        # adapter.num_steps + 1 (num_steps counts executed actions so far).
+        idx = int(getattr(adapter, "num_steps", 0) or 0) + 1
+        steps = getattr(cache, "steps", None) or []
+        if idx >= len(steps):
+            return "<explore>direction:0</explore>"
+
+        action = steps[idx].action
+        formatted = getattr(action, "formatted", None)
+        if formatted:
+            return formatted
+        return "<explore>direction:0</explore>"
 
     # ── recovery ──────────────────────────────────────────────────────
 

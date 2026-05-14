@@ -131,6 +131,72 @@ class MultiturnEnvConfig:
 
 
 @dataclass
+class GuidedRolloutConfig:
+    """Pope-Dagger V4 guided rollout knobs.
+
+    When ``enabled=True``, ``GuidedMultiturnEnvRollout`` replaces the standard
+    ``MultiturnEnvRollout`` driver. The trainer also flips ``algorithm.adv_estimator``
+    to ``grpo_branching`` automatically (so per-step pairwise-cohort advantages
+    are used instead of group-wide GRPO).
+    """
+
+    enabled: bool = False
+    """Master switch — when False, behaves exactly like baseline DAPO."""
+
+    max_iters: int = 3
+    """Maximum V4 chain depth (iters 1..max_iters after the on-policy baseline).
+    Effective cap is min(max_iters, max_depth - 1, n_per_prompt - 1)."""
+
+    n_per_prompt: int = 4
+    """Target group size: each uid contributes exactly this many trajectories
+    (baseline + chain + on-policy padding). Should match ``rollout.n``."""
+
+    stop_on_solved: bool = True
+    """Stop extending a chain once the parent trajectory succeeded (reward >= 1)."""
+
+    branch_selection_mode: str = "random_regression"
+    """Branch-step selection strategy.
+    - 'fixed_step_k': iter k forces step (k-1). Deterministic ladder; produces
+      a strict nested-prefix V4 chain.
+    - 'random_regression': pope-dagger V5 selector. Each iter samples a
+      branch step uniformly from [suffix_peak..last_unrecovered] of the
+      un-forced suffix (steps after the latest forced window). Branch chain
+      is still monotonically increasing (V5 scopes by scan_start)."""
+
+    random_regression_seed: int | None = None
+    """Optional seed for the V5 selector RNG. Mixed with (group_id, iter_k) so
+    each (prompt, iter) gets a deterministic but distinct sample. None →
+    fresh RNG (stochastic across runs)."""
+
+    # ── Teacher VLM backend ──────────────────────────────────────────────
+    teacher_mode: str = "server"
+    """'server' (always-on dedicated vLLM) or 'colocated' (in-process with
+    sleep mode). v1 supports 'server' only; 'colocated' raises at construction."""
+
+    teacher_vlm_node: Optional[str] = None
+    """Hostname of the teacher vLLM server (server mode)."""
+
+    teacher_vlm_port: Optional[str] = None
+    """Port of the teacher vLLM server (server mode)."""
+
+    teacher_job_name: Optional[str] = None
+    """SLURM job name for squeue-based discovery (server mode, fallback when
+    explicit node/port + env vars are unset)."""
+
+    teacher_vlm_type: str = "qwen"
+    """VLM family ('qwen' or 'cosmos') for tokenizer/prompt formatting."""
+
+    teacher_past_context_steps: int = 8
+    """Past observation horizon forwarded to ``annotate_expert_cache``."""
+
+    teacher_future_context_steps: int = 0
+    """Future observation horizon forwarded to ``annotate_expert_cache``."""
+
+    teacher_max_workers: int = 16
+    """Thread-pool fan-out width for batched teacher annotation."""
+
+
+@dataclass
 class RolloutConfig:
     name: str = "vllm"
     n: int = 1
