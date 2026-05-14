@@ -58,8 +58,15 @@ class SimulatorPool:
         past_k_steps: "int | None" = None,
         reward_mode: str = "continuous",
     ):
-        # Force AI2Thor to use the specified GPU (set before any CUDA init)
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        # Force AI2Thor to use the specified GPU (set before any CUDA init).
+        # On Linux64 (H100 / AI2THOR_USE_LINUX64=1) leave CUDA_VISIBLE_DEVICES
+        # empty so ai2thor skips its vulkaninfo precondition — vulkan is gated
+        # on H100 datacenter SKUs. Rendering is routed via x_display instead.
+        self._use_linux64 = os.environ.get("AI2THOR_USE_LINUX64", "0") == "1"
+        if self._use_linux64:
+            os.environ["CUDA_VISIBLE_DEVICES"] = ""
+        else:
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
         self.gpu_id = gpu_id
         self.num_slots = num_slots
@@ -190,6 +197,26 @@ class SimulatorPool:
         # Re-enable every slot; release_env will shrink under live pressure.
         self._slot_enabled = [True] * self.num_slots
         self._log_gpu_memory(f"before warmup ({self.num_slots} slots)")
+
+        # Linux64: one Xorg per Unity instance is required (probes 121479/121481
+        # showed multi-Unity-on-one-display produces identical framebuffers).
+        # The sbatch wrapper spawns N Xorgs and exports a comma-separated list
+        # per physical GPU via AI2THOR_DISPLAYS_FOR_GPU_<phys_id>.
+        displays: list[Optional[str]] = [None] * self.num_slots
+        if self._use_linux64:
+            env_key = f"AI2THOR_DISPLAYS_FOR_GPU_{self.gpu_id}"
+            raw = os.environ.get(env_key, "")
+            disp_list = [d.strip() for d in raw.split(",") if d.strip()]
+            if len(disp_list) < self.num_slots:
+                logger.warning(
+                    f"[GPU {self.gpu_id}] {env_key} has {len(disp_list)} displays "
+                    f"but pool has {self.num_slots} slots; extra slots will share "
+                    f"the last display and may produce corrupted frames."
+                )
+            for i in range(self.num_slots):
+                if disp_list:
+                    displays[i] = disp_list[min(i, len(disp_list) - 1)]
+
         created = 0
         for i in range(self.num_slots):
             if self._cached_controllers[i] is not None:
@@ -201,6 +228,7 @@ class SimulatorPool:
                     gpu_id=0,  # 0 = first (only) visible GPU after CUDA_VISIBLE_DEVICES
                     render_width=self.render_width,
                     render_height=self.render_height,
+                    x_display=displays[i],
                 )
                 controller = AI2ThorController(configuration=config)
                 self._cached_controllers[i] = controller

@@ -1522,7 +1522,22 @@ class MultiturnEnvRollout:
             if not for_generation:
                 # Pre-computed tensors for training-side log-prob computation
                 # (avoids re-processing which can produce mismatched grids).
-                multi_modal_inputs = {k: v for k, v in model_inputs.items() if isinstance(v, torch.Tensor)}
+                # Whitelist only visual-input tensors. Qwen3-VL processors may
+                # emit extra tensor fields (e.g. position_ids for mrope) whose
+                # non-batch dims vary per sample — those break torch.cat(dim=0)
+                # in dp_actor._forward_micro_batch.
+                _MM_KEYS = (
+                    "pixel_values",
+                    "image_grid_thw",
+                    "pixel_values_videos",
+                    "video_grid_thw",
+                    "second_per_grid_ts",
+                )
+                multi_modal_inputs = {
+                    k: model_inputs[k]
+                    for k in _MM_KEYS
+                    if k in model_inputs and isinstance(model_inputs[k], torch.Tensor)
+                }
                 batch_multi_modal_data.append(multi_modal_inputs)
             # Raw PIL images stored separately for vLLM generation (vLLM
             # does its own image processing internally).
