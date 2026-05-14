@@ -217,31 +217,53 @@ class SimulatorPool:
                 if disp_list:
                     displays[i] = disp_list[min(i, len(disp_list) - 1)]
 
-        created = 0
-        for i in range(self.num_slots):
-            if self._cached_controllers[i] is not None:
-                created += 1
-                continue
-            try:
-                config = AI2ThorControllerConfiguration(
-                    scene_metadata=dummy_scene_metadata,
-                    gpu_id=0,  # 0 = first (only) visible GPU after CUDA_VISIBLE_DEVICES
-                    render_width=self.render_width,
-                    render_height=self.render_height,
-                    x_display=displays[i],
-                )
-                controller = AI2ThorController(configuration=config)
-                self._cached_controllers[i] = controller
-                created += 1
-                logger.info(
-                    f"Warmed up controller {created}/{self.num_slots} "
-                    f"on gpu {self.gpu_id}"
-                )
-            except Exception as e:
-                logger.error(
-                    f"Failed to warm up controller for slot {i} on gpu "
-                    f"{self.gpu_id}: {e}"
-                )
+        # Parallelize per-slot Unity spawns within this pool. Each slot binds to
+        # a distinct x_display (Linux64), so renderer-level contention is bounded
+        # to per-display Xorg load. AI2ThorController's signal patch mutates
+        # process globals (signal.signal / signal.alarm) — install it once at
+        # the outer scope so the worker threads don't race; per-call patches
+        # inside _create_ai2thor_controller become no-ops via refcount.
+        from concurrent.futures import ThreadPoolExecutor
+        from interactive_reasoning.objectnavtask.environment.ai2thor_controller import (
+            safe_signal_patch,
+        )
+
+        slots_to_create = [
+            i for i in range(self.num_slots) if self._cached_controllers[i] is None
+        ]
+        created = self.num_slots - len(slots_to_create)
+
+        def _create_one(i: int):
+            config = AI2ThorControllerConfiguration(
+                scene_metadata=dummy_scene_metadata,
+                gpu_id=0,  # 0 = first (only) visible GPU after CUDA_VISIBLE_DEVICES
+                render_width=self.render_width,
+                render_height=self.render_height,
+                x_display=displays[i],
+            )
+            return i, AI2ThorController(configuration=config)
+
+        if slots_to_create:
+            with safe_signal_patch(), ThreadPoolExecutor(
+                max_workers=len(slots_to_create),
+                thread_name_prefix=f"warmup-gpu{self.gpu_id}",
+            ) as ex:
+                futures = {ex.submit(_create_one, i): i for i in slots_to_create}
+                for fut in futures:
+                    slot_idx = futures[fut]
+                    try:
+                        i, controller = fut.result()
+                        self._cached_controllers[i] = controller
+                        created += 1
+                        logger.info(
+                            f"Warmed up controller {created}/{self.num_slots} "
+                            f"on gpu {self.gpu_id}"
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"Failed to warm up controller for slot {slot_idx} "
+                            f"on gpu {self.gpu_id}: {e}"
+                        )
         self._log_gpu_memory(f"after warmup ({created}/{self.num_slots} created)")
         return created
 
