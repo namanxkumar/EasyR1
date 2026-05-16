@@ -62,6 +62,23 @@ from .metrics import (
 )
 
 
+def _redact_prompt_images(obj):
+    """Recursively replace PIL images / non-JSON-serializable bytes with placeholders."""
+    if isinstance(obj, list):
+        return [_redact_prompt_images(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _redact_prompt_images(v) for k, v in obj.items()}
+    if hasattr(obj, "save") and hasattr(obj, "size") and hasattr(obj, "mode"):
+        # PIL.Image-like
+        try:
+            return {"__image__": True, "size": list(obj.size), "mode": obj.mode}
+        except Exception:
+            return {"__image__": True}
+    if isinstance(obj, (bytes, bytearray)):
+        return f"<bytes len={len(obj)}>"
+    return obj
+
+
 class Role(IntEnum):
     """
     To create more roles dynamically, you can subclass Role and add new members
@@ -417,6 +434,63 @@ class RayPPOTrainer:
             return self._validate_multiturn()
         return self._validate_dataset()
 
+    def _dump_val_trajectories(self, snapshots) -> None:
+        """Write a small set of val trajectories to disk for visualization.
+
+        snapshots is the list produced by MultiturnEnvRollout._last_val_dump:
+        each entry has episode_id, group_id, n_idx, num_steps, reward,
+        ground_truth, step_responses, last_images, last_prompt.
+
+        Output: {save_checkpoint_path}/val_dumps/step_{global_step}/traj_{i}/
+        """
+        if not snapshots:
+            return
+        out_root = os.path.join(
+            self.config.trainer.save_checkpoint_path,
+            "val_dumps",
+            f"step_{self.global_step}",
+        )
+        os.makedirs(out_root, exist_ok=True)
+        for i, snap in enumerate(snapshots):
+            tdir = os.path.join(out_root, f"traj_{i:02d}")
+            os.makedirs(tdir, exist_ok=True)
+            meta = {
+                "episode_id": snap.get("episode_id"),
+                "group_id": snap.get("group_id"),
+                "n_idx": snap.get("n_idx"),
+                "num_steps": snap.get("num_steps"),
+                "reward": snap.get("reward"),
+            }
+            gt = snap.get("ground_truth")
+            if isinstance(gt, str):
+                try:
+                    meta["ground_truth"] = json.loads(gt)
+                except (json.JSONDecodeError, TypeError):
+                    meta["ground_truth"] = gt
+            else:
+                meta["ground_truth"] = gt
+            with open(os.path.join(tdir, "meta.json"), "w") as f:
+                json.dump(meta, f, indent=2, default=str)
+            for j, resp in enumerate(snap.get("step_responses") or []):
+                with open(os.path.join(tdir, f"step_{j:02d}_response.txt"), "w") as f:
+                    f.write(resp)
+            for j, img in enumerate(snap.get("last_images") or []):
+                save = getattr(img, "save", None)
+                if callable(save):
+                    try:
+                        save(os.path.join(tdir, f"obs_{j:02d}.png"))
+                    except Exception as e:
+                        print(f"[val-dump] traj {i} img {j} save failed: {e}")
+            last_prompt = snap.get("last_prompt")
+            if last_prompt is not None:
+                try:
+                    redacted = _redact_prompt_images(last_prompt)
+                    with open(os.path.join(tdir, "final_prompt.json"), "w") as f:
+                        json.dump(redacted, f, indent=2, default=str)
+                except Exception as e:
+                    print(f"[val-dump] traj {i} prompt save failed: {e}")
+        print(f"[val-dump] wrote {len(snapshots)} trajectories to {out_root}")
+
     def _validate_multiturn(self) -> dict[str, Any]:
         """Run validation via multi-turn environment rollouts on held-out episodes."""
         mt_cfg = self.config.worker.multiturn_env
@@ -425,6 +499,9 @@ class RayPPOTrainer:
         print(f"Start multiturn validation (batch_size={mt_cfg.val_batch_size}, n={mt_cfg.val_n})...")
 
         val_metrics: dict[str, Any] = {}
+        dump_k = int(self.config.trainer.val_generations_to_log or 0)
+        if dump_k > 0:
+            val_metrics["_dump_first_k"] = dump_k
         self.actor_rollout_ref_wg.prepare_rollout_engine()
 
         batch = self.val_multiturn_rollout.generate_trajectories(
@@ -437,6 +514,14 @@ class RayPPOTrainer:
         )
 
         self.actor_rollout_ref_wg.release_rollout_engine()
+
+        if dump_k > 0:
+            try:
+                self._dump_val_trajectories(
+                    getattr(self.val_multiturn_rollout, "_last_val_dump", None)
+                )
+            except Exception as e:
+                print(f"[val-dump] failed: {e}")
 
         # Compute reward via val_reward_fn (same as training reward, separate instance)
         reward_tensor, reward_metrics = ray.get(self.val_reward_fn.compute_reward.remote(batch))

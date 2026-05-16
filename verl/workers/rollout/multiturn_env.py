@@ -509,6 +509,27 @@ class MultiturnEnvRollout:
             all_trajectories, all_rewards, all_ground_truths, n_trajectories
         )
 
+        # ── Optional: snapshot first-K trajectories for val visualization ──
+        # Caller (_validate_multiturn) signals via metrics["_dump_first_k"].
+        dump_k = int(metrics.pop("_dump_first_k", 0) or 0)
+        if dump_k > 0:
+            snapshots = []
+            for t in all_trajectories[:dump_k]:
+                snapshots.append({
+                    "episode_id": t.episode_id,
+                    "group_id": t.group_id,
+                    "n_idx": t.n_idx,
+                    "num_steps": t.num_steps,
+                    "reward": t.reward,
+                    "ground_truth": t.ground_truth,
+                    "step_responses": list(t.step_responses),
+                    "last_images": list(t.last_images),
+                    "last_prompt": t.last_prompt,
+                })
+            self._last_val_dump = snapshots
+        else:
+            self._last_val_dump = None
+
         # ── Eagerly free trajectory image caches ──
         for t in all_trajectories:
             t.last_images.clear()
