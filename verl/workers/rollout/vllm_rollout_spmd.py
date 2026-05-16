@@ -108,7 +108,14 @@ class AsyncRequestRouter:
        lifecycle, same in-process weight sync — because the engine itself
        never moves out of the rollout-worker process.
 
-    TP=1 only — see `RolloutConfig.async_mode` docstring for why."""
+    Works with TP>1 when the driver fans the same request out to every TP
+    rank of an engine (see `MultiturnEnvRollout._run_async_episode_loop`).
+    The router on each rank runs independently, but because all ranks see
+    the same `add_request` calls in the same FIFO order — guaranteed by
+    Ray's async-actor mailbox ordering plus the sync prefix of
+    `generate_one` running to completion before yielding — each rank's
+    scheduler makes the same decisions and vLLM's intra-engine TP
+    collectives line up."""
 
     def __init__(self, llm_engine, sleep_quantum: float = 0.0):
         self.engine = llm_engine
@@ -341,13 +348,9 @@ class vLLMRollout(BaseRollout):
         # to spin up an asyncio event loop until the multiturn driver actually
         # asks for it — keeps the sync codepath untouched.
         self._async_router: Optional[AsyncRequestRouter] = None
-        if getattr(config, "async_mode", False):
-            if config.tensor_parallel_size != 1:
-                raise ValueError(
-                    "rollout.async_mode=true currently requires tensor_parallel_size=1. "
-                    "TP>1 needs the per-rank async path to broadcast each request "
-                    "across the TP group, which is not yet implemented."
-                )
+        # TP>1 async is supported: the driver fans each request out to every
+        # TP rank of an engine (see `_run_async_episode_loop`), so this rank
+        # just runs its own router. No cross-rank coordination needed here.
 
     def _get_async_router(self) -> AsyncRequestRouter:
         """Return (creating if needed) the asyncio driver for the in-process engine."""
