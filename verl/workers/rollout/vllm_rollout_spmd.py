@@ -308,9 +308,9 @@ class vLLMRollout(BaseRollout):
 
         # Offload vllm model to reduce peak memory usage
         try:
-            self.inference_engine.sleep(level=2)
+            self.inference_engine.sleep(level=1)
         except Exception as e:
-            print(f"WARNING: vLLM sleep(level=2) failed: {e}")
+            print(f"WARNING: vLLM sleep(level=1) failed: {e}")
             print("Continuing without sleep mode — this may increase peak memory usage.")
 
         # Stop strings require vLLM's incremental detokenizer to compare against
