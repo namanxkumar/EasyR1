@@ -730,7 +730,15 @@ class FSDPWorker(Worker):
         self.rollout_sharding_manager.load_vllm_and_sync_weights()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def release_rollout_engine(self):
+    async def release_rollout_engine(self):
+        # Async rollout: stop the AsyncRequestRouter's TP step loop before
+        # offloading. Without this, slaves keep calling
+        # `dist.broadcast_object_list` on the TP NCCL group while FSDP holds
+        # the GIL during the actor update — the NCCL watchdog then kills the
+        # job at the 600s collective timeout. `wait_idle` is a no-op when the
+        # router was never instantiated (sync rollout path).
+        if hasattr(self.rollout, "wait_idle"):
+            await self.rollout.wait_idle()
         self.rollout_sharding_manager.offload_vllm()
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
