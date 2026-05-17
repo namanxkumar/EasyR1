@@ -252,9 +252,12 @@ class RolloutConfig:
     once per PPO step before FSDP↔vLLM weight sync.
 
     Constraints:
-    - TP=1 only. With TP>1, every TP rank must call ``engine.step()`` in
-      lockstep with the same in-flight requests; the per-rank async path
-      doesn't yet broadcast new requests across the TP group.
+    - TP>1 supported via lockstep stepping in
+      ``AsyncRequestRouter._step_loop_tp``: rank 0 broadcasts the per-step
+      admit list over the vLLM TP NCCL group, slaves wait for matching
+      payloads (driver fans the request out to every TP rank of the chosen
+      engine), and all ranks call ``engine.step()`` with identical scheduler
+      state so the forward-pass TP collectives line up.
     - Existing direct-memory weight sync at ``fsdp_vllm.py`` requires the
       engine to live in the same Python process. Async is intentionally
       built around the sync ``LLMEngine`` (driven from asyncio) instead of

@@ -14,6 +14,7 @@
 
 import asyncio
 import os
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Optional, Union
@@ -108,7 +109,28 @@ class AsyncRequestRouter:
        lifecycle, same in-process weight sync — because the engine itself
        never moves out of the rollout-worker process.
 
-    TP=1 only — see `RolloutConfig.async_mode` docstring for why."""
+    TP>1 is supported via a lockstep step loop: rank 0 is the scheduling
+    master and per iteration broadcasts the list of request_ids to admit
+    over the vLLM TP NCCL group; slaves wait until those payloads arrive in
+    their local inbox (delivered by the driver's per-rank Ray fan-out), then
+    all ranks call `add_request` in the same order and `engine.step()` in
+    lockstep. Because every rank's scheduler sees the same `add_request`
+    sequence and the same `step()` cadence, the per-step batch composition
+    is identical across ranks, so the TP forward-pass collectives line up.
+    Outputs are replicated by vLLM's sampler (all-gather + same RNG seed),
+    so every rank's `engine.step()` yields identical finished tokens and
+    each rank locally resolves its own pending futures."""
+
+    # Max requests admitted into the engine per lockstep iteration. Bounding
+    # this caps the time slaves spend waiting for Ray IPC delivery in stage 3
+    # of `_step_loop_tp` — if rank 0 has 256 fresh requests but slaves have
+    # only received 64 so far, we admit 64 this iteration and the rest on
+    # subsequent iterations.
+    _TP_ADMIT_BATCH = 64
+    # Hard timeout for slaves waiting on payloads from Ray IPC. If exceeded,
+    # the slave's step loop raises and fails all pending futures rather than
+    # hanging on a NCCL barrier forever.
+    _TP_SLAVE_TIMEOUT_S = 60.0
 
     def __init__(self, llm_engine, sleep_quantum: float = 0.0):
         self.engine = llm_engine
@@ -121,6 +143,27 @@ class AsyncRequestRouter:
         self._packed_keys: dict[str, list[int]] = {}
         self._step_task: Optional[asyncio.Task] = None
         self._stopped = False
+
+        # TP>1 lockstep state: per-request payloads land in `_inbox` from
+        # `generate_one`, then `_step_loop_tp` calls `engine.add_request` for
+        # them in coordinated batches across ranks. For TP=1 the legacy path
+        # (`_step_loop_solo`) still adds requests directly in `generate_one`
+        # and `_inbox` stays unused.
+        self._inbox: dict[str, dict[str, Any]] = {}
+
+        # Detect TP topology from vLLM's parallel state (set up by
+        # external_launcher at LLM(...) init).
+        try:
+            import vllm.distributed.parallel_state as vllm_ps
+            self.tp_size = vllm_ps.get_tensor_model_parallel_world_size()
+            self.tp_rank = vllm_ps.get_tensor_model_parallel_rank()
+            _get_tp_group = getattr(vllm_ps, "get_tensor_model_parallel_group", None) \
+                or vllm_ps.get_tp_group
+            self.tp_group = _get_tp_group().device_group
+        except Exception:
+            self.tp_size = 1
+            self.tp_rank = 0
+            self.tp_group = None
 
     def start(self, loop: Optional[asyncio.AbstractEventLoop] = None) -> None:
         """Idempotently start the background step loop on the given event loop."""
@@ -137,24 +180,33 @@ class AsyncRequestRouter:
             self._step_task = None
 
     async def _step_loop(self) -> None:
+        if self.tp_size > 1:
+            await self._step_loop_tp()
+        else:
+            await self._step_loop_solo()
+
+    def _resolve_finished(self, outputs) -> None:
+        for out in outputs:
+            if not getattr(out, "finished", False):
+                continue
+            fut = self._pending.pop(out.request_id, None)
+            # Unlink the packed-MROPE override now that prefill + decode
+            # are both complete.
+            kept = self._packed_keys.pop(out.request_id, None)
+            if kept is not None:
+                try:
+                    packed_mrope_unlink_override(kept)
+                except Exception:
+                    pass
+            if fut is not None and not fut.done():
+                fut.set_result(out)
+
+    async def _step_loop_solo(self) -> None:
         try:
             while not self._stopped:
                 if self.engine.has_unfinished_requests():
                     outputs = self.engine.step()
-                    for out in outputs:
-                        if not getattr(out, "finished", False):
-                            continue
-                        fut = self._pending.pop(out.request_id, None)
-                        # Unlink the packed-MROPE override now that prefill +
-                        # decode are both complete.
-                        kept = self._packed_keys.pop(out.request_id, None)
-                        if kept is not None:
-                            try:
-                                packed_mrope_unlink_override(kept)
-                            except Exception:
-                                pass
-                        if fut is not None and not fut.done():
-                            fut.set_result(out)
+                    self._resolve_finished(outputs)
                 # Yield even when there is nothing to do so the event loop
                 # gets a chance to process Ray futures from env steps.
                 if self._sleep_quantum > 0:
@@ -162,7 +214,97 @@ class AsyncRequestRouter:
                 else:
                     await asyncio.sleep(0)
         except Exception as e:
-            # Fail any pending futures so coroutines don't hang forever.
+            for fut in self._pending.values():
+                if not fut.done():
+                    fut.set_exception(e)
+            self._pending.clear()
+            raise
+
+    async def _step_loop_tp(self) -> None:
+        """Lockstep step loop coordinating `engine.step()` across TP ranks.
+
+        Each iteration:
+        1. Rank 0 picks up to `_TP_ADMIT_BATCH` request_ids from its local
+           inbox.
+        2. Broadcast the rid list over the TP NCCL group so every rank
+           agrees on what to admit this iteration.
+        3. Slave ranks wait until their inbox contains those rids (the
+           driver fan-out delivers payloads to each rank's mailbox; arrival
+           timing across ranks is FIFO-per-rank but not synchronized).
+        4. All ranks call `engine.add_request` for the admitted rids in
+           identical order — so the scheduler's `waiting` queue is identical
+           across ranks.
+        5. All ranks call `engine.step()`. Scheduler is deterministic given
+           identical state, so the batch composition matches and TP
+           collectives line up.
+        6. Each rank locally resolves futures for its finished outputs
+           (outputs are bit-identical across ranks because vLLM's sampler is
+           TP-replicated with the same RNG seed)."""
+        import torch.distributed as dist
+        try:
+            while not self._stopped:
+                # Stage 1+2: rank 0 picks admit batch, broadcast to all
+                if self.tp_rank == 0:
+                    # Stable order so all ranks add_request in the same
+                    # sequence — `sorted` gives deterministic ordering of
+                    # request_ids, which are uuid-suffixed.
+                    candidates = sorted(self._inbox.keys())
+                    to_admit = candidates[: self._TP_ADMIT_BATCH]
+                else:
+                    to_admit = None
+                payload = [to_admit]
+                dist.broadcast_object_list(payload, src=0, group=self.tp_group)
+                to_admit = payload[0] or []
+
+                # Stage 3: slaves wait for payloads to land
+                if self.tp_rank != 0 and to_admit:
+                    deadline = time.time() + self._TP_SLAVE_TIMEOUT_S
+                    while not all(rid in self._inbox for rid in to_admit):
+                        if time.time() > deadline:
+                            missing = [rid for rid in to_admit if rid not in self._inbox]
+                            raise RuntimeError(
+                                f"TP rank {self.tp_rank} timed out after "
+                                f"{self._TP_SLAVE_TIMEOUT_S}s waiting for "
+                                f"{len(missing)} request payload(s) from Ray "
+                                f"IPC (missing: {missing[:3]}...)."
+                            )
+                        await asyncio.sleep(0.001)
+
+                # Stage 4: all ranks add_request in lockstep
+                for rid in to_admit:
+                    entry = self._inbox.pop(rid, None)
+                    if entry is None:
+                        # Defensive — should be impossible given stage 3
+                        continue
+                    try:
+                        self.engine.add_request(
+                            request_id=rid,
+                            prompt=entry["prompt"],
+                            params=entry["params"],
+                            lora_request=entry.get("lora_request"),
+                        )
+                    except Exception as e:
+                        fut = self._pending.pop(rid, None)
+                        kept = self._packed_keys.pop(rid, None)
+                        if kept is not None:
+                            try:
+                                packed_mrope_unlink_override(kept)
+                            except Exception:
+                                pass
+                        if fut is not None and not fut.done():
+                            fut.set_exception(e)
+
+                # Stage 5+6: lockstep step + local future resolution
+                if self.engine.has_unfinished_requests():
+                    outputs = self.engine.step()
+                    self._resolve_finished(outputs)
+                    await asyncio.sleep(0)
+                else:
+                    # No work — back off a bit so we're not hammering NCCL
+                    # broadcasts in a tight loop while waiting for new
+                    # trajectories to submit requests.
+                    await asyncio.sleep(0.005)
+        except Exception as e:
             for fut in self._pending.values():
                 if not fut.done():
                     fut.set_exception(e)
@@ -201,22 +343,31 @@ class AsyncRequestRouter:
 
         fut: asyncio.Future = loop.create_future()
         self._pending[request_id] = fut
-        try:
-            self.engine.add_request(
-                request_id=request_id,
-                prompt=prompt,
-                params=sampling_params,
-                lora_request=lora_request,
-            )
-        except Exception:
-            self._pending.pop(request_id, None)
-            kept = self._packed_keys.pop(request_id, None)
-            if kept is not None:
-                try:
-                    packed_mrope_unlink_override(kept)
-                except Exception:
-                    pass
-            raise
+        if self.tp_size > 1:
+            # TP>1: defer add_request to `_step_loop_tp` so all ranks add in
+            # lockstep. Just stage the payload here; the loop pops it.
+            self._inbox[request_id] = {
+                "prompt": prompt,
+                "params": sampling_params,
+                "lora_request": lora_request,
+            }
+        else:
+            try:
+                self.engine.add_request(
+                    request_id=request_id,
+                    prompt=prompt,
+                    params=sampling_params,
+                    lora_request=lora_request,
+                )
+            except Exception:
+                self._pending.pop(request_id, None)
+                kept = self._packed_keys.pop(request_id, None)
+                if kept is not None:
+                    try:
+                        packed_mrope_unlink_override(kept)
+                    except Exception:
+                        pass
+                raise
 
         request_output: RequestOutput = await fut
 
@@ -236,8 +387,17 @@ class AsyncRequestRouter:
         )
 
     async def wait_idle(self, poll_interval: float = 0.005) -> None:
-        """Block until the engine has no in-flight requests AND no pending futures."""
-        while self.engine.has_unfinished_requests() or self._pending:
+        """Block until the engine has no in-flight requests AND no pending futures.
+
+        For TP>1 also waits for the inbox to drain — a payload sitting in the
+        inbox hasn't been added to the engine yet but will be on the next
+        loop iteration, so leaving it un-drained would let the trainer start
+        FSDP weight sync while a request is still mid-flight."""
+        while (
+            self.engine.has_unfinished_requests()
+            or self._pending
+            or (self.tp_size > 1 and self._inbox)
+        ):
             await asyncio.sleep(poll_interval)
 
 
@@ -341,13 +501,6 @@ class vLLMRollout(BaseRollout):
         # to spin up an asyncio event loop until the multiturn driver actually
         # asks for it — keeps the sync codepath untouched.
         self._async_router: Optional[AsyncRequestRouter] = None
-        if getattr(config, "async_mode", False):
-            if config.tensor_parallel_size != 1:
-                raise ValueError(
-                    "rollout.async_mode=true currently requires tensor_parallel_size=1. "
-                    "TP>1 needs the per-rank async path to broadcast each request "
-                    "across the TP group, which is not yet implemented."
-                )
 
     def _get_async_router(self) -> AsyncRequestRouter:
         """Return (creating if needed) the asyncio driver for the in-process engine."""

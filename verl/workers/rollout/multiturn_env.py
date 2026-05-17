@@ -952,21 +952,36 @@ class MultiturnEnvRollout:
         if n_workers <= 0:
             raise RuntimeError("actor_rollout_ref_wg.workers is empty; cannot run async rollout.")
 
+        # Engine partitioning under TP>1: every TP-sized contiguous block of
+        # workers is one vLLM engine sharded across `tp_size` ranks. A request
+        # must be fanned out to all `tp_size` ranks of the chosen engine so
+        # the `AsyncRequestRouter._step_loop_tp` lockstep broadcast finds the
+        # payload on every rank's inbox; otherwise slaves time out in stage 3.
+        tp_size = max(1, int(getattr(config.worker.rollout, "tensor_parallel_size", 1)))
+        if n_workers % tp_size != 0:
+            raise RuntimeError(
+                f"n_workers={n_workers} is not a multiple of "
+                f"tensor_parallel_size={tp_size}; cannot partition into engines."
+            )
+        n_engines = n_workers // tp_size
+
         # Counters used as round-robin assignments and for logging.
-        _rank_counter = {"i": 0}
+        _engine_counter = {"i": 0}
         _running = {"n": 0}
         _completed = {"n": 0}
         _failed_steps = {"n": 0}
 
-        def _next_rank() -> int:
-            r = _rank_counter["i"] % n_workers
-            _rank_counter["i"] += 1
-            return r
+        def _next_engine_ranks() -> list[int]:
+            """Round-robin next engine, return its `tp_size` Ray worker ranks."""
+            e = _engine_counter["i"] % n_engines
+            _engine_counter["i"] += 1
+            base = e * tp_size
+            return list(range(base, base + tp_size))
 
         t_start = time.time()
 
         async def run_traj(t: Trajectory) -> Trajectory:
-            rank = _next_rank()
+            tp_ranks = _next_engine_ranks()
             _running["n"] += 1
             t.traj_start_ts = time.time()
             try:
@@ -1046,16 +1061,28 @@ class MultiturnEnvRollout:
                     t_gen_start = time.time()
                     prompt_ms = (t_gen_start - t_phase_start) * 1000.0
                     try:
-                        result = await actor_rollout_ref_wg.workers[rank].actor_rollout_ref_generate_one_async.remote(
-                            request_id=request_id,
-                            prompt_token_ids=raw_prompt_ids,
-                            multi_modal_data=mm_data,
-                            sampling_overrides=sampling_overrides,
-                            packed_mrope_override=packed_override,
-                            min_pixels=self.min_pixels,
-                            max_pixels=self.max_pixels,
-                            video_fps=getattr(config.data, "video_fps", 2.0),
-                        )
+                        # Fan out the request to every TP rank of the chosen
+                        # engine. The lockstep router in `vllm_rollout_spmd.py`
+                        # requires every rank's inbox to receive the payload
+                        # so all ranks can call add_request in lockstep. All
+                        # ranks compute identical outputs (sampler is
+                        # TP-replicated with same seed), so we use rank 0's
+                        # result and discard the rest.
+                        remote_calls = [
+                            actor_rollout_ref_wg.workers[r].actor_rollout_ref_generate_one_async.remote(
+                                request_id=request_id,
+                                prompt_token_ids=raw_prompt_ids,
+                                multi_modal_data=mm_data,
+                                sampling_overrides=sampling_overrides,
+                                packed_mrope_override=packed_override,
+                                min_pixels=self.min_pixels,
+                                max_pixels=self.max_pixels,
+                                video_fps=getattr(config.data, "video_fps", 2.0),
+                            )
+                            for r in tp_ranks
+                        ]
+                        results = await asyncio.gather(*remote_calls)
+                        result = results[0]
                     except Exception as e:
                         logger.warning(
                             f"  [async grp {t.group_id}/{t.n_idx}] generate_one_async failed: {e}. Terminating."
