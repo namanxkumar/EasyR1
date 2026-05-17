@@ -934,56 +934,39 @@ class MultiturnEnvRollout:
 
         Replaces the lockstep `_run_continuous_episode_loop` with a true
         per-trajectory model. As soon as a trajectory's env step returns, its
-        coroutine submits the next vLLM request — vLLM's continuous batching
-        handles GPU sharing across all in-flight requests. Stragglers no
-        longer idle the GPU; vLLM no longer idles all simulators.
+        coroutine submits the next vLLM request via
+        `wg.workers[rank].generate_one_async.remote(...)` — vLLM's continuous
+        batching handles GPU sharing across all in-flight requests. Stragglers
+        no longer idle the GPU; vLLM no longer idles all simulators.
 
-        Trajectory→engine routing is round-robin over engines, where an
-        engine spans `tensor_parallel_size` consecutive worker ranks. With
-        TP=1 each rank is its own engine (n_engines = n_workers); with TP>1
-        each engine spans `tp_size` ranks and the request is fanned out to
-        all of them so vLLM's intra-engine TP collectives stay in lockstep.
-
-        The fan-out is a single non-yielding list-comp of `.remote()` calls
-        followed by `asyncio.gather`. Ray's per-actor mailbox FIFO + the
-        sync prefix of `generate_one` (which calls `engine.add_request`
-        before yielding) guarantees every TP rank sees the requests in the
-        same order, so each rank's scheduler makes the same decisions.
+        Trajectory→DP-rank routing is round-robin; with TP=1 each DP rank has
+        its own engine, so independent trajectories landing on the same rank
+        share that rank's engine via vLLM batching.
 
         Drain barrier is implicit: this coroutine returns only after every
         scheduled trajectory has completed (and thus its `generate_one`
-        future has resolved on every TP rank), so the engine is naturally
-        idle by the time the trainer calls `release_rollout_engine`.
+        future has resolved), so the engine is naturally idle by the time
+        the trainer calls `release_rollout_engine`.
         """
         n_workers = len(actor_rollout_ref_wg.workers)
         if n_workers <= 0:
             raise RuntimeError("actor_rollout_ref_wg.workers is empty; cannot run async rollout.")
 
-        tp_size = max(1, int(getattr(config.worker.rollout, "tensor_parallel_size", 1)))
-        if n_workers % tp_size != 0:
-            raise RuntimeError(
-                f"n_workers={n_workers} is not divisible by tensor_parallel_size={tp_size}; "
-                "async rollout cannot partition workers into TP groups."
-            )
-        n_engines = n_workers // tp_size
-
         # Counters used as round-robin assignments and for logging.
-        _engine_counter = {"i": 0}
+        _rank_counter = {"i": 0}
         _running = {"n": 0}
         _completed = {"n": 0}
         _failed_steps = {"n": 0}
 
-        def _next_engine_ranks() -> list[int]:
-            """Round-robin pick the next engine; return its constituent TP ranks."""
-            e = _engine_counter["i"] % n_engines
-            _engine_counter["i"] += 1
-            base = e * tp_size
-            return list(range(base, base + tp_size))
+        def _next_rank() -> int:
+            r = _rank_counter["i"] % n_workers
+            _rank_counter["i"] += 1
+            return r
 
         t_start = time.time()
 
         async def run_traj(t: Trajectory) -> Trajectory:
-            tp_ranks = _next_engine_ranks()
+            rank = _next_rank()
             _running["n"] += 1
             t.traj_start_ts = time.time()
             try:
@@ -1063,29 +1046,16 @@ class MultiturnEnvRollout:
                     t_gen_start = time.time()
                     prompt_ms = (t_gen_start - t_phase_start) * 1000.0
                     try:
-                        # Fan out to every TP rank of the chosen engine in a
-                        # single non-yielding list-comp so all ranks receive
-                        # the request in the same order (mailbox FIFO + sync
-                        # prefix in `generate_one` keeps add_request lockstep).
-                        # For TP=1 this collapses to a single .remote() call.
-                        remote_calls = [
-                            actor_rollout_ref_wg.workers[r].actor_rollout_ref_generate_one_async.remote(
-                                request_id=request_id,
-                                prompt_token_ids=raw_prompt_ids,
-                                multi_modal_data=mm_data,
-                                sampling_overrides=sampling_overrides,
-                                packed_mrope_override=packed_override,
-                                min_pixels=self.min_pixels,
-                                max_pixels=self.max_pixels,
-                                video_fps=getattr(config.data, "video_fps", 2.0),
-                            )
-                            for r in tp_ranks
-                        ]
-                        # All ranks produce identical outputs; consume rank 0's
-                        # but still await every rank so the coroutines drain
-                        # cleanly (and any rank-local exception propagates).
-                        results = await asyncio.gather(*remote_calls)
-                        result = results[0]
+                        result = await actor_rollout_ref_wg.workers[rank].actor_rollout_ref_generate_one_async.remote(
+                            request_id=request_id,
+                            prompt_token_ids=raw_prompt_ids,
+                            multi_modal_data=mm_data,
+                            sampling_overrides=sampling_overrides,
+                            packed_mrope_override=packed_override,
+                            min_pixels=self.min_pixels,
+                            max_pixels=self.max_pixels,
+                            video_fps=getattr(config.data, "video_fps", 2.0),
+                        )
                     except Exception as e:
                         logger.warning(
                             f"  [async grp {t.group_id}/{t.n_idx}] generate_one_async failed: {e}. Terminating."

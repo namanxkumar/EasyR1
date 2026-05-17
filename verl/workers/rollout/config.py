@@ -251,18 +251,14 @@ class RolloutConfig:
     soon as the env step returns. The drain barrier (``wait_idle``) fires
     once per PPO step before FSDP↔vLLM weight sync.
 
-    Works with any ``tensor_parallel_size``. With TP>1, the driver fans
-    each request out to every TP rank of an engine
-    (n_engines = n_workers // tp_size, round-robin across engines) using
-    a single non-yielding list-comp of ``.remote()`` calls — Ray's
-    per-actor mailbox FIFO + the sync prefix of ``generate_one`` running
-    to completion before yielding guarantees every rank sees ``add_request``
-    in the same order, so vLLM's intra-engine TP collectives stay aligned.
-
-    The direct-memory weight sync at ``fsdp_vllm.py`` keeps working: async
-    is intentionally built around the sync ``LLMEngine`` (driven from
-    asyncio) instead of ``AsyncLLM`` (which forks the engine into a separate
-    process and breaks the in-process weight sync)."""
+    Constraints:
+    - TP=1 only. With TP>1, every TP rank must call ``engine.step()`` in
+      lockstep with the same in-flight requests; the per-rank async path
+      doesn't yet broadcast new requests across the TP group.
+    - Existing direct-memory weight sync at ``fsdp_vllm.py`` requires the
+      engine to live in the same Python process. Async is intentionally
+      built around the sync ``LLMEngine`` (driven from asyncio) instead of
+      ``AsyncLLM`` (which forks the engine and breaks the weight sync)."""
     # below are auto keys
     prompt_length: int = field(default=-1, init=False)
     response_length: int = field(default=-1, init=False)
