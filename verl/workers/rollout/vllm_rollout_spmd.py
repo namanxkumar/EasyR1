@@ -143,6 +143,12 @@ class AsyncRequestRouter:
         self._packed_keys: dict[str, list[int]] = {}
         self._step_task: Optional[asyncio.Task] = None
         self._stopped = False
+        # TP>1 only: set from `wait_idle` to coordinate loop shutdown via
+        # the admit-list broadcast channel. Slaves would otherwise keep
+        # calling `dist.broadcast_object_list` on the TP NCCL group while
+        # rank 0's event loop is blocked by the FSDP actor update (GIL
+        # held), and the NCCL watchdog kills the job at 600s.
+        self._stop_loop_requested = False
 
         # TP>1 lockstep state: per-request payloads land in `_inbox` from
         # `generate_one`, then `_step_loop_tp` calls `engine.add_request` for
@@ -171,6 +177,7 @@ class AsyncRequestRouter:
             return
         loop = loop or asyncio.get_event_loop()
         self._stopped = False
+        self._stop_loop_requested = False
         self._step_task = loop.create_task(self._step_loop())
 
     async def stop(self) -> None:
@@ -241,20 +248,33 @@ class AsyncRequestRouter:
            (outputs are bit-identical across ranks because vLLM's sampler is
            TP-replicated with the same RNG seed)."""
         import torch.distributed as dist
+        _STOP_SENTINEL = "__TP_STOP__"
         try:
             while not self._stopped:
-                # Stage 1+2: rank 0 picks admit batch, broadcast to all
+                # Stage 1+2: rank 0 picks admit batch (or sentinel),
+                # broadcast to all. The sentinel piggybacks on the
+                # admit-list channel so shutdown traverses the same
+                # collective slaves are already blocked on.
                 if self.tp_rank == 0:
-                    # Stable order so all ranks add_request in the same
-                    # sequence — `sorted` gives deterministic ordering of
-                    # request_ids, which are uuid-suffixed.
-                    candidates = sorted(self._inbox.keys())
-                    to_admit = candidates[: self._TP_ADMIT_BATCH]
+                    if self._stop_loop_requested:
+                        to_admit = _STOP_SENTINEL
+                    else:
+                        # Stable order so all ranks add_request in the same
+                        # sequence — `sorted` gives deterministic ordering
+                        # of request_ids, which are uuid-suffixed.
+                        candidates = sorted(self._inbox.keys())
+                        to_admit = candidates[: self._TP_ADMIT_BATCH]
                 else:
                     to_admit = None
                 payload = [to_admit]
                 dist.broadcast_object_list(payload, src=0, group=self.tp_group)
-                to_admit = payload[0] or []
+                received = payload[0]
+                if received == _STOP_SENTINEL:
+                    # Coordinated shutdown across all TP ranks; the next
+                    # `generate_one` will restart a fresh step loop.
+                    self._stopped = True
+                    return
+                to_admit = received or []
 
                 # Stage 3: slaves wait for payloads to land
                 if self.tp_rank != 0 and to_admit:
@@ -392,13 +412,28 @@ class AsyncRequestRouter:
         For TP>1 also waits for the inbox to drain — a payload sitting in the
         inbox hasn't been added to the engine yet but will be on the next
         loop iteration, so leaving it un-drained would let the trainer start
-        FSDP weight sync while a request is still mid-flight."""
+        FSDP weight sync while a request is still mid-flight.
+
+        TP>1: stop the step loop after the drain. Otherwise slaves keep
+        calling `dist.broadcast_object_list` on the TP NCCL group while
+        the FSDP actor update holds the GIL on rank 0, the broadcasts
+        diverge in time across ranks, and the NCCL watchdog kills the job
+        at the 600s collective timeout. The next `generate_one` after the
+        next rollout begins will restart the loop fresh."""
         while (
             self.engine.has_unfinished_requests()
             or self._pending
             or (self.tp_size > 1 and self._inbox)
         ):
             await asyncio.sleep(poll_interval)
+        if (
+            self.tp_size > 1
+            and self._step_task is not None
+            and not self._step_task.done()
+        ):
+            self._stop_loop_requested = True
+            await self._step_task
+            self._step_task = None
 
 
 class vLLMRollout(BaseRollout):
