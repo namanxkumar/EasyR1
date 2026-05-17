@@ -86,10 +86,31 @@ When `worker.multiturn_env.enabled=true`, standard dataset-based rollout is repl
 
 Key `MultiturnEnvConfig` fields:
 - `num_simulators` — total AI2Thor slots (should be >= `rollout_batch_size * n`)
+- `pools_per_gpu` — number of `SimulatorPool` Ray actors per GPU. **Must be 1** — `_create_simulator_pools` hard-fails on `>1`. See "pools_per_gpu cliff" below.
 - `max_depth` — max steps per trajectory
 - `data_root` — path to Poliformer dataset
 - `system_prompt_path` — path to the system prompt `.txt` file
 - `difficulties` / `max_per_difficulty` — filter episodes by `rooms_seen` difficulty
+
+#### pools_per_gpu cliff (hard-failed at >1)
+
+`pools_per_gpu` is a Ray-actor **concurrency** knob, not a slot-count knob. `_create_simulator_pools` builds `pools_per_gpu * n_gpus` total `SimulatorPool` actors and splits `num_simulators` evenly across them. Each pool is one Ray actor with default `max_concurrency=1`, so step calls within a pool serialize.
+
+- `pools_per_gpu=1` → 1 actor per GPU → AI2Thor `step` calls on that GPU run **one at a time** (controllers render serially).
+- `pools_per_gpu>1` → multiple actors per GPU → up to `pools_per_gpu` Unity controllers render **simultaneously** on a GPU that is also hosting vLLM under the HybridEngine.
+
+Concurrent Unity rendering on a vLLM-colocated GPU silently corrupts trajectories: AI2Thor controllers sharing one GPU clobber each other's offscreen framebuffers, returning stale / partially-rendered frames to the model. The model then navigates from a degraded observation, wanders, and either hits `max_depth` or the per-action watchdog fires (`step_env` raises, episode terminated with `reward=0`).
+
+Measured cliff on SFT-1500, `val_only`, 128 episodes (d=0), same slots/GPU (16):
+
+| pools/GPU | success | avg_steps |
+|-----------|---------|-----------|
+| 1 (serial) | 43.8% | 5.84 |
+| 4 (concurrent) | 14.8% | 6.77 |
+
+`avg_steps` going **up** under concurrency (not down) rules out "pure timeout failures" — episodes complete but complete wrong. Per-step wall time was actually ~2× faster on the 4-pool run for trajectories that did finish, so the cliff is observation quality, not throughput.
+
+Scale slot count via `num_simulators` only (more slots under one actor; serialized wall time). To prevent silent regressions, `_create_simulator_pools` raises `ValueError` on `pools_per_gpu > 1`.
 
 ### Reward Functions (`examples/reward_function/`)
 
