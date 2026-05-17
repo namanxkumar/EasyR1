@@ -58,8 +58,15 @@ class SimulatorPool:
         past_k_steps: "int | None" = None,
         reward_mode: str = "continuous",
     ):
-        # Force AI2Thor to use the specified GPU (set before any CUDA init)
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        # Force AI2Thor to use the specified GPU (set before any CUDA init).
+        # On Linux64 (H100 / AI2THOR_USE_LINUX64=1) leave CUDA_VISIBLE_DEVICES
+        # empty so ai2thor skips its vulkaninfo precondition — vulkan is gated
+        # on H100 datacenter SKUs. Rendering is routed via x_display instead.
+        self._use_linux64 = os.environ.get("AI2THOR_USE_LINUX64", "0") == "1"
+        if self._use_linux64:
+            os.environ["CUDA_VISIBLE_DEVICES"] = ""
+        else:
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
         self.gpu_id = gpu_id
         self.num_slots = num_slots
@@ -190,30 +197,83 @@ class SimulatorPool:
         # Re-enable every slot; release_env will shrink under live pressure.
         self._slot_enabled = [True] * self.num_slots
         self._log_gpu_memory(f"before warmup ({self.num_slots} slots)")
-        created = 0
-        for i in range(self.num_slots):
-            if self._cached_controllers[i] is not None:
-                created += 1
-                continue
-            try:
-                config = AI2ThorControllerConfiguration(
-                    scene_metadata=dummy_scene_metadata,
-                    gpu_id=0,  # 0 = first (only) visible GPU after CUDA_VISIBLE_DEVICES
-                    render_width=self.render_width,
-                    render_height=self.render_height,
+
+        # Linux64: one Xorg per Unity instance is required (probes 121479/121481
+        # showed multi-Unity-on-one-display produces identical framebuffers).
+        # The sbatch wrapper spawns N Xorgs and exports a comma-separated list
+        # per physical GPU via AI2THOR_DISPLAYS_FOR_GPU_<phys_id>.
+        displays: list[Optional[str]] = [None] * self.num_slots
+        if self._use_linux64:
+            env_key = f"AI2THOR_DISPLAYS_FOR_GPU_{self.gpu_id}"
+            raw = os.environ.get(env_key, "")
+            disp_list = [d.strip() for d in raw.split(",") if d.strip()]
+            if len(disp_list) < self.num_slots:
+                logger.warning(
+                    f"[GPU {self.gpu_id}] {env_key} has {len(disp_list)} displays "
+                    f"but pool has {self.num_slots} slots; extra slots will share "
+                    f"the last display and may produce corrupted frames."
                 )
-                controller = AI2ThorController(configuration=config)
-                self._cached_controllers[i] = controller
-                created += 1
-                logger.info(
-                    f"Warmed up controller {created}/{self.num_slots} "
-                    f"on gpu {self.gpu_id}"
-                )
-            except Exception as e:
-                logger.error(
-                    f"Failed to warm up controller for slot {i} on gpu "
-                    f"{self.gpu_id}: {e}"
-                )
+            for i in range(self.num_slots):
+                if disp_list:
+                    displays[i] = disp_list[min(i, len(disp_list) - 1)]
+
+        # Parallelize per-slot Unity spawns within this pool. Each slot binds to
+        # a distinct x_display (Linux64), so renderer-level contention is bounded
+        # to per-display Xorg load. AI2ThorController's signal patch mutates
+        # process globals (signal.signal / signal.alarm) — install it once at
+        # the outer scope so the worker threads don't race; per-call patches
+        # inside _create_ai2thor_controller become no-ops via refcount.
+        from concurrent.futures import ThreadPoolExecutor
+        from interactive_reasoning.objectnavtask.environment.ai2thor_controller import (
+            safe_signal_patch,
+        )
+
+        slots_to_create = [
+            i for i in range(self.num_slots) if self._cached_controllers[i] is None
+        ]
+        created = self.num_slots - len(slots_to_create)
+
+        def _create_one(i: int):
+            config = AI2ThorControllerConfiguration(
+                scene_metadata=dummy_scene_metadata,
+                gpu_id=0,  # 0 = first (only) visible GPU after CUDA_VISIBLE_DEVICES
+                render_width=self.render_width,
+                render_height=self.render_height,
+                x_display=displays[i],
+            )
+            return i, AI2ThorController(configuration=config)
+
+        if slots_to_create:
+            # Cap per-pool concurrency. With one pool per GPU, all pools warm
+            # up simultaneously, so per-pool W workers => node-wide ≈ 8·W
+            # concurrent Unity launches. At 256 sims (32 slots/pool) the
+            # unbounded path tried 256 concurrent Unity boots and each create
+            # timed out at 300s (job 121584). 8/pool keeps node peak ~64,
+            # matching the regime that worked for 128-sim runs (121576 OK in
+            # 2:48). Override via SIMULATOR_POOL_WARMUP_WORKERS.
+            warmup_workers = int(
+                os.environ.get("SIMULATOR_POOL_WARMUP_WORKERS", "8")
+            )
+            with safe_signal_patch(), ThreadPoolExecutor(
+                max_workers=min(warmup_workers, len(slots_to_create)),
+                thread_name_prefix=f"warmup-gpu{self.gpu_id}",
+            ) as ex:
+                futures = {ex.submit(_create_one, i): i for i in slots_to_create}
+                for fut in futures:
+                    slot_idx = futures[fut]
+                    try:
+                        i, controller = fut.result()
+                        self._cached_controllers[i] = controller
+                        created += 1
+                        logger.info(
+                            f"Warmed up controller {created}/{self.num_slots} "
+                            f"on gpu {self.gpu_id}"
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"Failed to warm up controller for slot {slot_idx} "
+                            f"on gpu {self.gpu_id}: {e}"
+                        )
         self._log_gpu_memory(f"after warmup ({created}/{self.num_slots} created)")
         return created
 
@@ -355,6 +415,14 @@ class SimulatorPool:
                 past_k_steps=self.past_k_steps,
                 reward_mode=self.reward_mode,
             )
+
+            # Stash the dataset item on the adapter so guided rollouts can
+            # synthesize the pope-dagger expert trajectory without re-fetching.
+            try:
+                adapter.dataset_item = item_data
+                adapter.expert_trajectory_cache = None
+            except Exception:
+                pass
 
             self.slots[slot_id] = adapter
             return slot_id
@@ -526,6 +594,61 @@ class SimulatorPool:
         if adapter is None:
             return "{}"
         return adapter.get_ground_truth()
+
+    # ── pope-dagger guided rollout hook ──────────────────────────────
+    def compute_expert_action(self, slot_id: int) -> str:
+        """Return the next pope-dagger oracle action for this slot.
+
+        Bridges ``GuidedMultiturnEnvRollout`` into pope-dagger's navmesh
+        expert. ``compute_expert_actions_via_sparsify`` synthesizes the full
+        expert SparseTrajectory (depends only on the dataset item / navmesh,
+        not on the student's history) so we compute it once per episode and
+        cache it on the adapter. Each call returns the action at index
+        ``adapter.num_steps + 1`` (steps[0] is the no-op ``initial`` step).
+        """
+        adapter = self.slots[slot_id]
+        if adapter is None:
+            raise ValueError(f"Slot {slot_id} is empty")
+        try:
+            from pope_dagger.expert_replay import compute_expert_actions_via_sparsify
+        except Exception as e:
+            logger.warning(f"pope_dagger import failed: {e!r}")
+            return "<explore>direction:0</explore>"
+
+        env = getattr(adapter, "env", None)
+        dataset_item = getattr(adapter, "dataset_item", None) or getattr(adapter, "item_data", None)
+        if env is None or dataset_item is None:
+            logger.warning(
+                f"Slot {slot_id}: missing env or dataset_item on adapter "
+                f"(env={env is not None}, item={dataset_item is not None})"
+            )
+            return "<explore>direction:0</explore>"
+
+        cache = getattr(adapter, "expert_trajectory_cache", None)
+        if cache is None:
+            try:
+                cache = compute_expert_actions_via_sparsify(env=env, dataset_item=dataset_item)
+            except Exception as e:
+                logger.warning(f"compute_expert_actions_via_sparsify failed: {e!r}")
+                return "<explore>direction:0</explore>"
+            try:
+                adapter.expert_trajectory_cache = cache
+            except Exception:
+                pass
+
+        # SparseTrajectory.steps[0] is the no-op "initial" step; steps[1:]
+        # are real expert actions. The next student action would be at index
+        # adapter.num_steps + 1 (num_steps counts executed actions so far).
+        idx = int(getattr(adapter, "num_steps", 0) or 0) + 1
+        steps = getattr(cache, "steps", None) or []
+        if idx >= len(steps):
+            return "<explore>direction:0</explore>"
+
+        action = steps[idx].action
+        formatted = getattr(action, "formatted", None)
+        if formatted:
+            return formatted
+        return "<explore>direction:0</explore>"
 
     # ── recovery ──────────────────────────────────────────────────────
 

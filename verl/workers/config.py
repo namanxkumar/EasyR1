@@ -20,13 +20,14 @@ from dataclasses import dataclass, field
 from .actor import ActorConfig, FSDPConfig, LoraConfig, ModelConfig, OptimConfig, RefConfig
 from .critic import CriticConfig
 from .reward import RewardConfig
-from .rollout import MultiturnEnvConfig, RolloutConfig
+from .rollout import GuidedRolloutConfig, MultiturnEnvConfig, RolloutConfig
 
 
 __all__ = [
     "ActorConfig",
     "CriticConfig",
     "FSDPConfig",
+    "GuidedRolloutConfig",
     "LoraConfig",
     "ModelConfig",
     "OptimConfig",
@@ -47,6 +48,7 @@ class WorkerConfig:
     reward: RewardConfig = field(default_factory=RewardConfig)
     rollout: RolloutConfig = field(default_factory=RolloutConfig)
     multiturn_env: MultiturnEnvConfig = field(default_factory=MultiturnEnvConfig)
+    guided_rollout: GuidedRolloutConfig = field(default_factory=GuidedRolloutConfig)
 
     def post_init(self):
         self.ref.micro_batch_size_per_device_for_experience = self.actor.micro_batch_size_per_device_for_experience
@@ -54,3 +56,4 @@ class WorkerConfig:
         self.ref.dynamic_batching = self.actor.dynamic_batching
         self.ref.ulysses_size = self.actor.ulysses_size
         self.ref.use_torch_compile = self.actor.use_torch_compile
+

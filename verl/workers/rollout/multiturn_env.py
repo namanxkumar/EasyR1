@@ -196,8 +196,36 @@ class Trajectory:
     # 1:1 with step_responses; outer list index is step.
     step_response_token_ids: list[list[int]] = field(default_factory=list)
     step_response_log_probs: list[list[float]] = field(default_factory=list)
+    # Per-step flag set when a step's response was injected by the teacher VLM
+    # (Pope-Dagger guided rollout) rather than sampled by the student. Aligned
+    # 1:1 with step_responses. The downstream loss masks these tokens out.
+    step_teacher_forced: list[bool] = field(default_factory=list)
+    # Per-step pre-action geodesic distance to the target (from the slot's
+    # state_before). Aligned 1:1 with step_responses. Used by the V5
+    # random_regression branch selector in GuidedMultiturnEnvRollout to
+    # compute the trajectory's progress envelope.
+    step_distances: list[float | None] = field(default_factory=list)
     terminated: bool = False
     num_steps: int = 0
+
+    # ── Pope-Dagger V4 guidance metadata (default values keep on-policy parity)
+    # 0 = baseline / on-policy rollout (incl. padding rollouts). k ≥ 1 = the
+    # k-th V4 iteration in the same prompt's group.
+    dagger_iter_index: int = 0
+    # Within a prompt group, multiple independent V4/V5 chains may be emitted
+    # (baseline + iters → baseline₂ + iters₂ → …) until the group fills to
+    # n_per_prompt. ``chain_id`` indexes which chain the trajectory belongs to.
+    # Cross-chain pairs (chain_id_i != chain_id_j) are treated as LCP=0 by the
+    # branching advantage estimator (fully divergent from step 0).
+    chain_id: int = 0
+    # Branch-step chain inherited from V4 ancestry: [B_1, B_2, …, B_k]. Adjacent
+    # iters in the same group differ only in the last entry; LCP between iters
+    # a and b is the prefix shared up to branch_chain[min(a,b)].
+    branch_chain: list[int] = field(default_factory=list)
+    # Single-shot response override consumed by the rollout loop in lieu of
+    # calling vLLM. Set by GuidedMultiturnEnvRollout for forced steps; cleared
+    # after the step is recorded. Tuple = (text, token_ids, is_teacher_forced).
+    pending_response_override: "tuple[str, list[int], bool] | None" = None
 
     # Reward collected immediately upon termination (before slot release)
     reward: float | None = None
@@ -350,6 +378,15 @@ class MultiturnEnvRollout:
 
         t_start = time.time()
 
+        # Sync-mode phase accumulators (async path has its own instrumentation).
+        # _run_continuous_episode_loop adds to these per turn so we can split
+        # rollout wall-time into gen vs env vs prompt-build.
+        self._sync_gen_seconds = 0.0
+        self._sync_env_seconds = 0.0
+        self._sync_prompt_build_seconds = 0.0
+        self._sync_step_total_seconds = 0.0
+        self._sync_n_turns = 0
+
         # Pre-collect all dataset items (ensures deterministic ordering)
         all_items = []
         for _ in range(batch_size):
@@ -419,6 +456,23 @@ class MultiturnEnvRollout:
                 all_trajectories, total_wall_s=time.time() - t_start
             )
             metrics.update(phase_metrics)
+        else:
+            # Sync-path phase breakdown. Each value is the summed wall-clock
+            # across all turns (turns run sequentially so this also equals the
+            # in-loop wall-time spent in that phase). "other" captures
+            # bookkeeping not attributed to any tracked phase.
+            total_turns_wall = self._sync_step_total_seconds
+            tracked = (
+                self._sync_gen_seconds
+                + self._sync_env_seconds
+                + self._sync_prompt_build_seconds
+            )
+            metrics["rollout/sync_gen_seconds"] = self._sync_gen_seconds
+            metrics["rollout/sync_env_step_seconds"] = self._sync_env_seconds
+            metrics["rollout/sync_prompt_build_seconds"] = self._sync_prompt_build_seconds
+            metrics["rollout/sync_turns_wall_seconds"] = total_turns_wall
+            metrics["rollout/sync_other_seconds"] = max(0.0, total_turns_wall - tracked)
+            metrics["rollout/sync_n_turns"] = self._sync_n_turns
         logger.info(
             f"Rollout complete: {len(all_trajectories)} trajectories in "
             f"{time.time() - t_start:.1f}s | "
@@ -436,6 +490,27 @@ class MultiturnEnvRollout:
         batch = self._build_final_batch(
             all_trajectories, all_rewards, all_ground_truths, n_trajectories
         )
+
+        # ── Optional: snapshot first-K trajectories for val visualization ──
+        # Caller (_validate_multiturn) signals via metrics["_dump_first_k"].
+        dump_k = int(metrics.pop("_dump_first_k", 0) or 0)
+        if dump_k > 0:
+            snapshots = []
+            for t in all_trajectories[:dump_k]:
+                snapshots.append({
+                    "episode_id": t.episode_id,
+                    "group_id": t.group_id,
+                    "n_idx": t.n_idx,
+                    "num_steps": t.num_steps,
+                    "reward": t.reward,
+                    "ground_truth": t.ground_truth,
+                    "step_responses": list(t.step_responses),
+                    "last_images": list(t.last_images),
+                    "last_prompt": t.last_prompt,
+                })
+            self._last_val_dump = snapshots
+        else:
+            self._last_val_dump = None
 
         # ── Eagerly free trajectory image caches ──
         for t in all_trajectories:
@@ -479,6 +554,14 @@ class MultiturnEnvRollout:
         global_step = 0
 
         while True:
+            # Optional subclass hook fired at the top of every iteration.
+            # Used by ``GuidedMultiturnEnvRollout`` to populate per-trajectory
+            # ``pending_response_override`` values before the prompt-build
+            # phase reads them. No-op by default.
+            pre_step_hook = getattr(self, "_pre_step_hook", None)
+            if pre_step_hook is not None:
+                pre_step_hook(active)
+
             # Force-terminate trajectories that hit max_depth
             for t in active:
                 if not t.terminated and t.num_steps >= self.max_depth:
@@ -505,6 +588,7 @@ class MultiturnEnvRollout:
             # When past_k_steps is set we also need the unfiltered
             # full-trajectory messages on the driver to compute packed MROPE
             # positions. Use build_prompt_with_full in that case.
+            t_pb = time.time()
             use_full = self.past_k_steps is not None
             if use_full:
                 prompt_futures = [
@@ -515,6 +599,7 @@ class MultiturnEnvRollout:
                     t.pool.build_prompt.remote(t.slot_id) for t in active
                 ]
             prompt_results_raw = ray.get(prompt_futures)
+            self._sync_prompt_build_seconds += time.time() - t_pb
 
             # Filter out trajectories whose prompt build failed
             valid = []          # (local_idx, trajectory)
@@ -564,6 +649,19 @@ class MultiturnEnvRollout:
                     t.last_prompt = prompts[local_i]
                     t.last_images = list(images_list[local_i])
 
+            # ── Partition into vLLM and override branches ────────────────
+            # Trajectories with a pending response override (set by the
+            # guided rollout driver for forced/replay steps) skip vLLM and
+            # reuse the provided text + token IDs. Order in `valid` is
+            # preserved so downstream indexing into prompts/images_list
+            # still matches per-trajectory state.
+            override_idx_set = {
+                local_i for local_i, t in valid
+                if t.pending_response_override is not None
+            }
+            vllm_valid = [(li, t) for li, t in valid if li not in override_idx_set]
+            override_valid = [(li, t) for li, t in valid if li in override_idx_set]
+
             if logger.isEnabledFor(logging.DEBUG):
                 for local_i, t in valid:
                     msgs = prompts[local_i]
@@ -592,79 +690,117 @@ class MultiturnEnvRollout:
                             lines.append(f'  [{role}] Text: "{content}"')
                     logger.debug("\n".join(lines))
 
-            # ── Tokenize into DataProto format ──
+            # ── Tokenize into DataProto format (vLLM subset only) ──
             t_gen = time.time()
-            tokenized = self._tokenize_prompts(
-                prompts,
-                images_list,
-                for_generation=True,
-                full_prompts=full_prompts if use_full else None,
-                full_images_list=full_images_list if use_full else None,
-            )
-            meta_info = {
-                "eos_token_id": self.tokenizer.eos_token_id,
-                "min_pixels": self.min_pixels,
-                "max_pixels": self.max_pixels,
-                "video_fps": getattr(config.data, "video_fps", 2.0),
-                "n": 1,
-                "temperature": config.worker.rollout.temperature,
-                "top_p": config.worker.rollout.top_p,
-            }
-            if override_config:
-                meta_info.update(override_config)
-                meta_info["n"] = 1  # always 1 per-step for multiturn
-            gen_batch = DataProto.from_single_dict(
-                tokenized, meta_info=meta_info
-            )
-
-            # ── Generate model responses via vLLM ──
-            if logger.isEnabledFor(logging.DEBUG):
-                prompt_lens = [len(ids) for ids in tokenized["raw_prompt_ids"]]
-                logger.debug(
-                    f"  [step {global_step}] TOKENIZED: "
-                    f"n_prompts={len(prompt_lens)}, "
-                    f"token_counts={prompt_lens}, "
-                    f"input_ids_shape={tokenized['input_ids'].shape}"
+            rollout_log_probs = None
+            response_ids = None
+            response_mask = None
+            if vllm_valid:
+                vllm_local_idxs = [li for li, _ in vllm_valid]
+                vllm_prompts = [prompts[li] for li in vllm_local_idxs]
+                vllm_images = [images_list[li] for li in vllm_local_idxs]
+                vllm_full_prompts = (
+                    [full_prompts[li] for li in vllm_local_idxs] if use_full else None
+                )
+                vllm_full_images = (
+                    [full_images_list[li] for li in vllm_local_idxs] if use_full else None
+                )
+                tokenized = self._tokenize_prompts(
+                    vllm_prompts,
+                    vllm_images,
+                    for_generation=True,
+                    full_prompts=vllm_full_prompts,
+                    full_images_list=vllm_full_images,
+                )
+                meta_info = {
+                    "eos_token_id": self.tokenizer.eos_token_id,
+                    "min_pixels": self.min_pixels,
+                    "max_pixels": self.max_pixels,
+                    "video_fps": getattr(config.data, "video_fps", 2.0),
+                    "n": 1,
+                    "temperature": config.worker.rollout.temperature,
+                    "top_p": config.worker.rollout.top_p,
+                }
+                if override_config:
+                    meta_info.update(override_config)
+                    meta_info["n"] = 1  # always 1 per-step for multiturn
+                gen_batch = DataProto.from_single_dict(
+                    tokenized, meta_info=meta_info
                 )
 
-            gen_batch, pad_size = pad_dataproto_to_divisor(
-                gen_batch, actor_rollout_ref_wg.world_size
-            )
-            gen_output = actor_rollout_ref_wg.generate_sequences(gen_batch)
-            gen_output = unpad_dataproto(gen_output, pad_size)
+                # ── Generate model responses via vLLM ──
+                if logger.isEnabledFor(logging.DEBUG):
+                    prompt_lens = [len(ids) for ids in tokenized["raw_prompt_ids"]]
+                    logger.debug(
+                        f"  [step {global_step}] TOKENIZED: "
+                        f"n_prompts={len(prompt_lens)}, "
+                        f"token_counts={prompt_lens}, "
+                        f"input_ids_shape={tokenized['input_ids'].shape}"
+                    )
+
+                gen_batch, pad_size = pad_dataproto_to_divisor(
+                    gen_batch, actor_rollout_ref_wg.world_size
+                )
+                gen_output = actor_rollout_ref_wg.generate_sequences(gen_batch)
+                gen_output = unpad_dataproto(gen_output, pad_size)
+                response_ids = gen_output.batch["responses"]
+                response_mask = gen_output.batch["response_mask"]
+                rollout_log_probs = gen_output.batch.get("rollout_log_probs")
             t_gen_elapsed = time.time() - t_gen
 
-            # Decode responses
-            response_ids = gen_output.batch["responses"]
-            response_mask = gen_output.batch["response_mask"]
-            rollout_log_probs = gen_output.batch.get("rollout_log_probs")
-            responses = []
-            response_token_ids_list: list[list[int]] = []
-            response_log_probs_list: list[list[float]] = []
-            for i in range(len(valid)):
-                length = int(response_mask[i].sum().item())
+            # Build unified per-`valid` response arrays, drawing from vLLM
+            # output or pending_response_override as appropriate.
+            responses: list[str] = [""] * len(valid)
+            response_token_ids_list: list[list[int]] = [[] for _ in valid]
+            response_log_probs_list: list[list[float]] = [[] for _ in valid]
+            teacher_forced_list: list[bool] = [False] * len(valid)
+
+            # vLLM branch
+            for vllm_i, (local_i, _t) in enumerate(vllm_valid):
+                # `local_i` is the index into `valid` (== `prompts`/`images_list`).
+                length = int(response_mask[vllm_i].sum().item())
                 text = self.tokenizer.decode(
-                    response_ids[i][:length], skip_special_tokens=True
+                    response_ids[vllm_i][:length], skip_special_tokens=True
                 )
-                responses.append(text)
-                response_token_ids_list.append(response_ids[i][:length].tolist())
+                # Locate this trajectory's slot in `valid` for indexing.
+                # `valid` is iterated in the same order as `local_i` insertions,
+                # so we can match by local_i directly.
+                valid_pos = next(
+                    j for j, (li, _) in enumerate(valid) if li == local_i
+                )
+                responses[valid_pos] = text
+                response_token_ids_list[valid_pos] = response_ids[vllm_i][:length].tolist()
                 if rollout_log_probs is not None:
-                    response_log_probs_list.append(
-                        rollout_log_probs[i][:length].cpu().tolist()
+                    response_log_probs_list[valid_pos] = (
+                        rollout_log_probs[vllm_i][:length].cpu().tolist()
                     )
-                else:
-                    response_log_probs_list.append([])
+
+            # Override branch (forced / replay)
+            for local_i, t in override_valid:
+                ov_text, ov_token_ids, ov_is_teacher = t.pending_response_override
+                valid_pos = next(
+                    j for j, (li, _) in enumerate(valid) if li == local_i
+                )
+                responses[valid_pos] = ov_text
+                response_token_ids_list[valid_pos] = list(ov_token_ids)
+                response_log_probs_list[valid_pos] = []  # no sampled logprobs
+                teacher_forced_list[valid_pos] = bool(ov_is_teacher)
+                # Consume the override so the next step uses vLLM (unless the
+                # driver sets another override).
+                t.pending_response_override = None
 
             if logger.isEnabledFor(logging.DEBUG):
-                for i, (local_i, t) in enumerate(valid):
-                    resp_len = int(response_mask[i].sum().item())
+                for i, (_local_i, t) in enumerate(valid):
+                    resp_len = len(response_token_ids_list[i])
+                    tag = "TEACHER" if teacher_forced_list[i] else "ASSISTANT"
                     logger.debug(
                         f"  [step {global_step}][grp {t.group_id}/{t.n_idx}] "
-                        f"RESPONSE ({resp_len} tokens):\n"
-                        f'  [ASSISTANT] Text: "{responses[i]}"'
+                        f"RESPONSE ({resp_len} tokens, {tag}):\n"
+                        f'  [{tag}] Text: "{responses[i]}"'
                     )
 
             # ── Step environments in parallel via Ray ──
+            t_env = time.time()
             step_futures = [
                 t.pool.step_env.remote(t.slot_id, responses[i])
                 for i, (_, t) in enumerate(valid)
@@ -678,6 +814,10 @@ class MultiturnEnvRollout:
                     step_results.append(ray.get(f))
                 except Exception as e:
                     step_results.append(e)
+            t_env_elapsed = time.time() - t_env
+            self._sync_env_seconds += t_env_elapsed
+            self._sync_gen_seconds += t_gen_elapsed
+            self._sync_n_turns += 1
 
             # Process step results
             n_terminated_this_step = 0
@@ -686,6 +826,7 @@ class MultiturnEnvRollout:
                 t.step_responses.append(responses[i])
                 t.step_response_token_ids.append(response_token_ids_list[i])
                 t.step_response_log_probs.append(response_log_probs_list[i])
+                t.step_teacher_forced.append(teacher_forced_list[i])
                 t.num_steps += 1
 
                 result = step_results[i]
@@ -697,9 +838,11 @@ class MultiturnEnvRollout:
                     t.terminated = True
                     n_terminated_this_step += 1
                     n_failed_this_step += 1
+                    t.step_distances.append(None)
                     continue
 
                 reward, terminated, _info = result
+                t.step_distances.append(_info.get("dist_before"))
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug(
                         f"  [step {global_step}][grp {t.group_id}/{t.n_idx}] "
@@ -717,22 +860,26 @@ class MultiturnEnvRollout:
                         t.terminated = True
                         n_terminated_this_step += 1
 
+            t_step_elapsed = time.time() - t_step
+            self._sync_step_total_seconds += t_step_elapsed
             logger.info(
                 f"  step {global_step}: {len(valid)} active, "
                 f"{n_terminated_this_step} done"
                 + (f" ({n_failed_this_step} failed)" if n_failed_this_step else "")
-                + f", gen={t_gen_elapsed:.1f}s, "
-                f"total={time.time() - t_step:.1f}s"
+                + f", gen={t_gen_elapsed:.1f}s, env={t_env_elapsed:.1f}s, "
+                f"total={t_step_elapsed:.1f}s"
                 + (f", pending={len(pending_queue)}" if pending_queue else "")
                 + f", RSS={_get_rss_mb():.0f}MB"
             )
 
             # ── Parity-mode context dump: visible turn IDs + prompt extents ──
             # For the first few traj only, so the log doesn't explode.
-            if rollout_log_probs is not None:
+            # Indices here refer to the vLLM subset; overridden/forced steps
+            # are skipped (they didn't go through vLLM).
+            if rollout_log_probs is not None and vllm_valid:
                 prompt_ids_b = gen_batch.batch.get("input_ids")
                 attn_b = gen_batch.batch.get("attention_mask")
-                for i, (_, t) in enumerate(valid[:2]):
+                for i, (_, t) in enumerate(vllm_valid[:2]):
                     if prompt_ids_b is None or attn_b is None:
                         break
                     pl = int(attn_b[i].sum().item())
@@ -787,21 +934,36 @@ class MultiturnEnvRollout:
         if n_workers <= 0:
             raise RuntimeError("actor_rollout_ref_wg.workers is empty; cannot run async rollout.")
 
+        # Engine partitioning under TP>1: every TP-sized contiguous block of
+        # workers is one vLLM engine sharded across `tp_size` ranks. A request
+        # must be fanned out to all `tp_size` ranks of the chosen engine so
+        # the `AsyncRequestRouter._step_loop_tp` lockstep broadcast finds the
+        # payload on every rank's inbox; otherwise slaves time out in stage 3.
+        tp_size = max(1, int(getattr(config.worker.rollout, "tensor_parallel_size", 1)))
+        if n_workers % tp_size != 0:
+            raise RuntimeError(
+                f"n_workers={n_workers} is not a multiple of "
+                f"tensor_parallel_size={tp_size}; cannot partition into engines."
+            )
+        n_engines = n_workers // tp_size
+
         # Counters used as round-robin assignments and for logging.
-        _rank_counter = {"i": 0}
+        _engine_counter = {"i": 0}
         _running = {"n": 0}
         _completed = {"n": 0}
         _failed_steps = {"n": 0}
 
-        def _next_rank() -> int:
-            r = _rank_counter["i"] % n_workers
-            _rank_counter["i"] += 1
-            return r
+        def _next_engine_ranks() -> list[int]:
+            """Round-robin next engine, return its `tp_size` Ray worker ranks."""
+            e = _engine_counter["i"] % n_engines
+            _engine_counter["i"] += 1
+            base = e * tp_size
+            return list(range(base, base + tp_size))
 
         t_start = time.time()
 
         async def run_traj(t: Trajectory) -> Trajectory:
-            rank = _next_rank()
+            tp_ranks = _next_engine_ranks()
             _running["n"] += 1
             t.traj_start_ts = time.time()
             try:
@@ -881,16 +1043,28 @@ class MultiturnEnvRollout:
                     t_gen_start = time.time()
                     prompt_ms = (t_gen_start - t_phase_start) * 1000.0
                     try:
-                        result = await actor_rollout_ref_wg.workers[rank].actor_rollout_ref_generate_one_async.remote(
-                            request_id=request_id,
-                            prompt_token_ids=raw_prompt_ids,
-                            multi_modal_data=mm_data,
-                            sampling_overrides=sampling_overrides,
-                            packed_mrope_override=packed_override,
-                            min_pixels=self.min_pixels,
-                            max_pixels=self.max_pixels,
-                            video_fps=getattr(config.data, "video_fps", 2.0),
-                        )
+                        # Fan out the request to every TP rank of the chosen
+                        # engine. The lockstep router in `vllm_rollout_spmd.py`
+                        # requires every rank's inbox to receive the payload
+                        # so all ranks can call add_request in lockstep. All
+                        # ranks compute identical outputs (sampler is
+                        # TP-replicated with same seed), so we use rank 0's
+                        # result and discard the rest.
+                        remote_calls = [
+                            actor_rollout_ref_wg.workers[r].actor_rollout_ref_generate_one_async.remote(
+                                request_id=request_id,
+                                prompt_token_ids=raw_prompt_ids,
+                                multi_modal_data=mm_data,
+                                sampling_overrides=sampling_overrides,
+                                packed_mrope_override=packed_override,
+                                min_pixels=self.min_pixels,
+                                max_pixels=self.max_pixels,
+                                video_fps=getattr(config.data, "video_fps", 2.0),
+                            )
+                            for r in tp_ranks
+                        ]
+                        results = await asyncio.gather(*remote_calls)
+                        result = results[0]
                     except Exception as e:
                         logger.warning(
                             f"  [async grp {t.group_id}/{t.n_idx}] generate_one_async failed: {e}. Terminating."
@@ -914,7 +1088,9 @@ class MultiturnEnvRollout:
                             f"  [async grp {t.group_id}/{t.n_idx}] step_env failed: {e}. Terminating."
                         )
                         t.terminated = True
+                        t.step_distances.append(None)
                         break
+                    t.step_distances.append(info.get("dist_before"))
 
                     env_ms = (time.time() - t_gen_done) * 1000.0
                     t.step_phase_times.append({
@@ -1411,7 +1587,22 @@ class MultiturnEnvRollout:
             if not for_generation:
                 # Pre-computed tensors for training-side log-prob computation
                 # (avoids re-processing which can produce mismatched grids).
-                multi_modal_inputs = {k: v for k, v in model_inputs.items() if isinstance(v, torch.Tensor)}
+                # Whitelist only visual-input tensors. Qwen3-VL processors may
+                # emit extra tensor fields (e.g. position_ids for mrope) whose
+                # non-batch dims vary per sample — those break torch.cat(dim=0)
+                # in dp_actor._forward_micro_batch.
+                _MM_KEYS = (
+                    "pixel_values",
+                    "image_grid_thw",
+                    "pixel_values_videos",
+                    "video_grid_thw",
+                    "second_per_grid_ts",
+                )
+                multi_modal_inputs = {
+                    k: model_inputs[k]
+                    for k in _MM_KEYS
+                    if k in model_inputs and isinstance(model_inputs[k], torch.Tensor)
+                }
                 batch_multi_modal_data.append(multi_modal_inputs)
             # Raw PIL images stored separately for vLLM generation (vLLM
             # does its own image processing internally).
@@ -1745,6 +1936,16 @@ class MultiturnEnvRollout:
         # position of the first assistant content token (= prompt/response
         # boundary).
         response_mask_full = torch.zeros(bs, seq_len, dtype=full_ids.dtype)
+        # Per-trajectory teacher-token mask in *full conversation* coords;
+        # sliced to response coords below. 1 = injected by teacher VLM (Pope-
+        # Dagger forced step), 0 = sampled by student. Downstream the policy
+        # loss zeroes out gradient on positions where this is 1.
+        teacher_token_mask_full = torch.zeros(bs, seq_len, dtype=torch.float32)
+        # Per-trajectory per-step (start, end) token spans, in *response* coords
+        # (after split). Populated below alongside the assistant-content range
+        # iteration so the branching advantage estimator can broadcast a single
+        # per-step scalar over each span without re-scanning the tokens.
+        step_token_spans: list[list[tuple[int, int]]] = [[] for _ in range(bs)]
         split_points = []  # per-sample split in the padded sequence
 
         # If rollout-time logprobs were captured (parity smoke), copy them
@@ -1770,26 +1971,30 @@ class MultiturnEnvRollout:
             # Split at first assistant content start
             split_points.append(ranges[0][0] if ranges else seq_len)
             # Copy per-step rollout logprobs into the packed positions.
-            if any_lp and b < len(trajectories):
+            if b < len(trajectories):
                 t = trajectories[b]
+                forced_flags = t.step_teacher_forced or []
                 for step_idx, (start, end) in enumerate(ranges):
-                    if step_idx >= len(t.step_response_log_probs):
-                        break
-                    span_len = end - start + 1
-                    lp = t.step_response_log_probs[step_idx][:span_len]
-                    if not lp:
-                        continue
-                    rollout_lp_full[b, start : start + len(lp)] = torch.tensor(
-                        lp, dtype=torch.float32
-                    )
-                    # Mirror the rollout-generated token IDs at the same
-                    # positions for parity diagnosis (BPE-boundary check).
-                    if step_idx < len(t.step_response_token_ids):
-                        rt = t.step_response_token_ids[step_idx][:span_len]
-                        if rt:
-                            rollout_tok_full[b, start : start + len(rt)] = torch.tensor(
-                                rt, dtype=torch.int64
+                    # Stash the per-step span in full-coords for later
+                    # response-coord conversion (after split).
+                    step_token_spans[b].append((start, end))
+                    if step_idx < len(forced_flags) and forced_flags[step_idx]:
+                        teacher_token_mask_full[b, start : end + 1] = 1.0
+                    if any_lp and step_idx < len(t.step_response_log_probs):
+                        span_len = end - start + 1
+                        lp = t.step_response_log_probs[step_idx][:span_len]
+                        if lp:
+                            rollout_lp_full[b, start : start + len(lp)] = torch.tensor(
+                                lp, dtype=torch.float32
                             )
+                        # Mirror the rollout-generated token IDs at the same
+                        # positions for parity diagnosis (BPE-boundary check).
+                        if step_idx < len(t.step_response_token_ids):
+                            rt = t.step_response_token_ids[step_idx][:span_len]
+                            if rt:
+                                rollout_tok_full[b, start : start + len(rt)] = torch.tensor(
+                                    rt, dtype=torch.int64
+                                )
 
         # ── 4. Split at first assistant content boundary ──
         # Use the earliest split across the batch so all samples align.
@@ -1800,6 +2005,20 @@ class MultiturnEnvRollout:
         prompt_ids = full_ids[:, :split]
         response_ids = full_ids[:, split:]
         response_mask_t = response_mask_full[:, split:]
+        teacher_token_mask_t = teacher_token_mask_full[:, split:].contiguous()
+        # Convert step spans from full-coords to response-coords. Spans whose
+        # `start < split` (extremely rare — would mean an assistant turn
+        # straddled the split) are clipped at 0; downstream consumers should
+        # treat negative-end spans as empty.
+        step_token_spans_resp: list[list[tuple[int, int]]] = []
+        for spans in step_token_spans:
+            adj: list[tuple[int, int]] = []
+            for s, e in spans:
+                ns = max(0, s - split)
+                ne = e - split
+                if ne >= ns:
+                    adj.append((ns, ne))
+            step_token_spans_resp.append(adj)
 
         # ── 5. Build per-token turn_id (for past-K K-window BlockMask) ──
         # Always emit when context_mode is multi_turn; downstream (actor
@@ -1834,6 +2053,9 @@ class MultiturnEnvRollout:
             "position_ids": full_pos,
             "turn_id": turn_id_full,
         }
+        # Always emit teacher_token_mask so downstream consumers can rely on
+        # the key existing. For on-policy / non-guided runs every entry is 0.
+        td_dict["teacher_token_mask"] = teacher_token_mask_t
         if any_lp:
             # Slice to the response portion to align with old_log_probs shape.
             td_dict["rollout_log_probs"] = rollout_lp_full[:, split:].contiguous()
@@ -1851,6 +2073,19 @@ class MultiturnEnvRollout:
             "uid": np.array(uids, dtype=object),
             "ground_truth": np.array(ground_truths, dtype=object),
             "multi_modal_data": tokenized["multi_modal_data"],
+            # Pope-Dagger V4 metadata. Always emitted; for non-guided runs
+            # `dagger_iter_index` is all zero and `branch_chain` is empty, so
+            # the branching advantage estimator collapses to standard GRPO.
+            "step_token_spans": np.array(step_token_spans_resp, dtype=object),
+            "dagger_iter_index": np.array(
+                [t.dagger_iter_index for t in trajectories], dtype=np.int64
+            ),
+            "chain_id": np.array(
+                [t.chain_id for t in trajectories], dtype=np.int64
+            ),
+            "branch_chain": np.array(
+                [list(t.branch_chain) for t in trajectories], dtype=object
+            ),
         }
 
         # ── Place trajectory reward at last assistant content token ──
@@ -2073,6 +2308,11 @@ class ObjectNavEnvAdapter:
     def step(self, action_text: str) -> tuple[float, bool, dict[str, Any]]:
         self.num_steps += 1
 
+        # Capture pre-step distance for V5 random_regression selector.
+        # self.previous_distance is what the agent saw before deciding this
+        # step (initial_distance at step 0; post-prev-step distance otherwise).
+        dist_before = self.previous_distance
+
         # Score format and validity for this step
         self.format_scores.append(self._check_format(action_text))
         self.validity_scores.append(self._check_validity(action_text))
@@ -2103,7 +2343,7 @@ class ObjectNavEnvAdapter:
             error_state.observation = None
             error_state.user_response = f"Action execution failed: {e}"
             self.state_history.append(action, error_state)
-            return 0.0, False, {"action_type": "error"}
+            return 0.0, False, {"action_type": "error", "dist_before": dist_before}
 
         # Handle error states (no new observation)
         if new_state.observation is None:
@@ -2111,7 +2351,7 @@ class ObjectNavEnvAdapter:
             error_state.observation = None
             error_state.user_response = new_state.user_response
             self.state_history.append(action, error_state)
-            return 0.0, False, {"action_type": "error"}
+            return 0.0, False, {"action_type": "error", "dist_before": dist_before}
 
         self.state_history.append(action, deepcopy(new_state))
 
@@ -2156,7 +2396,11 @@ class ObjectNavEnvAdapter:
         else:
             action_type = "unknown"
 
-        return new_state.reward, terminated, {"action_type": action_type}
+        return new_state.reward, terminated, {
+            "action_type": action_type,
+            "dist_before": dist_before,
+            "dist_after": new_state.shortest_path_distance_to_target,
+        }
 
     def _debug_save_answer_image(self, action, new_state, prev_observation=None) -> None:
         """Save the observation image with the answer coordinate drawn on it.

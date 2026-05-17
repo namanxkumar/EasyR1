@@ -356,6 +356,10 @@ class DataParallelPPOActor(BasePPOActor):
         select_keys = ["input_ids", "attention_mask", "position_ids", "responses", "response_mask"]
         if "turn_id" in data.batch.keys():
             select_keys.append("turn_id")
+        # Teacher-forced tokens (V4 guided rollouts) are masked out of the
+        # policy-gradient denominator by compute_policy_loss when present.
+        if "teacher_token_mask" in data.batch.keys():
+            select_keys.append("teacher_token_mask")
         select_keys.extend(["old_log_probs", "ref_log_probs", "advantages"])
         non_tensor_select_keys = ["multi_modal_inputs"]
 
@@ -385,6 +389,7 @@ class DataParallelPPOActor(BasePPOActor):
                     # all return: (bsz, response_length)
                     log_probs = self._forward_micro_batch(model_inputs, temperature=temperature)
 
+                    teacher_token_mask = model_inputs.get("teacher_token_mask")
                     pg_loss, pg_metrics = compute_policy_loss(
                         old_log_probs=old_log_probs,
                         log_probs=log_probs,
@@ -397,6 +402,7 @@ class DataParallelPPOActor(BasePPOActor):
                         tau_negative=self.config.tau_negative,
                         loss_type=self.config.loss_type,
                         loss_avg_mode=self.config.loss_avg_mode,
+                        teacher_token_mask=teacher_token_mask,
                     )
                     if self.config.use_kl_loss and "ref_log_probs" in model_inputs:
                         ref_log_probs = model_inputs["ref_log_probs"]
