@@ -69,6 +69,15 @@ def _create_simulator_pools(mt_cfg, n_gpus: int):
 
     num_simulators = mt_cfg.num_simulators
     pools_per_gpu = max(1, getattr(mt_cfg, "pools_per_gpu", 1))
+    if pools_per_gpu > 1:
+        raise ValueError(
+            f"pools_per_gpu={pools_per_gpu} is not supported: multiple AI2Thor "
+            f"controllers sharing one GPU corrupt each other's offscreen "
+            f"framebuffers, producing bad observations and inflated reward "
+            f"variance (compared 121806 4/GPU=0.286 vs 121807 1/GPU=0.582 on "
+            f"the same SFT checkpoint). Set pools_per_gpu=1 and raise "
+            f"num_simulators if you need more parallel slots."
+        )
     total_pools = pools_per_gpu * n_gpus
 
     # Distribute simulators evenly across all pools (across all GPUs).
