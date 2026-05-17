@@ -80,6 +80,8 @@ class MultiturnEnvConfig:
         + 0.15 * avg_validity - 0.005 * num_steps. Reward concentrates on
         success/no-success binary; format/validity are near-ceiling on the SFT
         ckpt so this is effectively bimodal {~0.21, ~1.22}.
+    'success': pure binary {0.0, 1.0} on trajectory success — no format
+        weighting, no progress shaping, no step penalty.
     """
     context_mode: str = "multi_turn"
     """Prompt context mode: 'multi_turn' uses proper user/assistant turn

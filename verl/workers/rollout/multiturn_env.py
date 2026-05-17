@@ -2144,8 +2144,10 @@ class ObjectNavEnvAdapter:
         self.max_observations = max_observations
         self.context_mode = context_mode
         self.past_k_steps = past_k_steps
-        if reward_mode not in ("continuous", "bimodal"):
-            raise ValueError(f"reward_mode must be 'continuous' or 'bimodal', got {reward_mode!r}")
+        if reward_mode not in ("continuous", "bimodal", "success"):
+            raise ValueError(
+                f"reward_mode must be 'continuous', 'bimodal', or 'success', got {reward_mode!r}"
+            )
         self.reward_mode = reward_mode
 
         # Build the per-step instruction matching the SFT annotation format.
@@ -2539,7 +2541,12 @@ class ObjectNavEnvAdapter:
         avg_validity = sum(self.validity_scores) / len(self.validity_scores) if self.validity_scores else 0.0
         step_penalty = 0.005 * self.num_steps
 
-        if self.reward_mode == "bimodal":
+        if self.reward_mode == "success":
+            # Pure binary success reward: 1.0 on success, 0.0 otherwise.
+            # No format weighting, no progress shaping, no step penalty.
+            reward = 1.0 if self.success else 0.0
+            progress = None
+        elif self.reward_mode == "bimodal":
             #   0.875 * success + 0.125 * fmt + 0.25 * normalized_net_progress
             # Progress = fraction of the initial gap closed at trajectory end,
             # clamped to [0, 1]. Replaces ViGoRL's forward-only Σ max(0, Δdist)
