@@ -2169,6 +2169,7 @@ class ObjectNavEnvAdapter:
         self.previous_distance: float | None = None
         self.progress_sum: float = 0.0
         self.success: bool = False
+        self.answer_issued: bool = False
         self.num_steps: int = 0
         self.format_scores: list[float] = []
         self.validity_scores: list[float] = []
@@ -2187,6 +2188,7 @@ class ObjectNavEnvAdapter:
         self.previous_distance = self.initial_distance
         self.progress_sum = 0.0
         self.success = False
+        self.answer_issued = False
         self.num_steps = 0
         self.format_scores = []
         self.validity_scores = []
@@ -2381,6 +2383,7 @@ class ObjectNavEnvAdapter:
 
         if isinstance(action, ObjectNavAnswerAction):
             action_type = "answer"
+            self.answer_issued = True
             # ── DEBUG: save answer image with coordinate and bounding box ──
             # self._debug_save_answer_image(action, new_state, prev_observation)
         elif isinstance(action, ObjectNavGroundNavigationAction):
@@ -2552,15 +2555,26 @@ class ObjectNavEnvAdapter:
             # clamped to [0, 1]. Replaces ViGoRL's forward-only Σ max(0, Δdist)
             # which lets agents farm reward by zigzagging (close, back, close).
             # No step_penalty, no validity gate.
-            reward = 0.0
-            if self.success:
-                reward += 0.875
-            reward += 0.125 * avg_fmt
-            if self.initial_distance and self.initial_distance > 1e-6:
-                progress = max(0.0, min(1.0, (self.initial_distance - self.final_distance) / self.initial_distance))
-            else:
+            # Force-answer: timing out without ever committing an <answer/> is
+            # strictly worse than a wrong answer. Without this gate, a wandering
+            # trajectory that closes half the gap earns 0.125 progress while a
+            # confidently-wrong early answer earns 0.125 fmt — the "wander
+            # forever" attractor pays out. Bimodal/success runs collapse via
+            # avg_steps → max_depth; gating progress/fmt on answer_issued
+            # removes that escape valve while staying RLVR-faithful.
+            if not self.answer_issued:
                 progress = 0.0
-            reward += 0.25 * progress
+                reward = 0.0
+            else:
+                reward = 0.0
+                if self.success:
+                    reward += 0.875
+                reward += 0.125 * avg_fmt
+                if self.initial_distance and self.initial_distance > 1e-6:
+                    progress = max(0.0, min(1.0, (self.initial_distance - self.final_distance) / self.initial_distance))
+                else:
+                    progress = 0.0
+                reward += 0.25 * progress
         else:
             # Continuous distance progress: graded credit even on failed trajectories.
             if self.initial_distance and self.initial_distance > 0.1:
@@ -2574,6 +2588,7 @@ class ObjectNavEnvAdapter:
 
         logger.info(
             f"Trajectory reward [{self.reward_mode}]: success={self.success}, "
+            f"answer_issued={self.answer_issued}, "
             f"initial_distance={self.initial_distance:.2f}, "
             f"final_distance={self.final_distance:.2f}, "
             f"progress={'n/a' if progress is None else f'{progress:+.3f}'}, "
@@ -2590,6 +2605,7 @@ class ObjectNavEnvAdapter:
             {
                 "trajectory_reward": self.get_trajectory_reward(),
                 "success": self.success,
+                "answer_issued": self.answer_issued,
                 "num_steps": self.num_steps,
                 "initial_distance": self.initial_distance,
                 "final_distance": self.final_distance,
