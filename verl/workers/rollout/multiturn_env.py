@@ -1164,16 +1164,31 @@ class MultiturnEnvRollout:
                     exc = d.exception()
                     if exc is not None:
                         logger.error(f"async trajectory coroutine raised: {exc!r}")
-                # Refill: each completed trajectory frees one slot. Acquire
-                # new trajectories from the pending queue and schedule them.
-                free_slots = len(done)
-                while free_slots > 0 and pending_queue:
-                    refill_batch = [pending_queue.popleft()]
-                    free_slots -= 1
-                    new_trajs = self._initialize_batch(refill_batch)
-                    all_trajectories.extend(new_trajs)
-                    for nt in new_trajs:
-                        tasks.add(asyncio.create_task(run_traj(nt)))
+                # Refill from the pending queue. A completed trajectory does
+                # NOT guarantee a reusable slot: SimulatorPool.release_env can
+                # reactively *disable* the freed slot under GPU memory pressure
+                # (reactive shrink). Trusting free_slots=len(done) then
+                # over-refills into capacity that no longer exists, and
+                # _initialize_batch raises "No simulator slots available across
+                # any pool" — crashing the whole rollout (observed during
+                # val_before_train on the 4-GPU/32-slot configs, which run hot
+                # enough to trip shrink). Instead, query the pools' real
+                # availability each wave and schedule only what actually fits;
+                # leftover items stay queued for a later completion. The pool's
+                # enabled-slot floor (>=1) guarantees forward progress.
+                if pending_queue:
+                    avail = sum(
+                        ray.get(
+                            [p.get_available_count.remote() for p in self.simulator_pools]
+                        )
+                    )
+                    n_refill = min(avail, len(pending_queue))
+                    for _ in range(n_refill):
+                        refill_batch = [pending_queue.popleft()]
+                        new_trajs = self._initialize_batch(refill_batch)
+                        all_trajectories.extend(new_trajs)
+                        for nt in new_trajs:
+                            tasks.add(asyncio.create_task(run_traj(nt)))
 
         # Periodic progress logger so long rollouts don't appear silent.
         async def progress_logger() -> None:
