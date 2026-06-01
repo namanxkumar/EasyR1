@@ -2133,6 +2133,14 @@ class MultiturnEnvRollout:
             "video_fps": 2.0,
         }
 
+        # Human-readable rollout step-view (gated by POPE_DAGGER_VIZ=1):
+        # per group/trajectory/step — abbreviated <think>, action, provenance.
+        try:
+            from verl.utils.pope_dagger_viz import log_rollout_stepview
+            log_rollout_stepview(trajectories)
+        except Exception:
+            pass
+
         return DataProto(
             batch=td, non_tensor_batch=non_tensor, meta_info=meta_info
         )
@@ -2222,6 +2230,12 @@ class ObjectNavEnvAdapter:
         self.num_steps = 0
         self.format_scores = []
         self.validity_scores = []
+        # Clear any expert trajectory cached for a previous episode on this
+        # (possibly reused) slot — it was synthesized from a different episode's
+        # pose/navmesh and must not leak into this one. Rebuilt lazily at the
+        # first forced step (the branch) of this episode.
+        self.expert_trajectory_cache = None
+        self.expert_cache_base_num_steps = 0
         return {"observation": initial_state.observation}
 
     def build_prompt(self) -> tuple[list[dict], list[Image.Image]]:

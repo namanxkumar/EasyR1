@@ -884,6 +884,15 @@ class RayPPOTrainer:
                     )
                 _phase_cleanup("adv", timing_raw)
 
+                # Human-readable advantage step-view (gated by POPE_DAGGER_VIZ=1):
+                # per group/trajectory/step — advantage applied + token-level
+                # accounting (pg / teacher-masked / sft) post advantage compute.
+                try:
+                    from verl.utils.pope_dagger_viz import log_advantage_stepview
+                    log_advantage_stepview(batch, global_step=self.global_step)
+                except Exception:
+                    pass
+
                 # update critic
                 if self.use_critic:
                     with timer("update_critic", timing_raw):

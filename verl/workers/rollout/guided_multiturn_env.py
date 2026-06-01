@@ -645,6 +645,16 @@ class GuidedMultiturnEnvRollout(MultiturnEnvRollout):
             t.pool, t.slot_id, _dataset_item_for(t),
         )
 
+        # 4.0. Oracle exhausted/failed: the branch-relative expert trajectory
+        # has no real action at this step (we ran past its end, or synthesis
+        # failed). Do NOT inject a no-op ``direction:0`` forced step — hand off
+        # to the student so this step is a genuine on-policy generation
+        # ("replace the failed expert step"). Once we return None here the
+        # override provider keeps returning None, so the student finishes the
+        # trajectory from this pose.
+        if not expert_action or not str(expert_action).strip():
+            return None
+
         # 4a. Never force an ``<answer/>`` — even if the oracle returns one,
         # let the student make the call. (Completion iters DO force the answer,
         # as does the global force_expert_answer knob.)
@@ -838,20 +848,26 @@ def _dataset_item_for(t: Trajectory) -> dict:
 
 def _default_expert_action_fn(
     pool: Any, slot_id: int, dataset_item: dict
-) -> str:
+) -> Optional[str]:
     """Default oracle hook: calls pool.compute_expert_action.remote(slot_id).
 
-    The SimulatorPool method (added in this commit) wraps
+    The SimulatorPool method wraps
     ``pope_dagger.expert_replay.compute_expert_actions_via_sparsify`` against
     the slot's live environment and returns the next expert action as a
-    formatted string.
+    formatted string, or ``None`` when the expert has no real action to give
+    (trajectory exhausted past its end, or oracle synthesis failed).
+
+    Returns ``None`` in that case (and on any RPC error) — the caller
+    (``_build_override_for``) treats ``None`` as "hand off to the student for
+    this step" rather than injecting a no-op ``direction:0`` forced step that
+    would then be teacher-masked + SFT'd.
     """
     try:
         return ray.get(pool.compute_expert_action.remote(slot_id))
     except Exception as e:
         logger.warning(
             f"[guided] expert action computation failed for slot {slot_id}: {e}. "
-            f"Falling back to a no-op move-forward action."
+            f"Handing off to the student for this step."
         )
-        return "<explore action_type=direction direction=forward/>"
+        return None
 

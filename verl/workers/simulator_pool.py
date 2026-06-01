@@ -30,6 +30,7 @@ import time
 import traceback
 from typing import Any, Optional
 
+import numpy as np
 import ray
 
 logger = logging.getLogger(__name__)
@@ -596,15 +597,26 @@ class SimulatorPool:
         return adapter.get_ground_truth()
 
     # ── pope-dagger guided rollout hook ──────────────────────────────
-    def compute_expert_action(self, slot_id: int) -> str:
-        """Return the next pope-dagger oracle action for this slot.
+    def _next_expert_sparse_step(self, slot_id: int):
+        """Resolve the next expert ``SparseStep`` for this slot, or ``None``.
 
-        Bridges ``GuidedMultiturnEnvRollout`` into pope-dagger's navmesh
-        expert. ``compute_expert_actions_via_sparsify`` synthesizes the full
-        expert SparseTrajectory (depends only on the dataset item / navmesh,
-        not on the student's history) so we compute it once per episode and
-        cache it on the adapter. Each call returns the action at index
-        ``adapter.num_steps + 1`` (steps[0] is the no-op ``initial`` step).
+        Shared by ``compute_expert_action`` (string-only) and
+        ``compute_expert_entry`` (rich entry). Builds + caches the expert
+        ``SparseTrajectory`` on the adapter on first call. The trajectory is
+        synthesized from the env's pose AT BUILD TIME — i.e. the branch pose
+        (the first forced step) — so its ``steps[1:]`` are actions relative to
+        the branch, NOT to episode start. We therefore index it relative to the
+        branch: the j-th forced step (1-based) is ``steps[j]``, where
+        ``j = num_steps - base + 1`` and ``base`` is ``num_steps`` captured at
+        build time. (The old ``num_steps + 1`` indexed by absolute episode step,
+        which silently skipped the first ``branch`` expert actions — the forced
+        rollout then ended at the wrong pose and the screen-space expert answer
+        pixel, computed for the correct final pose, missed.)
+
+        Returns ``(adapter, dataset_item, step)`` or ``None`` if the oracle is
+        unavailable or the branch-relative trajectory is exhausted (the forced
+        window ran past its end) — the caller treats ``None`` as "hand off to
+        the student" rather than injecting a no-op forced step.
         """
         adapter = self.slots[slot_id]
         if adapter is None:
@@ -613,7 +625,7 @@ class SimulatorPool:
             from pope_dagger.expert_replay import compute_expert_actions_via_sparsify
         except Exception as e:
             logger.warning(f"pope_dagger import failed: {e!r}")
-            return "<explore>direction:0</explore>"
+            return None
 
         env = getattr(adapter, "env", None)
         dataset_item = getattr(adapter, "dataset_item", None) or getattr(adapter, "item_data", None)
@@ -622,7 +634,7 @@ class SimulatorPool:
                 f"Slot {slot_id}: missing env or dataset_item on adapter "
                 f"(env={env is not None}, item={dataset_item is not None})"
             )
-            return "<explore>direction:0</explore>"
+            return None
 
         cache = getattr(adapter, "expert_trajectory_cache", None)
         if cache is None:
@@ -630,25 +642,149 @@ class SimulatorPool:
                 cache = compute_expert_actions_via_sparsify(env=env, dataset_item=dataset_item)
             except Exception as e:
                 logger.warning(f"compute_expert_actions_via_sparsify failed: {e!r}")
-                return "<explore>direction:0</explore>"
+                return None
             try:
                 adapter.expert_trajectory_cache = cache
+                # Capture the branch base: num_steps at build time. The forced
+                # window opens here, so steps[1] is the first action from this
+                # pose and maps to num_steps == base.
+                adapter.expert_cache_base_num_steps = int(getattr(adapter, "num_steps", 0) or 0)
             except Exception:
                 pass
 
-        # SparseTrajectory.steps[0] is the no-op "initial" step; steps[1:]
-        # are real expert actions. The next student action would be at index
-        # adapter.num_steps + 1 (num_steps counts executed actions so far).
-        idx = int(getattr(adapter, "num_steps", 0) or 0) + 1
+        # Branch-relative index: steps[0] is the no-op "initial" step; the j-th
+        # forced step (1-based) is steps[j] with j = num_steps - base + 1.
+        base = int(getattr(adapter, "expert_cache_base_num_steps", 0) or 0)
+        idx = (int(getattr(adapter, "num_steps", 0) or 0) - base) + 1
         steps = getattr(cache, "steps", None) or []
-        if idx >= len(steps):
-            return "<explore>direction:0</explore>"
+        if idx < 1 or idx >= len(steps):
+            return None
+        return adapter, dataset_item, steps[idx]
 
-        action = steps[idx].action
+    def compute_expert_action(self, slot_id: int):
+        """Return the next pope-dagger oracle action string, or ``None``.
+
+        Thin string-only wrapper over ``_next_expert_sparse_step`` (back-compat
+        entry point for the guided rollout's expert-action hook). Returns
+        ``None`` when the oracle has no real action to give — the expert
+        trajectory is exhausted (the forced window ran past its end) or the
+        oracle failed to synthesize one. The guided rollout treats ``None`` as
+        "hand off to the student for this step" rather than injecting a no-op
+        forced step (a ``direction:0`` non-action that would then be SFT'd).
+        """
+        resolved = self._next_expert_sparse_step(slot_id)
+        if resolved is None:
+            return None
+        _adapter, _item, step = resolved
+        return getattr(step.action, "formatted", None) or None
+
+    def compute_expert_entry(self, slot_id: int, past_k: int = 0, future_k: int = 0):
+        """Return the next expert step as a rich dict for teacher annotation.
+
+        Surfaces the fields ``annotate_expert_cache`` needs that
+        ``compute_expert_action`` discards: the ``SparseAction`` object, its
+        ``rationale_kind`` (action_type), the **before**-observation image (the
+        exact frame the student is looking at when this action is chosen), and
+        the episode's target / house metadata. Returns ``None`` when no expert
+        step is available so the caller can fall back to the placeholder
+        annotator.
+
+        The before-image is the live ``state_history`` head — the same image
+        the adapter uses as ``prev_observation`` in ``step`` — so the teacher
+        reasons over the on-distribution branch observation, not the expert's
+        synthesized pose frame.
+
+        When ``past_k > 0`` / ``future_k > 0``, also returns context windows so
+        the teacher can reason history- and plan-aware (not single-frame):
+
+        * ``past_steps``: the last ``past_k`` *executed* steps on this slot,
+          oldest→newest, each ``{step_index, image (the obs the agent saw before
+          that step), response (the assistant <think>+action text)}``. Read from
+          the live ``state_history`` — no Trajectory plumbing needed.
+        * ``future_steps``: the next ``future_k`` *planned* expert steps from the
+          cached SparseTrajectory, each ``{sparse_action, action_str, image (the
+          expert's synthesized pose frame)}``. The expert's look-ahead plan.
+        """
+        resolved = self._next_expert_sparse_step(slot_id)
+        if resolved is None:
+            return None
+        adapter, dataset_item, step = resolved
+        action = step.action
         formatted = getattr(action, "formatted", None)
-        if formatted:
-            return formatted
-        return "<explore>direction:0</explore>"
+        if not formatted:
+            return None
+
+        sh = getattr(adapter, "state_history", None)
+
+        # Before-observation: the frame the agent currently sees (pre-step).
+        image = None
+        try:
+            obs = getattr(sh.get_last_state(), "observation", None) if sh is not None else None
+            if obs is not None:
+                image = np.ascontiguousarray(np.asarray(obs))
+        except Exception as e:
+            logger.warning(f"Slot {slot_id}: could not read before-observation: {e!r}")
+
+        # Past window: last past_k executed (action, state) pairs. The obs the
+        # agent saw BEFORE pair j is the root state (j==0) or pair j-1's state.
+        past_steps = []
+        if past_k > 0 and sh is not None:
+            try:
+                pairs = sh.action_state_pairs or []
+                n = len(pairs)
+                for j in range(max(0, n - past_k), n):
+                    act_j = pairs[j][0]
+                    obs_before = (
+                        getattr(sh.root_state, "observation", None) if j == 0
+                        else getattr(pairs[j - 1][1], "observation", None)
+                    )
+                    img_j = (
+                        np.ascontiguousarray(np.asarray(obs_before))
+                        if obs_before is not None else None
+                    )
+                    past_steps.append({
+                        "step_index": j,
+                        "image": img_j,
+                        "response": getattr(act_j, "response", "") or "",
+                    })
+            except Exception as e:
+                logger.warning(f"Slot {slot_id}: could not build past window: {e!r}")
+
+        # Future window: next future_k planned expert steps from the cache.
+        future_steps = []
+        if future_k > 0:
+            try:
+                cache = getattr(adapter, "expert_trajectory_cache", None)
+                base = int(getattr(adapter, "expert_cache_base_num_steps", 0) or 0)
+                cur_idx = (int(getattr(adapter, "num_steps", 0) or 0) - base) + 1
+                steps = getattr(cache, "steps", None) or []
+                for k in range(cur_idx + 1, min(cur_idx + 1 + future_k, len(steps))):
+                    fs = steps[k]
+                    frgb = getattr(getattr(fs, "frame", None), "rgb", None)
+                    future_steps.append({
+                        "sparse_action": fs.action,
+                        "action_str": getattr(fs.action, "formatted", "") or "",
+                        "image": (
+                            np.ascontiguousarray(np.asarray(frgb))
+                            if frgb is not None else None
+                        ),
+                    })
+            except Exception as e:
+                logger.warning(f"Slot {slot_id}: could not build future window: {e!r}")
+
+        item = dataset_item or {}
+        return {
+            "action_str": formatted,
+            "sparse_action": action,
+            "rationale_kind": getattr(action, "action_type", "") or "",
+            "image": image,
+            "target_object": item.get("target_object", "") if isinstance(item, dict) else "",
+            "target_description": item.get("target_object_description", "") if isinstance(item, dict) else "",
+            "house_id": str(item.get("house_id", "")) if isinstance(item, dict) else "",
+            "sub_house_id": str(item.get("sub_house_id", "")) if isinstance(item, dict) else "",
+            "past_steps": past_steps,
+            "future_steps": future_steps,
+        }
 
     # ── recovery ──────────────────────────────────────────────────────
 

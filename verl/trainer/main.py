@@ -251,26 +251,135 @@ def _create_multiturn_rollout(config: PPOConfig, tokenizer, processor):
                 )
                 teacher = ServerTeacherVLM(tcfg)
 
+                import re as _re
                 from ..workers.rollout.guided_multiturn_env import _build_placeholder_annotator
+                from pope_dagger.expert_replay import ExpertCacheEntry
+                from pope_dagger_sanity.types import TrajectoryStepRecord
+                from common.prompting.response_format import (
+                    build_assistant_response_no_summary,
+                )
                 _placeholder = _build_placeholder_annotator(tokenizer)
+                _ACTION_TAG_RE = _re.compile(
+                    r"<(?:answer|explore)\b[^>]*?>.*?</(?:answer|explore)>"
+                    r"|<(?:answer|explore)\b[^>]*?/>",
+                    _re.DOTALL,
+                )
+
+                def _parsed_action_of(resp):
+                    m = _ACTION_TAG_RE.search(resp or "")
+                    return m.group(0) if m else ""
+
+                _past_k = int(getattr(guided_cfg, "teacher_past_context_steps", 0) or 0)
+                _future_k = int(getattr(guided_cfg, "teacher_future_context_steps", 0) or 0)
 
                 def _annotate(*, pool, slot_id, episode_id, expert_action_formatted,
                               parent, branch_step_index):
-                    # ExpertCacheEntry requires sparse_action / rationale_kind /
-                    # image which the rollout layer does not currently plumb
-                    # through. Until that wiring exists, fall back to the
-                    # placeholder annotator so the run still proceeds (the V4
-                    # chain is structurally valid; we just lose teacher
-                    # reasoning until the integration is completed).
+                    """Real teacher-VLM annotation for one forced expert step.
+
+                    Pulls the rich expert entry (SparseAction + before-image +
+                    target metadata) from the slot, routes it through the
+                    ServerTeacherVLM (which wraps annotate_expert_cache with
+                    endpoint resolution + reconnect), and returns the
+                    ``<think>...</think>\\n<action/>`` block + its token ids.
+
+                    Any failure (oracle unavailable, no observation, empty
+                    reasoning, teacher outage past its retry budget) degrades to
+                    the placeholder annotator so the rollout never crashes on a
+                    teacher hiccup — the V4 chain stays structurally valid, we
+                    just lose teacher reasoning for that step.
+
+                    Context: the teacher sees the last ``teacher_past_context_steps``
+                    executed steps (images + reasoning, from the slot's live
+                    state_history) as past priors, and the next
+                    ``teacher_future_context_steps`` planned expert steps as
+                    look-ahead — so its reasoning is history- and plan-aware, not
+                    single-frame. Both windows come from compute_expert_entry.
+                    """
+                    def _fallback():
+                        return _placeholder(
+                            pool=pool, slot_id=slot_id, episode_id=episode_id,
+                            expert_action_formatted=expert_action_formatted,
+                            parent=parent, branch_step_index=branch_step_index,
+                        )
                     try:
-                        from pope_dagger.expert_replay import ExpertCacheEntry  # noqa: F401  (import probe)
-                    except Exception:
-                        pass
-                    return _placeholder(
-                        pool=pool, slot_id=slot_id, episode_id=episode_id,
-                        expert_action_formatted=expert_action_formatted,
-                        parent=parent, branch_step_index=branch_step_index,
-                    )
+                        entry_d = ray.get(
+                            pool.compute_expert_entry.remote(slot_id, _past_k, _future_k)
+                        )
+                        if not entry_d or entry_d.get("image") is None:
+                            logging.warning(
+                                f"[guided] teacher: no expert entry/image for slot {slot_id} "
+                                f"(ep={episode_id}); using placeholder for this step"
+                            )
+                            return _fallback()
+                        # Past priors: executed steps with images + reasoning.
+                        parent_history = []
+                        for ps in entry_d.get("past_steps", []) or []:
+                            if ps.get("image") is None:
+                                continue
+                            resp = ps.get("response", "") or ""
+                            parent_history.append(TrajectoryStepRecord(
+                                step_index=int(ps.get("step_index", 0)),
+                                state_before={"observation": ps["image"]},
+                                state_after={},
+                                action={},
+                                model_response=resp,
+                                parsed_action=_parsed_action_of(resp),
+                                env_feedback="",
+                                reward=0.0,
+                                is_terminal=False,
+                            ))
+                        # Annotate at the current step's absolute index so all
+                        # executed steps (incl. prior forced steps) count as priors.
+                        annot_branch_idx = (
+                            parent_history[-1].step_index + 1
+                            if parent_history else branch_step_index
+                        )
+                        # Future plan: next expert steps' frames + actions.
+                        future_entries = [
+                            ExpertCacheEntry(
+                                action_str=fs.get("action_str", ""),
+                                sparse_action=fs.get("sparse_action"),
+                                rationale_kind="",
+                                image=fs.get("image"),
+                            )
+                            for fs in (entry_d.get("future_steps", []) or [])
+                            if fs.get("image") is not None
+                        ]
+                        req = TeacherAnnotateRequest(
+                            episode_id=episode_id,
+                            target_object=entry_d.get("target_object", ""),
+                            target_description=entry_d.get("target_description", ""),
+                            parent_history=parent_history,
+                            branch_step_index=annot_branch_idx,
+                            entries=[ExpertCacheEntry(
+                                action_str=entry_d["action_str"],
+                                sparse_action=entry_d["sparse_action"],
+                                rationale_kind=entry_d.get("rationale_kind", ""),
+                                image=entry_d["image"],
+                            )],
+                            house_id=entry_d.get("house_id", ""),
+                            sub_house_id=entry_d.get("sub_house_id", ""),
+                            future_steps=future_entries,
+                        )
+                        annotated = teacher.annotate_branch(req)
+                        reasoning = (annotated[0].reasoning if annotated else "") or ""
+                        if not reasoning.strip():
+                            logging.warning(
+                                f"[guided] teacher returned empty reasoning for slot {slot_id} "
+                                f"(ep={episode_id}); using placeholder for this step"
+                            )
+                            return _fallback()
+                        text = build_assistant_response_no_summary(
+                            reasoning, entry_d["action_str"],
+                        )
+                        token_ids = tokenizer.encode(text, add_special_tokens=False)
+                        return text, token_ids
+                    except Exception as e:
+                        logging.warning(
+                            f"[guided] teacher annotation failed for slot {slot_id} "
+                            f"(ep={episode_id}): {e!r}; using placeholder for this step"
+                        )
+                        return _fallback()
 
                 teacher_annotate_fn = _annotate
                 logging.info("[guided] teacher mode=server wired via ServerTeacherVLM")
