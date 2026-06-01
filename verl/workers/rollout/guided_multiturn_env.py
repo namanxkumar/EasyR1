@@ -125,6 +125,12 @@ class GuidedConfig:
     # returns an answer, hand off to the student so the answer step is always
     # policy-generated. Mirrors pope-dagger's ``force_expert_answer`` knob.
     force_expert_answer: bool = False
+    # If True, the final iteration of each chain (iter == global_max_iters) is a
+    # *completion* iter: from its branch, the expert forces every remaining step
+    # through the terminal ``<answer/>`` (guaranteed success). Produces the
+    # SFT-only "expert completion" trajectories from the design. With
+    # ``max_iters=2`` this yields one middle-injection iter + one completion iter.
+    completion_final_iter: bool = True
 
 
 @dataclass
@@ -142,6 +148,9 @@ class _IterPlan:
     branch_step_index: int
     # Parent's full ancestry chain extended with this iter's branch.
     branch_chain: list[int] = field(default_factory=list)
+    # When True, ``_build_override_for`` forces the expert from the branch
+    # through the terminal answer (see ``GuidedConfig.completion_final_iter``).
+    is_completion: bool = False
     # ── forced-window runtime state (populated when override hits branch) ──
     progress_resume_target: float | None = None
     forced_window_max_bp: float = 0.0
@@ -223,6 +232,17 @@ class GuidedMultiturnEnvRollout(MultiturnEnvRollout):
         n_per_prompt = max(self.guided_cfg.n_per_prompt, n_trajectories)
 
         t_start = time.time()
+
+        # Sync-mode phase accumulators — the base _run_continuous_episode_loop
+        # increments these per turn. The base generate_trajectories initializes
+        # them per call; this guided override must do the same or the first
+        # `+=` raises AttributeError.
+        self._sync_gen_seconds = 0.0
+        self._sync_env_seconds = 0.0
+        self._sync_prompt_build_seconds = 0.0
+        self._sync_step_total_seconds = 0.0
+        self._sync_n_turns = 0
+
         self.warmup_controllers()
 
         pool_infos = ray.get(
@@ -320,9 +340,15 @@ class GuidedMultiturnEnvRollout(MultiturnEnvRollout):
                 if not eligible_parents:
                     break
 
+                # The final iter of a chain is the "expert completes the
+                # trajectory" pass when completion_final_iter is set.
+                is_completion_iter = (
+                    self.guided_cfg.completion_final_iter
+                    and iter_k == global_max_iters
+                )
                 plans = self._plan_iteration(
                     iter_k, eligible_parents, items_by_group, selector_states,
-                    chain_id=chain_idx,
+                    chain_id=chain_idx, is_completion=is_completion_iter,
                 )
                 if not plans:
                     logger.info(
@@ -435,6 +461,7 @@ class GuidedMultiturnEnvRollout(MultiturnEnvRollout):
         items_by_group: dict[int, dict],
         selector_states: dict[int, Any] | None = None,
         chain_id: int = 0,
+        is_completion: bool = False,
     ) -> dict[int, _IterPlan]:
         """Pick a branch step per eligible parent. Eligibility:
           1. Parent not solved (if stop_on_solved).
@@ -479,7 +506,10 @@ class GuidedMultiturnEnvRollout(MultiturnEnvRollout):
                 continue
             chain = list(parent.branch_chain) + [branch_step]
             plans[group_id] = _IterPlan(
-                parent=parent, branch_step_index=branch_step, branch_chain=chain
+                parent=parent,
+                branch_step_index=branch_step,
+                branch_chain=chain,
+                is_completion=is_completion,
             )
         return plans
 
@@ -564,13 +594,13 @@ class GuidedMultiturnEnvRollout(MultiturnEnvRollout):
                 return None
             text = parent.step_responses[step_idx]
             token_ids = parent.step_response_token_ids[step_idx]
-            # Carry forward the parent's teacher-forced flag for this position
-            # so chained iters preserve mask provenance.
-            was_teacher = (
-                step_idx < len(parent.step_teacher_forced)
-                and parent.step_teacher_forced[step_idx]
-            )
-            return text, list(token_ids), was_teacher
+            # Replayed prefix tokens are *conditioning*, not a fresh sample: they
+            # were sampled on-policy once (in the source rollout) and are replayed
+            # here byte-for-byte. Mask them from the policy gradient (is_teacher=
+            # True) so the expert boost downstream can't leak back into the prefix
+            # and the prefix isn't double-counted; but do NOT SFT them
+            # (is_expert=False) — they are trained exactly once, via their source.
+            return text, list(token_ids), True, False
 
         # ── 2. Open the forced window at branch ──────────────────────────
         if step_idx == branch and plan.progress_resume_target is None:
@@ -580,17 +610,25 @@ class GuidedMultiturnEnvRollout(MultiturnEnvRollout):
             )
             plan.forced_window_max_bp = parent_floor
 
+        # A completion iteration forces the expert all the way through the
+        # terminal ``<answer/>`` from the branch onward (the max-iter "expert
+        # finishes the trajectory" regime). It bypasses the progress-resume
+        # early-stop (3a), the terminal-step handoff (3c), and the answer block
+        # (4a). The forced-step safety cap (3b) still applies as a guard.
+        is_completion = bool(getattr(plan, "is_completion", False))
+
         # ── 3. Termination checks for steps past the first forced step ──
         if step_idx > branch:
             # 3a. Has best-progress-so-far on the new trajectory crossed the
-            # resume target?
-            current_bp = _best_progress_so_far(t)
-            if current_bp > plan.forced_window_max_bp:
-                plan.forced_window_max_bp = current_bp
-            if plan.forced_window_max_bp >= (plan.progress_resume_target or 0.0):
-                return None
+            # resume target? (Skipped for completion iters — force to the end.)
+            if not is_completion:
+                current_bp = _best_progress_so_far(t)
+                if current_bp > plan.forced_window_max_bp:
+                    plan.forced_window_max_bp = current_bp
+                if plan.forced_window_max_bp >= (plan.progress_resume_target or 0.0):
+                    return None
 
-            # 3b. Safety cap on consecutive forced steps.
+            # 3b. Safety cap on consecutive forced steps (applies always).
             cap = self.guided_cfg.max_forced_window_length
             if cap is not None and plan.forced_window_steps_emitted >= cap:
                 return None
@@ -598,8 +636,8 @@ class GuidedMultiturnEnvRollout(MultiturnEnvRollout):
             # 3c. Never force the terminal step — the answer must always come
             # from the student. ``max_depth - 1`` is the last step the rollout
             # will emit; if step_idx is that, hand off so the policy is free
-            # to answer or run past the budget.
-            if step_idx >= self.max_depth - 1:
+            # to answer or run past the budget. (Completion iters DO force it.)
+            if not is_completion and step_idx >= self.max_depth - 1:
                 return None
 
         # ── 4. Query the oracle for the next expert action ──────────────
@@ -608,9 +646,11 @@ class GuidedMultiturnEnvRollout(MultiturnEnvRollout):
         )
 
         # 4a. Never force an ``<answer/>`` — even if the oracle returns one,
-        # let the student make the call.
+        # let the student make the call. (Completion iters DO force the answer,
+        # as does the global force_expert_answer knob.)
         if (
-            not self.guided_cfg.force_expert_answer
+            not is_completion
+            and not self.guided_cfg.force_expert_answer
             and _is_answer_action(expert_action)
         ):
             return None
@@ -625,7 +665,9 @@ class GuidedMultiturnEnvRollout(MultiturnEnvRollout):
             branch_step_index=branch,
         )
         plan.forced_window_steps_emitted += 1
-        return text, list(token_ids), True
+        # Fresh oracle step: mask from PG (is_teacher=True) AND imitate via SFT
+        # (is_expert=True).
+        return text, list(token_ids), True, True
 
     # ── shared pass runner ───────────────────────────────────────────────
 

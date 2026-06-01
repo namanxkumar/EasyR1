@@ -146,6 +146,11 @@ class ActorConfig:
     """temperature for positive tokens"""
     tau_negative: float = 1.05
     """temperature for negative tokens"""
+    sft_coef: float = 0.0
+    """POPE-DAgger SFT/cross-entropy coefficient on fresh-expert (oracle) tokens.
+    0.0 (default) disables the term — vanilla RL. When > 0 and a guided rollout
+    populates ``sft_token_mask``, the expert tokens (already masked from the
+    policy gradient) are imitated via cross-entropy scaled by this coefficient."""
     model: ModelConfig = field(default_factory=ModelConfig)
     optim: OptimConfig = field(default_factory=OptimConfig)
     fsdp: FSDPConfig = field(default_factory=FSDPConfig)

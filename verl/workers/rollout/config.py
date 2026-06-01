@@ -137,9 +137,14 @@ class GuidedRolloutConfig:
     """Pope-Dagger V4 guided rollout knobs.
 
     When ``enabled=True``, ``GuidedMultiturnEnvRollout`` replaces the standard
-    ``MultiturnEnvRollout`` driver. The trainer also flips ``algorithm.adv_estimator``
-    to ``grpo_branching`` automatically (so per-step pairwise-cohort advantages
-    are used instead of group-wide GRPO).
+    ``MultiturnEnvRollout`` driver. The advantage estimator is NOT changed
+    automatically — set ``algorithm.adv_estimator`` explicitly:
+    - ``grpo`` (POPE-DAgger): plain group-wide GRPO. The shared replayed prefix
+      is masked from the policy gradient at the rollout layer (replayed tokens
+      carry ``teacher_token_mask=1``), and fresh-expert tokens are imitated via
+      the SFT term (``actor.sft_coef``).
+    - ``grpo_branching`` (legacy V5): per-step pairwise-cohort advantages that
+      zero out shared-prefix regions via LCP instead of masking.
     """
 
     enabled: bool = False
@@ -155,6 +160,13 @@ class GuidedRolloutConfig:
 
     stop_on_solved: bool = True
     """Stop extending a chain once the parent trajectory succeeded (reward >= 1)."""
+
+    completion_final_iter: bool = True
+    """If True, the final iter of each chain (iter == effective max_iters) forces
+    the expert from its branch through the terminal <answer/> (guaranteed
+    success), producing the SFT-only "expert completion" trajectories. With
+    max_iters=2 → one middle-injection iter + one completion iter (the POPE-DAgger
+    2-iteration design)."""
 
     branch_selection_mode: str = "random_regression"
     """Branch-step selection strategy.

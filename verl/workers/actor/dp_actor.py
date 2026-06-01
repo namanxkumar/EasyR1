@@ -360,6 +360,10 @@ class DataParallelPPOActor(BasePPOActor):
         # policy-gradient denominator by compute_policy_loss when present.
         if "teacher_token_mask" in data.batch.keys():
             select_keys.append("teacher_token_mask")
+        # Fresh-expert tokens (POPE-DAgger guided rollouts) are imitated by the
+        # SFT/cross-entropy term below when sft_coef > 0.
+        if "sft_token_mask" in data.batch.keys():
+            select_keys.append("sft_token_mask")
         select_keys.extend(["old_log_probs", "ref_log_probs", "advantages"])
         non_tensor_select_keys = ["multi_modal_inputs"]
 
@@ -418,6 +422,26 @@ class DataParallelPPOActor(BasePPOActor):
                         metrics["actor/kl_coef"] = self.config.kl_coef
                     else:
                         loss = pg_loss
+
+                    # POPE-DAgger SFT term: cross-entropy on the fresh-expert
+                    # (oracle) tokens. Those tokens are teacher-forced into the
+                    # response, so log_probs at their positions ARE
+                    # log p(expert_token | ctx); -mean = cross-entropy. They are
+                    # excluded from the policy gradient (teacher_token_mask) and
+                    # pulled up by this term instead, making the guided states
+                    # more likely. sft_coef defaults to 0.0 (no-op) for non-guided
+                    # runs and when the mask is absent/all-zero.
+                    sft_token_mask = model_inputs.get("sft_token_mask")
+                    if self.config.sft_coef > 0.0 and sft_token_mask is not None:
+                        sft_loss = -average_loss(
+                            log_probs, sft_token_mask, mode=self.config.loss_avg_mode
+                        )
+                        loss = loss + self.config.sft_coef * sft_loss
+                        metrics["actor/sft_loss"] = sft_loss.detach().item()
+                        metrics["actor/sft_coef"] = self.config.sft_coef
+                        metrics["actor/sft_token_frac"] = (
+                            (sft_token_mask.sum() / (response_mask.sum() + 1e-8)).detach().item()
+                        )
 
                     loss = loss * torch.sum(response_mask) * self.world_size / total_response_tokens
                     loss.backward()

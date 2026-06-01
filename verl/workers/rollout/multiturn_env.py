@@ -200,6 +200,12 @@ class Trajectory:
     # (Pope-Dagger guided rollout) rather than sampled by the student. Aligned
     # 1:1 with step_responses. The downstream loss masks these tokens out.
     step_teacher_forced: list[bool] = field(default_factory=list)
+    # Per-step flag, subset of ``step_teacher_forced``: True only for *fresh
+    # expert* steps emitted this iteration (the oracle's forced action). These
+    # are the tokens the SFT/cross-entropy loss imitates. Replayed-prefix steps
+    # are teacher-forced (masked from PG) but NOT expert (no SFT) — they were
+    # already trained via their source rollout. Aligned 1:1 with step_responses.
+    step_is_expert: list[bool] = field(default_factory=list)
     # Per-step pre-action geodesic distance to the target (from the slot's
     # state_before). Aligned 1:1 with step_responses. Used by the V5
     # random_regression branch selector in GuidedMultiturnEnvRollout to
@@ -224,8 +230,11 @@ class Trajectory:
     branch_chain: list[int] = field(default_factory=list)
     # Single-shot response override consumed by the rollout loop in lieu of
     # calling vLLM. Set by GuidedMultiturnEnvRollout for forced steps; cleared
-    # after the step is recorded. Tuple = (text, token_ids, is_teacher_forced).
-    pending_response_override: "tuple[str, list[int], bool] | None" = None
+    # after the step is recorded.
+    # Tuple = (text, token_ids, is_teacher_forced, is_expert). ``is_teacher_forced``
+    # masks the step from the policy gradient; ``is_expert`` additionally routes
+    # it to the SFT loss (fresh oracle action vs. replayed prefix).
+    pending_response_override: "tuple[str, list[int], bool, bool] | None" = None
 
     # Reward collected immediately upon termination (before slot release)
     reward: float | None = None
@@ -754,6 +763,8 @@ class MultiturnEnvRollout:
             response_token_ids_list: list[list[int]] = [[] for _ in valid]
             response_log_probs_list: list[list[float]] = [[] for _ in valid]
             teacher_forced_list: list[bool] = [False] * len(valid)
+            # Subset of teacher_forced: fresh expert (oracle) steps → SFT targets.
+            is_expert_list: list[bool] = [False] * len(valid)
 
             # vLLM branch
             for vllm_i, (local_i, _t) in enumerate(vllm_valid):
@@ -777,7 +788,11 @@ class MultiturnEnvRollout:
 
             # Override branch (forced / replay)
             for local_i, t in override_valid:
-                ov_text, ov_token_ids, ov_is_teacher = t.pending_response_override
+                ov = t.pending_response_override
+                # Tolerate legacy 3-tuples (text, ids, is_teacher); a 4th entry
+                # is_expert marks fresh oracle steps for the SFT loss.
+                ov_text, ov_token_ids, ov_is_teacher = ov[0], ov[1], ov[2]
+                ov_is_expert = bool(ov[3]) if len(ov) > 3 else False
                 valid_pos = next(
                     j for j, (li, _) in enumerate(valid) if li == local_i
                 )
@@ -785,6 +800,7 @@ class MultiturnEnvRollout:
                 response_token_ids_list[valid_pos] = list(ov_token_ids)
                 response_log_probs_list[valid_pos] = []  # no sampled logprobs
                 teacher_forced_list[valid_pos] = bool(ov_is_teacher)
+                is_expert_list[valid_pos] = ov_is_expert
                 # Consume the override so the next step uses vLLM (unless the
                 # driver sets another override).
                 t.pending_response_override = None
@@ -827,6 +843,7 @@ class MultiturnEnvRollout:
                 t.step_response_token_ids.append(response_token_ids_list[i])
                 t.step_response_log_probs.append(response_log_probs_list[i])
                 t.step_teacher_forced.append(teacher_forced_list[i])
+                t.step_is_expert.append(is_expert_list[i])
                 t.num_steps += 1
 
                 result = step_results[i]
@@ -1941,6 +1958,11 @@ class MultiturnEnvRollout:
         # Dagger forced step), 0 = sampled by student. Downstream the policy
         # loss zeroes out gradient on positions where this is 1.
         teacher_token_mask_full = torch.zeros(bs, seq_len, dtype=torch.float32)
+        # Per-trajectory SFT mask in *full conversation* coords; sliced below.
+        # 1 = fresh expert (oracle) step → imitated by the cross-entropy/SFT loss.
+        # Strict subset of teacher_token_mask (replayed-prefix tokens are teacher-
+        # masked but NOT SFT'd). Zero everywhere for on-policy / non-guided runs.
+        sft_token_mask_full = torch.zeros(bs, seq_len, dtype=torch.float32)
         # Per-trajectory per-step (start, end) token spans, in *response* coords
         # (after split). Populated below alongside the assistant-content range
         # iteration so the branching advantage estimator can broadcast a single
@@ -1974,12 +1996,15 @@ class MultiturnEnvRollout:
             if b < len(trajectories):
                 t = trajectories[b]
                 forced_flags = t.step_teacher_forced or []
+                expert_flags = t.step_is_expert or []
                 for step_idx, (start, end) in enumerate(ranges):
                     # Stash the per-step span in full-coords for later
                     # response-coord conversion (after split).
                     step_token_spans[b].append((start, end))
                     if step_idx < len(forced_flags) and forced_flags[step_idx]:
                         teacher_token_mask_full[b, start : end + 1] = 1.0
+                    if step_idx < len(expert_flags) and expert_flags[step_idx]:
+                        sft_token_mask_full[b, start : end + 1] = 1.0
                     if any_lp and step_idx < len(t.step_response_log_probs):
                         span_len = end - start + 1
                         lp = t.step_response_log_probs[step_idx][:span_len]
@@ -2006,6 +2031,7 @@ class MultiturnEnvRollout:
         response_ids = full_ids[:, split:]
         response_mask_t = response_mask_full[:, split:]
         teacher_token_mask_t = teacher_token_mask_full[:, split:].contiguous()
+        sft_token_mask_t = sft_token_mask_full[:, split:].contiguous()
         # Convert step spans from full-coords to response-coords. Spans whose
         # `start < split` (extremely rare — would mean an assistant turn
         # straddled the split) are clipped at 0; downstream consumers should
@@ -2056,6 +2082,9 @@ class MultiturnEnvRollout:
         # Always emit teacher_token_mask so downstream consumers can rely on
         # the key existing. For on-policy / non-guided runs every entry is 0.
         td_dict["teacher_token_mask"] = teacher_token_mask_t
+        # Always emit sft_token_mask too (all-zero for non-guided runs) so the
+        # actor can rely on the key existing.
+        td_dict["sft_token_mask"] = sft_token_mask_t
         if any_lp:
             # Slice to the response portion to align with old_log_probs shape.
             td_dict["rollout_log_probs"] = rollout_lp_full[:, split:].contiguous()
@@ -2144,9 +2173,10 @@ class ObjectNavEnvAdapter:
         self.max_observations = max_observations
         self.context_mode = context_mode
         self.past_k_steps = past_k_steps
-        if reward_mode not in ("continuous", "bimodal", "success"):
+        if reward_mode not in ("continuous", "bimodal", "bimodal_noprogress", "success"):
             raise ValueError(
-                f"reward_mode must be 'continuous', 'bimodal', or 'success', got {reward_mode!r}"
+                "reward_mode must be 'continuous', 'bimodal', 'bimodal_noprogress', "
+                f"or 'success', got {reward_mode!r}"
             )
         self.reward_mode = reward_mode
 
@@ -2575,6 +2605,22 @@ class ObjectNavEnvAdapter:
                 else:
                     progress = 0.0
                 reward += 0.25 * progress
+        elif self.reward_mode == "bimodal_noprogress":
+            #   0.875 * success + 0.125 * fmt        (answer-gated; NO progress term)
+            # Identical to 'bimodal' minus the 0.25 * normalized_net_progress shaping.
+            # Used by the POPE-DAgger runs (and its vanilla-GRPO comparison anchor) so
+            # the reward is a clean success+format signal — progress shaping is dropped
+            # because the expert-guided branches already manufacture progress, which
+            # would otherwise double-credit the guided trajectories.
+            if not self.answer_issued:
+                progress = None
+                reward = 0.0
+            else:
+                reward = 0.0
+                if self.success:
+                    reward += 0.875
+                reward += 0.125 * avg_fmt
+                progress = None
         else:
             # Continuous distance progress: graded credit even on failed trajectories.
             if self.initial_distance and self.initial_distance > 0.1:

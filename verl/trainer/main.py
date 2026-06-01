@@ -222,6 +222,7 @@ def _create_multiturn_rollout(config: PPOConfig, tokenizer, processor):
             max_iters=guided_cfg.max_iters,
             n_per_prompt=guided_cfg.n_per_prompt,
             stop_on_solved=guided_cfg.stop_on_solved,
+            completion_final_iter=guided_cfg.completion_final_iter,
             branch_selection_mode=guided_cfg.branch_selection_mode,
             random_regression_seed=guided_cfg.random_regression_seed,
         )
