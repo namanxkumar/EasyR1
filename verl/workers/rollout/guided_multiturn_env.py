@@ -40,6 +40,7 @@ from __future__ import annotations
 import logging
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Protocol
 
@@ -53,6 +54,24 @@ logger = logging.getLogger(__name__)
 
 
 # ─── strategy hooks ────────────────────────────────────────────────────────
+
+
+class _PendingAnnotation:
+    """Deferred teacher-VLM annotation for one forced expert step.
+
+    ``_build_override_for`` returns this (instead of calling the blocking
+    ``teacher_annotate_fn`` inline) when a forced step needs teacher reasoning.
+    The ``pre_step`` hook collects all of a step's pending annotations across
+    the iteration's concurrently-active trajectories (up to one per eligible
+    group) and fans the calls out on a thread pool, so the vLLM teacher server
+    batches the inflight HTTP requests instead of serializing them one
+    trajectory at a time. ``kwargs`` are the ``teacher_annotate_fn`` arguments.
+    """
+
+    __slots__ = ("kwargs",)
+
+    def __init__(self, kwargs: dict):
+        self.kwargs = kwargs
 
 
 class ExpertActionFn(Protocol):
@@ -665,19 +684,23 @@ class GuidedMultiturnEnvRollout(MultiturnEnvRollout):
         ):
             return None
 
-        # ── 5. Annotate and emit the forced step ────────────────────────
-        text, token_ids = self.teacher_annotate_fn(
+        # ── 5. Defer the teacher annotation for this forced step ────────
+        # The (blocking, HTTP) teacher_annotate_fn call is NOT made here — it is
+        # deferred to the pre_step hook, which runs all of a step's annotations
+        # concurrently (vLLM batches them) instead of serializing one trajectory
+        # at a time. The forced-window counter is incremented now (serial decide
+        # phase) so step 3b's cap check stays consistent. The pre_step hook
+        # turns the returned _PendingAnnotation into the final
+        # (text, token_ids, is_teacher=True, is_expert=True) override.
+        plan.forced_window_steps_emitted += 1
+        return _PendingAnnotation(dict(
             pool=t.pool,
             slot_id=t.slot_id,
             episode_id=t.episode_id,
             expert_action_formatted=expert_action,
             parent=parent,
             branch_step_index=branch,
-        )
-        plan.forced_window_steps_emitted += 1
-        # Fresh oracle step: mask from PG (is_teacher=True) AND imitate via SFT
-        # (is_expert=True).
-        return text, list(token_ids), True, True
+        ))
 
     # ── shared pass runner ───────────────────────────────────────────────
 
@@ -757,7 +780,17 @@ class GuidedMultiturnEnvRollout(MultiturnEnvRollout):
         """
         provider = self._override_provider
 
+        annotate_fn = self.teacher_annotate_fn
+        max_workers = max(1, int(getattr(self.guided_cfg, "teacher_max_workers", 1) or 1))
+
         def pre_step(active_now: list[Trajectory]) -> None:
+            # Decide phase (serial, cheap): resolve each active trajectory's
+            # override. Cheap cases (prefix replay / no-override) are applied
+            # immediately; forced steps that need a teacher annotation come back
+            # as _PendingAnnotation and are batched below. All plan-state
+            # mutations happen here (single-threaded), so only the stateless
+            # teacher HTTP calls run concurrently.
+            pending: list[tuple[Trajectory, _PendingAnnotation]] = []
             for t in active_now:
                 if t.terminated:
                     continue
@@ -770,8 +803,36 @@ class GuidedMultiturnEnvRollout(MultiturnEnvRollout):
                 if provider is None:
                     continue
                 ov = provider(t)
-                if ov is not None:
+                if ov is None:
+                    continue
+                if isinstance(ov, _PendingAnnotation):
+                    pending.append((t, ov))
+                else:
                     t.pending_response_override = ov
+
+            if not pending:
+                return
+
+            # Annotate phase (parallel): fan the deferred teacher calls out so
+            # the vLLM teacher server batches the concurrent requests. Without
+            # this, a step's N forced annotations run serially (each a slow 32B
+            # call), stalling the whole rollout loop and idling the simulators.
+            def _run(item: tuple[Trajectory, _PendingAnnotation]):
+                t, pend = item
+                text, token_ids = annotate_fn(**pend.kwargs)
+                return t, text, token_ids
+
+            if len(pending) == 1:
+                t, text, token_ids = _run(pending[0])
+                t.pending_response_override = (text, list(token_ids), True, True)
+                return
+
+            with ThreadPoolExecutor(max_workers=min(len(pending), max_workers)) as ex:
+                for fut in as_completed([ex.submit(_run, item) for item in pending]):
+                    t, text, token_ids = fut.result()
+                    # Fresh oracle step: mask from PG (is_teacher=True) AND
+                    # imitate via SFT (is_expert=True).
+                    t.pending_response_override = (text, list(token_ids), True, True)
 
         self._pre_step_hook = pre_step
         try:
