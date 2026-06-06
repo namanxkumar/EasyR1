@@ -717,11 +717,29 @@ class SimulatorPool:
         sh = getattr(adapter, "state_history", None)
 
         # Before-observation: the frame the agent currently sees (pre-step).
+        # The head state's observation can be None when the previous step was a
+        # no-op / env error: ``ObjectNavEnvAdapter.step`` appends an error_state
+        # with ``observation=None`` (e.g. a ground action the navmesh refused
+        # from the branch pose). On a no-op the agent never moved, so the most
+        # recent non-None observation in the history *is* the current view — fall
+        # back to it instead of returning image=None (which would force the
+        # teacher onto the generic placeholder annotator and lose real reasoning).
         image = None
         try:
-            obs = getattr(sh.get_last_state(), "observation", None) if sh is not None else None
+            obs = None
+            if sh is not None:
+                for _act, _state in reversed(sh.to_list()):
+                    o = getattr(_state, "observation", None)
+                    if o is not None:
+                        obs = o
+                        break
             if obs is not None:
                 image = np.ascontiguousarray(np.asarray(obs))
+            else:
+                logger.warning(
+                    f"Slot {slot_id}: no non-None observation in state_history; "
+                    f"teacher before-image unavailable"
+                )
         except Exception as e:
             logger.warning(f"Slot {slot_id}: could not read before-observation: {e!r}")
 
