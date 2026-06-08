@@ -1010,6 +1010,71 @@ class MultiturnEnvRollout:
                         t.last_prompt = messages
                         t.last_images = list(images or [])
 
+                    # ── Guided override hook (forced / prefix-replay step) ──
+                    # Mirrors the sync ``_pre_step_hook``: a guided subclass sets
+                    # ``self._async_pre_step`` to an async callable that resolves
+                    # this trajectory's override. It runs the (blocking) oracle
+                    # decide + teacher-VLM annotate in a bounded executor so the
+                    # event loop keeps driving every other trajectory's vLLM gen
+                    # + env steps concurrently. Returns a 4-tuple
+                    # ``(text, token_ids, is_teacher, is_expert)`` or None.
+                    override = None
+                    async_pre = getattr(self, "_async_pre_step", None)
+                    if async_pre is not None:
+                        try:
+                            override = await async_pre(t)
+                        except Exception as e:
+                            logger.warning(
+                                f"  [async grp {t.group_id}/{t.n_idx}] override "
+                                f"hook failed: {e}. Falling back to vLLM."
+                            )
+                            override = None
+
+                    if override is not None:
+                        ov_text = override[0]
+                        ov_token_ids = list(override[1])
+                        ov_is_teacher = bool(override[2])
+                        ov_is_expert = bool(override[3]) if len(override) > 3 else False
+                        prompt_ms = (time.time() - t_phase_start) * 1000.0
+                        # Forced/replay tokens are injected, not sampled: no fresh
+                        # log-probs. Flags drive the PG mask (teacher) + SFT mask
+                        # (expert) in _build_final_batch_multiturn.
+                        t.step_responses.append(ov_text)
+                        t.step_response_token_ids.append(ov_token_ids)
+                        t.step_response_log_probs.append([])
+                        t.step_teacher_forced.append(ov_is_teacher)
+                        t.step_is_expert.append(ov_is_expert)
+                        t.num_steps += 1
+                        t_env_start = time.time()
+                        try:
+                            reward, terminated, info = await t.pool.step_env.remote(
+                                t.slot_id, ov_text
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                f"  [async grp {t.group_id}/{t.n_idx}] step_env "
+                                f"(forced) failed: {e}. Terminating."
+                            )
+                            t.terminated = True
+                            t.step_distances.append(None)
+                            break
+                        t.step_distances.append(info.get("dist_before"))
+                        t.step_phase_times.append({
+                            "prompt_ms": prompt_ms,
+                            "gen_ms": 0.0,
+                            "env_ms": (time.time() - t_env_start) * 1000.0,
+                        })
+                        if terminated:
+                            if self.force_max_depth and t.num_steps < self.max_depth:
+                                logger.info(
+                                    f"  [async grp {t.group_id}/{t.n_idx}] "
+                                    f"force_max_depth: ignoring env termination at "
+                                    f"step {t.num_steps}/{self.max_depth}"
+                                )
+                            else:
+                                t.terminated = True
+                        continue
+
                     # Tokenize this single prompt; reuse the batch helper with a
                     # 1-element list to keep packed-MROPE + image-truncation
                     # logic identical to the sync path.
@@ -1096,6 +1161,11 @@ class MultiturnEnvRollout:
                     t.step_responses.append(text)
                     t.step_response_token_ids.append(list(result.token_ids))
                     t.step_response_log_probs.append(list(result.logprobs) if result.logprobs is not None else [])
+                    # On-policy student step: not teacher-forced, not an SFT
+                    # target. Keep the flag lists 1:1 with step_responses so
+                    # _build_final_batch_multiturn's mask slicing stays aligned.
+                    t.step_teacher_forced.append(False)
+                    t.step_is_expert.append(False)
                     t.num_steps += 1
 
                     try:

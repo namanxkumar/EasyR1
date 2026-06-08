@@ -37,6 +37,7 @@ consumes.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections import deque
@@ -747,15 +748,32 @@ class GuidedMultiturnEnvRollout(MultiturnEnvRollout):
         # by hooking into the loop via a temporary subclass-style attribute.
         self._override_provider = override_provider
 
+        async_mode = bool(getattr(config.worker.rollout, "async_mode", False))
         try:
-            self._run_continuous_episode_loop_with_overrides(
-                active, all_trajs, pending_queue,
-                actor_rollout_ref_wg, config,
-                override_config=override_config,
-                dagger_iter_index=dagger_iter_index,
-                branch_chain=branch_chain,
-                chain_id=chain_id,
-            )
+            if async_mode:
+                # Per-trajectory async: every trajectory in this pass runs as
+                # its own coroutine, so vLLM continuous batching overlaps with
+                # env steps and teacher annotations across the whole pass
+                # (no per-step lockstep barrier). Override decide + teacher
+                # calls run in a bounded executor off the event loop.
+                self._run_async_episode_loop_with_overrides(
+                    active, all_trajs, pending_queue,
+                    actor_rollout_ref_wg, config,
+                    override_config=override_config,
+                    total_slots=total_slots,
+                    dagger_iter_index=dagger_iter_index,
+                    branch_chain=branch_chain,
+                    chain_id=chain_id,
+                )
+            else:
+                self._run_continuous_episode_loop_with_overrides(
+                    active, all_trajs, pending_queue,
+                    actor_rollout_ref_wg, config,
+                    override_config=override_config,
+                    dagger_iter_index=dagger_iter_index,
+                    branch_chain=branch_chain,
+                    chain_id=chain_id,
+                )
         finally:
             self._override_provider = None
 
@@ -843,6 +861,92 @@ class GuidedMultiturnEnvRollout(MultiturnEnvRollout):
             )
         finally:
             self._pre_step_hook = None
+
+    def _run_async_episode_loop_with_overrides(
+        self,
+        active: list[Trajectory],
+        all_trajectories: list[Trajectory],
+        pending_queue,
+        actor_rollout_ref_wg,
+        config,
+        override_config: dict[str, Any] | None,
+        total_slots: int,
+        dagger_iter_index: int,
+        branch_chain: Optional[list[int]],
+        chain_id: int = 0,
+    ) -> None:
+        """Async counterpart of ``_run_continuous_episode_loop_with_overrides``.
+
+        Installs ``_async_pre_step``, a per-trajectory async hook the base
+        ``_run_async_episode_loop`` awaits before each step. The hook resolves
+        the override for one trajectory: cheap cases (prefix replay / no
+        override) and the blocking oracle decide + teacher-VLM annotate all run
+        inside a bounded ``ThreadPoolExecutor`` via ``run_in_executor`` so the
+        event loop keeps every other trajectory's vLLM generation and env steps
+        in flight. Each pass runs at most one trajectory per group/plan, so the
+        plan-state mutations inside ``_build_override_for`` never race.
+        """
+        provider = self._override_provider
+
+        # Baseline (on-policy) pass: no overrides → run the plain async loop and
+        # skip the per-step executor round-trip entirely. dagger metadata for
+        # these trajectories is stamped by ``generate_trajectories`` post-pass.
+        if provider is None:
+            asyncio.run(
+                self._run_async_episode_loop(
+                    active, all_trajectories, pending_queue,
+                    actor_rollout_ref_wg, config,
+                    total_slots=total_slots,
+                    override_config=override_config,
+                )
+            )
+            return
+
+        annotate_fn = self.teacher_annotate_fn
+        max_workers = max(1, int(getattr(self.guided_cfg, "teacher_max_workers", 1) or 1))
+
+        def _decide_and_annotate(t: Trajectory):
+            # Runs in an executor thread. Re-stamp dagger metadata first (a
+            # trajectory refilled from the pending queue mid-pass carries none
+            # yet) — matches the sync pre_step hook. ``provider`` is the only
+            # plan-state mutator and there is one trajectory per plan, so this
+            # is race-free across the concurrent executor threads.
+            t.dagger_iter_index = dagger_iter_index
+            t.chain_id = chain_id
+            if branch_chain is not None:
+                t.branch_chain = list(branch_chain)
+            ov = provider(t)
+            if ov is None:
+                return None
+            if isinstance(ov, _PendingAnnotation):
+                text, token_ids = annotate_fn(**ov.kwargs)
+                # Fresh oracle step: mask from PG (is_teacher) AND imitate via
+                # SFT (is_expert).
+                return (text, list(token_ids), True, True)
+            # Prefix-replay 4-tuple (text, token_ids, is_teacher, is_expert).
+            return ov
+
+        executor = ThreadPoolExecutor(max_workers=max_workers)
+
+        async def async_pre_step(t: Trajectory):
+            if t.terminated:
+                return None
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(executor, _decide_and_annotate, t)
+
+        self._async_pre_step = async_pre_step
+        try:
+            asyncio.run(
+                self._run_async_episode_loop(
+                    active, all_trajectories, pending_queue,
+                    actor_rollout_ref_wg, config,
+                    total_slots=total_slots,
+                    override_config=override_config,
+                )
+            )
+        finally:
+            self._async_pre_step = None
+            executor.shutdown(wait=True)
 
 # ─── helpers ───────────────────────────────────────────────────────────────
 
