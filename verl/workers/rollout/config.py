@@ -209,6 +209,21 @@ class GuidedRolloutConfig:
     teacher_max_workers: int = 16
     """Thread-pool fan-out width for batched teacher annotation."""
 
+    concurrent_chains_per_group: int = 2
+    """Flat-async orchestration only: how many independent chains of one group
+    may run concurrently. Chains are independent (each starts with a fresh
+    on-policy baseline), so >1 shortens a group's critical path (a group
+    needing n=8 trajectories at ~3 trajs/chain runs ~3 chains; sequential
+    chains serialize ~8 trajectory executions, 2 concurrent chains halve
+    that). Capped implicitly by simulator slots via the shared semaphore."""
+
+    exclude_fully_forced_from_group: bool = True
+    """Route fully-forced trajectories (every step teacher-injected, e.g. the
+    completion iter — zero student tokens) to a shared out-of-group GRPO uid.
+    They are pure SFT carriers: their (usually 1.0) rewards would otherwise
+    inflate the group mean and depress every on-policy sibling's advantage
+    while contributing zero policy gradient themselves."""
+
 
 @dataclass
 class RolloutConfig:

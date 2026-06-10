@@ -244,6 +244,13 @@ class Trajectory:
     last_prompt: list[dict] | None = None
     last_images: list[Any] = field(default_factory=list)
 
+    # Per-step prompt/images, captured each step in ``summary_context`` mode so
+    # the final batch can emit one independent single-turn training sample PER
+    # STEP (the summary-context architecture). Aligned 1:1 with step_responses.
+    # Left empty (and unused) in multi_turn / single_turn modes.
+    step_prompts: list[list[dict]] = field(default_factory=list)
+    step_images_list: list[list[Any]] = field(default_factory=list)
+
     # Per-step phase timings (async rollout instrumentation). Each entry:
     # {"prompt_ms": float, "gen_ms": float, "env_ms": float}. Empty when
     # rollout runs in the synchronous lockstep mode.
@@ -251,6 +258,11 @@ class Trajectory:
     # Wall-clock window of the trajectory's coroutine (for concurrency stats).
     traj_start_ts: float | None = None
     traj_end_ts: float | None = None
+    # Per-trajectory async override hook (guided flat orchestration). When set,
+    # ``_async_run_traj`` awaits it before each step instead of the instance-
+    # level ``self._async_pre_step``; lets trajectories with different override
+    # providers (baseline vs. iter-k of different chains) share one event loop.
+    async_pre_step_fn: Any = field(default=None, repr=False)
 
 
 # ---------------------------------------------------------------------------
@@ -396,6 +408,13 @@ class MultiturnEnvRollout:
         self._sync_step_total_seconds = 0.0
         self._sync_n_turns = 0
 
+        # Per-step prompt/response token lengths captured DURING rollout
+        # (summary_context), so the length distributions are visible before the
+        # expensive post-rollout phases (old/ref/adv/update) — lets us kill early
+        # when right-sizing data.max_prompt_length / max_response_length.
+        self._sumctx_prompt_lens = []
+        self._sumctx_resp_lens = []
+
         # Pre-collect all dataset items (ensures deterministic ordering)
         all_items = []
         for _ in range(batch_size):
@@ -488,6 +507,30 @@ class MultiturnEnvRollout:
             f"avg_steps={avg_steps:.1f} | avg_reward={avg_reward:.3f}"
         )
 
+        # Prompt-length distribution for this rollout (summary_context) — printed
+        # right after the rollout, BEFORE old/ref/adv/update, so we can read it and
+        # kill early when right-sizing data.max_prompt_length.
+        pls = getattr(self, "_sumctx_prompt_lens", [])
+        if pls:
+            ss = sorted(pls)
+            logger.info(
+                f"[sumctx] ROLLOUT prompt_tok dist (n={len(ss)}): "
+                f"min={ss[0]} p50={ss[len(ss)//2]} "
+                f"p95={ss[min(len(ss)-1, int(len(ss)*0.95))]} "
+                f"p99={ss[min(len(ss)-1, int(len(ss)*0.99))]} max={ss[-1]} "
+                f"(cap={self.max_prompt_length}, max_response_length={self.max_response_length})"
+            )
+        rls = getattr(self, "_sumctx_resp_lens", [])
+        if rls:
+            rs = sorted(rls)
+            logger.info(
+                f"[sumctx] ROLLOUT response_tok dist (n={len(rs)}): "
+                f"min={rs[0]} p50={rs[len(rs)//2]} "
+                f"p95={rs[min(len(rs)-1, int(len(rs)*0.95))]} "
+                f"p99={rs[min(len(rs)-1, int(len(rs)*0.99))]} max={rs[-1]} "
+                f"(max_response_length={self.max_response_length})"
+            )
+
         logger.info(f"[mem] before destroy_controllers: RSS={_get_rss_mb():.0f}MB")
 
         # ── Free GPU memory for training ──
@@ -528,6 +571,8 @@ class MultiturnEnvRollout:
             t.step_responses.clear()
             t.step_response_token_ids.clear()
             t.step_response_log_probs.clear()
+            t.step_prompts.clear()
+            t.step_images_list.clear()
         all_trajectories.clear()
 
         _force_free_memory()
@@ -845,6 +890,12 @@ class MultiturnEnvRollout:
                 t.step_teacher_forced.append(teacher_forced_list[i])
                 t.step_is_expert.append(is_expert_list[i])
                 t.num_steps += 1
+                # summary_context trains one sample per step: stash this step's
+                # exact prompt/images (just set into last_prompt above) aligned
+                # 1:1 with step_responses for _build_final_batch_summary_context.
+                if self.context_mode == "summary_context":
+                    t.step_prompts.append(t.last_prompt)
+                    t.step_images_list.append(list(t.last_images))
 
                 result = step_results[i]
                 if isinstance(result, Exception):
@@ -964,11 +1015,8 @@ class MultiturnEnvRollout:
             )
         n_engines = n_workers // tp_size
 
-        # Counters used as round-robin assignments and for logging.
+        # Round-robin engine assignment counter.
         _engine_counter = {"i": 0}
-        _running = {"n": 0}
-        _completed = {"n": 0}
-        _failed_steps = {"n": 0}
 
         def _next_engine_ranks() -> list[int]:
             """Round-robin next engine, return its `tp_size` Ray worker ranks."""
@@ -979,247 +1027,13 @@ class MultiturnEnvRollout:
 
         t_start = time.time()
 
-        async def run_traj(t: Trajectory) -> Trajectory:
-            tp_ranks = _next_engine_ranks()
-            _running["n"] += 1
-            t.traj_start_ts = time.time()
-            try:
-                while not t.terminated and t.num_steps < self.max_depth:
-                    use_full = self.past_k_steps is not None
-                    t_phase_start = time.time()
-                    try:
-                        if use_full:
-                            messages, images, full_messages, full_images = (
-                                await t.pool.build_prompt_with_full.remote(t.slot_id)
-                            )
-                        else:
-                            messages, images = await t.pool.build_prompt.remote(t.slot_id)
-                            full_messages, full_images = None, None
-                    except Exception as e:
-                        logger.warning(
-                            f"  [async grp {t.group_id}/{t.n_idx}] build_prompt failed: {e}. Terminating."
-                        )
-                        t.terminated = True
-                        break
+        counters = {"running": 0, "completed": 0, "failed_steps": 0}
 
-                    # Cache for final batch (full trajectory when past_k is on).
-                    if use_full:
-                        t.last_prompt = full_messages
-                        t.last_images = list(full_images or [])
-                    else:
-                        t.last_prompt = messages
-                        t.last_images = list(images or [])
-
-                    # ── Guided override hook (forced / prefix-replay step) ──
-                    # Mirrors the sync ``_pre_step_hook``: a guided subclass sets
-                    # ``self._async_pre_step`` to an async callable that resolves
-                    # this trajectory's override. It runs the (blocking) oracle
-                    # decide + teacher-VLM annotate in a bounded executor so the
-                    # event loop keeps driving every other trajectory's vLLM gen
-                    # + env steps concurrently. Returns a 4-tuple
-                    # ``(text, token_ids, is_teacher, is_expert)`` or None.
-                    override = None
-                    async_pre = getattr(self, "_async_pre_step", None)
-                    if async_pre is not None:
-                        try:
-                            override = await async_pre(t)
-                        except Exception as e:
-                            logger.warning(
-                                f"  [async grp {t.group_id}/{t.n_idx}] override "
-                                f"hook failed: {e}. Falling back to vLLM."
-                            )
-                            override = None
-
-                    if override is not None:
-                        ov_text = override[0]
-                        ov_token_ids = list(override[1])
-                        ov_is_teacher = bool(override[2])
-                        ov_is_expert = bool(override[3]) if len(override) > 3 else False
-                        prompt_ms = (time.time() - t_phase_start) * 1000.0
-                        # Forced/replay tokens are injected, not sampled: no fresh
-                        # log-probs. Flags drive the PG mask (teacher) + SFT mask
-                        # (expert) in _build_final_batch_multiturn.
-                        t.step_responses.append(ov_text)
-                        t.step_response_token_ids.append(ov_token_ids)
-                        t.step_response_log_probs.append([])
-                        t.step_teacher_forced.append(ov_is_teacher)
-                        t.step_is_expert.append(ov_is_expert)
-                        t.num_steps += 1
-                        t_env_start = time.time()
-                        try:
-                            reward, terminated, info = await t.pool.step_env.remote(
-                                t.slot_id, ov_text
-                            )
-                        except Exception as e:
-                            logger.warning(
-                                f"  [async grp {t.group_id}/{t.n_idx}] step_env "
-                                f"(forced) failed: {e}. Terminating."
-                            )
-                            t.terminated = True
-                            t.step_distances.append(None)
-                            break
-                        t.step_distances.append(info.get("dist_before"))
-                        t.step_phase_times.append({
-                            "prompt_ms": prompt_ms,
-                            "gen_ms": 0.0,
-                            "env_ms": (time.time() - t_env_start) * 1000.0,
-                        })
-                        if terminated:
-                            if self.force_max_depth and t.num_steps < self.max_depth:
-                                logger.info(
-                                    f"  [async grp {t.group_id}/{t.n_idx}] "
-                                    f"force_max_depth: ignoring env termination at "
-                                    f"step {t.num_steps}/{self.max_depth}"
-                                )
-                            else:
-                                t.terminated = True
-                        continue
-
-                    # Tokenize this single prompt; reuse the batch helper with a
-                    # 1-element list to keep packed-MROPE + image-truncation
-                    # logic identical to the sync path.
-                    try:
-                        tokenized = self._tokenize_prompts(
-                            [messages],
-                            [images],
-                            for_generation=True,
-                            full_prompts=[full_messages] if use_full else None,
-                            full_images_list=[full_images] if use_full else None,
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            f"  [async grp {t.group_id}/{t.n_idx}] tokenize failed: {e}. Terminating."
-                        )
-                        t.terminated = True
-                        break
-
-                    raw_prompt_ids = list(tokenized["raw_prompt_ids"][0])
-                    raw_images = tokenized["raw_images"][0]
-                    packed_override = None
-                    if "packed_mrope_overrides" in tokenized:
-                        packed_override = tokenized["packed_mrope_overrides"][0]
-
-                    # vLLM expects the multi-modal dict shape that
-                    # `_process_multi_modal_data` produces (`{"image": [...]}`)
-                    # so the rollout side doesn't need to know about it again.
-                    mm_data = {"images": raw_images} if raw_images else None
-
-                    sampling_overrides: dict[str, Any] = {
-                        # Multiturn always samples 1 response per step. The
-                        # group-of-n enumeration happens at the trajectory level
-                        # (n_trajectories items in the pending queue), not via
-                        # vLLM's `n` parameter.
-                        "n": 1,
-                        "temperature": config.worker.rollout.temperature,
-                        "top_p": config.worker.rollout.top_p,
-                    }
-                    rollout_top_k = getattr(config.worker.rollout, "top_k", -1)
-                    if rollout_top_k != -1:
-                        sampling_overrides["top_k"] = rollout_top_k
-                    if override_config:
-                        for k in ("temperature", "top_p", "top_k"):
-                            if k in override_config:
-                                sampling_overrides[k] = override_config[k]
-
-                    request_id = f"async-{t.episode_id}-step{t.num_steps}-{uuid.uuid4().hex[:6]}"
-                    t_gen_start = time.time()
-                    prompt_ms = (t_gen_start - t_phase_start) * 1000.0
-                    try:
-                        # Fan out the request to every TP rank of the chosen
-                        # engine. The lockstep router in `vllm_rollout_spmd.py`
-                        # requires every rank's inbox to receive the payload
-                        # so all ranks can call add_request in lockstep. All
-                        # ranks compute identical outputs (sampler is
-                        # TP-replicated with same seed), so we use rank 0's
-                        # result and discard the rest.
-                        remote_calls = [
-                            actor_rollout_ref_wg.workers[r].actor_rollout_ref_generate_one_async.remote(
-                                request_id=request_id,
-                                prompt_token_ids=raw_prompt_ids,
-                                multi_modal_data=mm_data,
-                                sampling_overrides=sampling_overrides,
-                                packed_mrope_override=packed_override,
-                                min_pixels=self.min_pixels,
-                                max_pixels=self.max_pixels,
-                                video_fps=getattr(config.data, "video_fps", 2.0),
-                            )
-                            for r in tp_ranks
-                        ]
-                        results = await asyncio.gather(*remote_calls)
-                        result = results[0]
-                    except Exception as e:
-                        logger.warning(
-                            f"  [async grp {t.group_id}/{t.n_idx}] generate_one_async failed: {e}. Terminating."
-                        )
-                        t.terminated = True
-                        _failed_steps["n"] += 1
-                        break
-
-                    t_gen_done = time.time()
-                    gen_ms = (t_gen_done - t_gen_start) * 1000.0
-                    text = self.tokenizer.decode(result.token_ids, skip_special_tokens=True)
-                    t.step_responses.append(text)
-                    t.step_response_token_ids.append(list(result.token_ids))
-                    t.step_response_log_probs.append(list(result.logprobs) if result.logprobs is not None else [])
-                    # On-policy student step: not teacher-forced, not an SFT
-                    # target. Keep the flag lists 1:1 with step_responses so
-                    # _build_final_batch_multiturn's mask slicing stays aligned.
-                    t.step_teacher_forced.append(False)
-                    t.step_is_expert.append(False)
-                    t.num_steps += 1
-
-                    try:
-                        reward, terminated, info = await t.pool.step_env.remote(t.slot_id, text)
-                    except Exception as e:
-                        logger.warning(
-                            f"  [async grp {t.group_id}/{t.n_idx}] step_env failed: {e}. Terminating."
-                        )
-                        t.terminated = True
-                        t.step_distances.append(None)
-                        break
-                    t.step_distances.append(info.get("dist_before"))
-
-                    env_ms = (time.time() - t_gen_done) * 1000.0
-                    t.step_phase_times.append({
-                        "prompt_ms": prompt_ms,
-                        "gen_ms": gen_ms,
-                        "env_ms": env_ms,
-                    })
-
-                    if terminated:
-                        if self.force_max_depth and t.num_steps < self.max_depth:
-                            logger.info(
-                                f"  [async grp {t.group_id}/{t.n_idx}] force_max_depth: "
-                                f"ignoring env termination at step {t.num_steps}/{self.max_depth}"
-                            )
-                        else:
-                            t.terminated = True
-
-                # Trajectory finished (terminated or hit max_depth). Collect
-                # reward + ground truth, then release the slot.
-                try:
-                    t.reward = float(await t.pool.get_trajectory_reward.remote(t.slot_id))
-                except Exception as e:
-                    logger.warning(
-                        f"  [async grp {t.group_id}/{t.n_idx}] get_trajectory_reward failed: {e}. Using 0.0."
-                    )
-                    t.reward = 0.0
-                try:
-                    t.ground_truth = await t.pool.get_ground_truth.remote(t.slot_id)
-                except Exception as e:
-                    logger.warning(
-                        f"  [async grp {t.group_id}/{t.n_idx}] get_ground_truth failed: {e}."
-                    )
-                    t.ground_truth = "{}"
-                try:
-                    await t.pool.release_env.remote(t.slot_id)
-                except Exception:
-                    pass
-                _completed["n"] += 1
-                t.traj_end_ts = time.time()
-                return t
-            finally:
-                _running["n"] -= 1
+        def run_traj(t: Trajectory):
+            return self._async_run_traj(
+                t, _next_engine_ranks(), actor_rollout_ref_wg, config,
+                override_config, counters,
+            )
 
         # Schedule the initial set of trajectories and refill from
         # pending_queue as slots open up. The total number of in-flight
@@ -1265,10 +1079,10 @@ class MultiturnEnvRollout:
             while True:
                 await asyncio.sleep(15.0)
                 logger.info(
-                    f"  [async] running={_running['n']} "
-                    f"completed={_completed['n']} "
+                    f"  [async] running={counters['running']} "
+                    f"completed={counters['completed']} "
                     f"pending={len(pending_queue)} "
-                    f"failed_steps={_failed_steps['n']} "
+                    f"failed_steps={counters['failed_steps']} "
                     f"elapsed={time.time() - t_start:.0f}s "
                     f"RSS={_get_rss_mb():.0f}MB"
                 )
@@ -1284,10 +1098,303 @@ class MultiturnEnvRollout:
                 pass
 
         logger.info(
-            f"  [async] DONE completed={_completed['n']} "
-            f"failed_steps={_failed_steps['n']} "
+            f"  [async] DONE completed={counters['completed']} "
+            f"failed_steps={counters['failed_steps']} "
             f"elapsed={time.time() - t_start:.1f}s"
         )
+
+    async def _async_run_traj(
+        self,
+        t: "Trajectory",
+        tp_ranks: list[int],
+        actor_rollout_ref_wg,
+        config,
+        override_config: dict[str, Any] | None,
+        counters: dict[str, int],
+    ) -> "Trajectory":
+        """Run ONE trajectory to completion as a coroutine (the unit the
+        async scheduler — and the guided flat orchestrator — compose).
+
+        ``counters`` keys: running / completed / failed_steps (mutated in
+        place; safe — single event loop). Per-trajectory override hook:
+        ``t.async_pre_step_fn`` (preferred) or the instance-level
+        ``self._async_pre_step`` fallback used by the per-pass wrapper.
+        """
+        counters["running"] += 1
+        t.traj_start_ts = time.time()
+        try:
+            while not t.terminated and t.num_steps < self.max_depth:
+                use_full = self.past_k_steps is not None
+                t_phase_start = time.time()
+                try:
+                    if use_full:
+                        messages, images, full_messages, full_images = (
+                            await t.pool.build_prompt_with_full.remote(t.slot_id)
+                        )
+                    else:
+                        messages, images = await t.pool.build_prompt.remote(t.slot_id)
+                        full_messages, full_images = None, None
+                except Exception as e:
+                    logger.warning(
+                        f"  [async grp {t.group_id}/{t.n_idx}] build_prompt failed: {e}. Terminating."
+                    )
+                    t.terminated = True
+                    break
+
+                # Cache for final batch (full trajectory when past_k is on).
+                if use_full:
+                    t.last_prompt = full_messages
+                    t.last_images = list(full_images or [])
+                else:
+                    t.last_prompt = messages
+                    t.last_images = list(images or [])
+
+                # ── Guided override hook (forced / prefix-replay step) ──
+                # Mirrors the sync ``_pre_step_hook``: a guided subclass sets
+                # ``self._async_pre_step`` to an async callable that resolves
+                # this trajectory's override. It runs the (blocking) oracle
+                # decide + teacher-VLM annotate in a bounded executor so the
+                # event loop keeps driving every other trajectory's vLLM gen
+                # + env steps concurrently. Returns a 4-tuple
+                # ``(text, token_ids, is_teacher, is_expert)`` or None.
+                override = None
+                async_pre = getattr(t, "async_pre_step_fn", None) or getattr(
+                    self, "_async_pre_step", None
+                )
+                if async_pre is not None:
+                    try:
+                        override = await async_pre(t)
+                    except Exception as e:
+                        logger.warning(
+                            f"  [async grp {t.group_id}/{t.n_idx}] override "
+                            f"hook failed: {e}. Falling back to vLLM."
+                        )
+                        override = None
+
+                if override is not None:
+                    ov_text = override[0]
+                    ov_token_ids = list(override[1])
+                    ov_is_teacher = bool(override[2])
+                    ov_is_expert = bool(override[3]) if len(override) > 3 else False
+                    prompt_ms = (time.time() - t_phase_start) * 1000.0
+                    # Forced/replay tokens are injected, not sampled: no fresh
+                    # log-probs. Flags drive the PG mask (teacher) + SFT mask
+                    # (expert) in _build_final_batch_multiturn.
+                    t.step_responses.append(ov_text)
+                    t.step_response_token_ids.append(ov_token_ids)
+                    t.step_response_log_probs.append([])
+                    t.step_teacher_forced.append(ov_is_teacher)
+                    t.step_is_expert.append(ov_is_expert)
+                    t.num_steps += 1
+                    # summary_context trains one sample per step — forced/replay
+                    # steps included (the masks above decide PG vs SFT). Keep
+                    # step_prompts 1:1 with step_responses or the final-batch
+                    # builder mis-slices every later step of this trajectory.
+                    if self.context_mode == "summary_context":
+                        t.step_prompts.append(t.last_prompt)
+                        t.step_images_list.append(list(t.last_images))
+                    t_env_start = time.time()
+                    try:
+                        reward, terminated, info = await t.pool.step_env.remote(
+                            t.slot_id, ov_text
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"  [async grp {t.group_id}/{t.n_idx}] step_env "
+                            f"(forced) failed: {e}. Terminating."
+                        )
+                        t.terminated = True
+                        t.step_distances.append(None)
+                        break
+                    t.step_distances.append(info.get("dist_before"))
+                    t.step_phase_times.append({
+                        "prompt_ms": prompt_ms,
+                        "gen_ms": 0.0,
+                        "env_ms": (time.time() - t_env_start) * 1000.0,
+                    })
+                    if terminated:
+                        if self.force_max_depth and t.num_steps < self.max_depth:
+                            logger.info(
+                                f"  [async grp {t.group_id}/{t.n_idx}] "
+                                f"force_max_depth: ignoring env termination at "
+                                f"step {t.num_steps}/{self.max_depth}"
+                            )
+                        else:
+                            t.terminated = True
+                    continue
+
+                # Tokenize this single prompt; reuse the batch helper with a
+                # 1-element list to keep packed-MROPE + image-truncation
+                # logic identical to the sync path.
+                try:
+                    tokenized = self._tokenize_prompts(
+                        [messages],
+                        [images],
+                        for_generation=True,
+                        full_prompts=[full_messages] if use_full else None,
+                        full_images_list=[full_images] if use_full else None,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"  [async grp {t.group_id}/{t.n_idx}] tokenize failed: {e}. Terminating."
+                    )
+                    t.terminated = True
+                    break
+
+                raw_prompt_ids = list(tokenized["raw_prompt_ids"][0])
+                raw_images = tokenized["raw_images"][0]
+                packed_override = None
+                if "packed_mrope_overrides" in tokenized:
+                    packed_override = tokenized["packed_mrope_overrides"][0]
+
+                # Mid-rollout prompt-length telemetry (summary_context): the
+                # real generation prompt length (img+text, this step's carried
+                # summary included). Logged periodically so we can read the
+                # distribution and kill before the slow post-rollout phases.
+                if self.context_mode == "summary_context":
+                    # Lazy-init: guided entry points don't pass through the
+                    # sync generate_trajectories() block that resets these.
+                    if not hasattr(self, "_sumctx_prompt_lens"):
+                        self._sumctx_prompt_lens = []
+                        self._sumctx_resp_lens = []
+                    pls = self._sumctx_prompt_lens
+                    pls.append(len(raw_prompt_ids))
+                    if len(pls) % 128 == 0:
+                        ss = sorted(pls)
+                        logger.info(
+                            f"[sumctx] prompt_tok rolling (n={len(pls)}): "
+                            f"p50={ss[len(ss)//2]} p95={ss[min(len(ss)-1, int(len(ss)*0.95))]} "
+                            f"max={ss[-1]} (cap={self.max_prompt_length})"
+                        )
+
+                # vLLM expects the multi-modal dict shape that
+                # `_process_multi_modal_data` produces (`{"image": [...]}`)
+                # so the rollout side doesn't need to know about it again.
+                mm_data = {"images": raw_images} if raw_images else None
+
+                sampling_overrides: dict[str, Any] = {
+                    # Multiturn always samples 1 response per step. The
+                    # group-of-n enumeration happens at the trajectory level
+                    # (n_trajectories items in the pending queue), not via
+                    # vLLM's `n` parameter.
+                    "n": 1,
+                    "temperature": config.worker.rollout.temperature,
+                    "top_p": config.worker.rollout.top_p,
+                }
+                rollout_top_k = getattr(config.worker.rollout, "top_k", -1)
+                if rollout_top_k != -1:
+                    sampling_overrides["top_k"] = rollout_top_k
+                if override_config:
+                    for k in ("temperature", "top_p", "top_k"):
+                        if k in override_config:
+                            sampling_overrides[k] = override_config[k]
+
+                request_id = f"async-{t.episode_id}-step{t.num_steps}-{uuid.uuid4().hex[:6]}"
+                t_gen_start = time.time()
+                prompt_ms = (t_gen_start - t_phase_start) * 1000.0
+                try:
+                    # Fan out the request to every TP rank of the chosen
+                    # engine. The lockstep router in `vllm_rollout_spmd.py`
+                    # requires every rank's inbox to receive the payload
+                    # so all ranks can call add_request in lockstep. All
+                    # ranks compute identical outputs (sampler is
+                    # TP-replicated with same seed), so we use rank 0's
+                    # result and discard the rest.
+                    remote_calls = [
+                        actor_rollout_ref_wg.workers[r].actor_rollout_ref_generate_one_async.remote(
+                            request_id=request_id,
+                            prompt_token_ids=raw_prompt_ids,
+                            multi_modal_data=mm_data,
+                            sampling_overrides=sampling_overrides,
+                            packed_mrope_override=packed_override,
+                            min_pixels=self.min_pixels,
+                            max_pixels=self.max_pixels,
+                            video_fps=getattr(config.data, "video_fps", 2.0),
+                        )
+                        for r in tp_ranks
+                    ]
+                    results = await asyncio.gather(*remote_calls)
+                    result = results[0]
+                except Exception as e:
+                    logger.warning(
+                        f"  [async grp {t.group_id}/{t.n_idx}] generate_one_async failed: {e}. Terminating."
+                    )
+                    t.terminated = True
+                    counters["failed_steps"] += 1
+                    break
+
+                t_gen_done = time.time()
+                gen_ms = (t_gen_done - t_gen_start) * 1000.0
+                text = self.tokenizer.decode(result.token_ids, skip_special_tokens=True)
+                t.step_responses.append(text)
+                t.step_response_token_ids.append(list(result.token_ids))
+                t.step_response_log_probs.append(list(result.logprobs) if result.logprobs is not None else [])
+                # On-policy student step: not teacher-forced, not an SFT
+                # target. Keep the flag lists 1:1 with step_responses so
+                # _build_final_batch_multiturn's mask slicing stays aligned.
+                t.step_teacher_forced.append(False)
+                t.step_is_expert.append(False)
+                t.num_steps += 1
+                # summary_context trains one sample per step: stash this
+                # step's exact prompt/images (set into last_prompt above)
+                # aligned 1:1 with step_responses.
+                if self.context_mode == "summary_context":
+                    t.step_prompts.append(t.last_prompt)
+                    t.step_images_list.append(list(t.last_images))
+                    self._sumctx_resp_lens.append(len(result.token_ids))
+
+                try:
+                    reward, terminated, info = await t.pool.step_env.remote(t.slot_id, text)
+                except Exception as e:
+                    logger.warning(
+                        f"  [async grp {t.group_id}/{t.n_idx}] step_env failed: {e}. Terminating."
+                    )
+                    t.terminated = True
+                    t.step_distances.append(None)
+                    break
+                t.step_distances.append(info.get("dist_before"))
+
+                env_ms = (time.time() - t_gen_done) * 1000.0
+                t.step_phase_times.append({
+                    "prompt_ms": prompt_ms,
+                    "gen_ms": gen_ms,
+                    "env_ms": env_ms,
+                })
+
+                if terminated:
+                    if self.force_max_depth and t.num_steps < self.max_depth:
+                        logger.info(
+                            f"  [async grp {t.group_id}/{t.n_idx}] force_max_depth: "
+                            f"ignoring env termination at step {t.num_steps}/{self.max_depth}"
+                        )
+                    else:
+                        t.terminated = True
+
+            # Trajectory finished (terminated or hit max_depth). Collect
+            # reward + ground truth, then release the slot.
+            try:
+                t.reward = float(await t.pool.get_trajectory_reward.remote(t.slot_id))
+            except Exception as e:
+                logger.warning(
+                    f"  [async grp {t.group_id}/{t.n_idx}] get_trajectory_reward failed: {e}. Using 0.0."
+                )
+                t.reward = 0.0
+            try:
+                t.ground_truth = await t.pool.get_ground_truth.remote(t.slot_id)
+            except Exception as e:
+                logger.warning(
+                    f"  [async grp {t.group_id}/{t.n_idx}] get_ground_truth failed: {e}."
+                )
+                t.ground_truth = "{}"
+            try:
+                await t.pool.release_env.remote(t.slot_id)
+            except Exception:
+                pass
+            counters["completed"] += 1
+            t.traj_end_ts = time.time()
+            return t
+        finally:
+            counters["running"] -= 1
 
     def _harvest_and_refill(
         self,
@@ -1410,39 +1517,59 @@ class MultiturnEnvRollout:
             acquire_meta.append((pool, group_id, n_idx))
             acquire_futures.append(pool.acquire_env.remote(item_data))
 
+        # Resolve acquisitions individually so one bad env-spawn (e.g. a
+        # transient AI2Thor `CreateHouse` TimeoutError that exhausts the
+        # controller-creation retries) DROPS just that trajectory instead of
+        # crashing the whole rollout. GRPO advantage is uid-grouped
+        # dynamically (core_algos.compute_grpo_outcome_advantage) — a group
+        # that loses a rollout (n-1 survivors) is fine; only a group reduced
+        # below 2 samples is degenerate, and online filtering handles that.
+        # Mirrors the per-trajectory tolerance the rollout loop already has
+        # for mid-episode failures; the batch-acquire path was the lone
+        # all-or-nothing barrier.
         t0 = time.time()
-        slot_ids = ray.get(acquire_futures)
+        slot_ids = [None] * total
+        for i, fut in enumerate(acquire_futures):
+            try:
+                slot_ids[i] = ray.get(fut)
+            except Exception as e:
+                _, group_id, n_idx = acquire_meta[i]
+                logger.warning(
+                    f"  acquire_env failed for group={group_id}, n={n_idx}: "
+                    f"{type(e).__name__}: {e}. Dropping this trajectory."
+                )
+                slot_ids[i] = None
         logger.info(f"  acquire_env ({total}): {time.time() - t0:.1f}s")
 
-        # Validate all slots were acquired
-        for i, slot_id in enumerate(slot_ids):
-            if slot_id is None:
-                # Release already-acquired slots before raising
-                for j in range(i):
-                    if slot_ids[j] is not None:
-                        try:
-                            ray.get(acquire_meta[j][0].release_env.remote(slot_ids[j]))
-                        except Exception:
-                            pass
-                _, group_id, n_idx = acquire_meta[i]
-                raise RuntimeError(
-                    f"Failed to acquire simulator slot for group={group_id}, "
-                    f"n={n_idx}. Not enough slots available. "
-                    f"Increase num_simulators or reduce batch_size."
-                )
-
-        # Reset all environments in parallel
+        # Reset only successfully-acquired envs, again tolerant of per-env
+        # failure (a controller can spawn but fail to reset). A failed reset
+        # releases its slot and drops the trajectory.
         t0 = time.time()
-        reset_futures = [
-            acquire_meta[i][0].reset_env.remote(slot_ids[i])
-            for i in range(total)
-        ]
-        ray.get(reset_futures)
+        ok_idx = [i for i in range(total) if slot_ids[i] is not None]
+        reset_futures = {
+            i: acquire_meta[i][0].reset_env.remote(slot_ids[i]) for i in ok_idx
+        }
+        for i, fut in reset_futures.items():
+            try:
+                ray.get(fut)
+            except Exception as e:
+                _, group_id, n_idx = acquire_meta[i]
+                logger.warning(
+                    f"  reset_env failed for group={group_id}, n={n_idx}: "
+                    f"{type(e).__name__}: {e}. Releasing slot and dropping."
+                )
+                try:
+                    ray.get(acquire_meta[i][0].release_env.remote(slot_ids[i]))
+                except Exception:
+                    pass
+                slot_ids[i] = None
         logger.info(f"  reset_env ({total}): {time.time() - t0:.1f}s")
 
-        # Build Trajectory objects
+        # Build Trajectory objects for survivors only.
         trajectories = []
         for i, (pool, group_id, n_idx) in enumerate(acquire_meta):
+            if slot_ids[i] is None:
+                continue
             episode_id = f"grpo_{uuid.uuid4().hex[:8]}_{n_idx}"
             trajectories.append(
                 Trajectory(
@@ -1452,6 +1579,13 @@ class MultiturnEnvRollout:
                     group_id=group_id,
                     n_idx=n_idx,
                 )
+            )
+
+        dropped = total - len(trajectories)
+        if dropped:
+            logger.warning(
+                f"  _initialize_batch: {dropped}/{total} trajectories dropped "
+                f"on env acquire/reset; continuing with {len(trajectories)}."
             )
 
         return trajectories
@@ -1831,6 +1965,10 @@ class MultiturnEnvRollout:
             return self._build_final_batch_multiturn(
                 trajectories, rewards, ground_truths, n_trajectories
             )
+        if self.context_mode == "summary_context":
+            return self._build_final_batch_summary_context(
+                trajectories, rewards, ground_truths, n_trajectories
+            )
         return self._build_final_batch_single_turn(
             trajectories, rewards, ground_truths, n_trajectories
         )
@@ -1940,6 +2078,301 @@ class MultiturnEnvRollout:
             "max_pixels": self.max_pixels,
             "video_fps": 2.0,
         }
+
+        return DataProto(
+            batch=td, non_tensor_batch=non_tensor, meta_info=meta_info
+        )
+
+    def _build_final_batch_summary_context(
+        self,
+        trajectories: list[Trajectory],
+        rewards: list[float],
+        ground_truths: list[str],
+        n_trajectories: int,
+    ) -> DataProto:
+        """Summary-context batch: one independent single-turn sample PER STEP.
+
+        Each step of each trajectory is its own ``(system + prev_summary +
+        current image) -> (think + action + summary)`` sample, carrying the
+        trajectory's reward at its last response token and sharing the
+        trajectory's GRPO group uid. This is the summary-context architecture:
+        flat per-step token cost, every step trained.
+
+        The total row count varies (trajectories have different step counts), but
+        ``DataProto.split`` asserts divisibility. Since the config invariant holds
+        (``global_batch_size == rollout_batch_size``), the effective actor global
+        batch (``global_batch_size * rollout.n``) equals ``len(trajectories)``. We
+        therefore pad the row count up to a multiple of ``len(trajectories)`` with
+        response-masked dummy rows (zero gradient, zero reward, throwaway
+        singleton uids) so every minibatch / micro-batch split downstream is exact.
+
+        Note (length bias): grouping per-step rows under the episode uid means a
+        longer trajectory contributes more rows to its GRPO group, so the group
+        mean is mildly weighted toward longer trajectories vs. the multi_turn path
+        (one row per trajectory). Accepted for this sanity-check recipe.
+        """
+        n_total = len(trajectories)
+        # One GRPO uid per *group_id* (dataset item), assigned explicitly from
+        # the trajectory rather than positionally (j // n_trajectories). The
+        # positional mapping silently mis-groups every row after a dropped
+        # trajectory (hardened _initialize_batch can drop on env failure) or
+        # whenever a group ends up with != n_trajectories rollouts.
+        group_uids: dict[int, str] = {}
+        for traj in trajectories:
+            if traj.group_id not in group_uids:
+                group_uids[traj.group_id] = str(uuid.uuid4())
+        n_items = len(group_uids)
+        # Guided runs can emit fully-forced trajectories (every step teacher-
+        # injected, e.g. the completion iter): pure SFT carriers with zero
+        # student tokens. Including their (usually 1.0) rewards in the group
+        # mean depresses every on-policy sibling's advantage while the forced
+        # rows themselves contribute nothing to the PG loss (teacher mask).
+        # Route their rows to ONE shared out-of-group uid instead. Their
+        # advantage value is irrelevant (all tokens PG-masked); what matters is
+        # removing them from the students' baseline.
+        exclude_forced = bool(
+            getattr(getattr(self, "guided_cfg", None), "exclude_fully_forced_from_group", True)
+        )
+        forced_uid = str(uuid.uuid4())
+        traj_fully_forced: list[bool] = []
+        for traj in trajectories:
+            tf = traj.step_teacher_forced or []
+            ns = len(traj.step_responses)
+            traj_fully_forced.append(ns > 0 and all(tf[:ns]) and len(tf) >= ns)
+        n_forced_rows = sum(
+            len(t.step_responses) for t, ff in zip(trajectories, traj_fully_forced) if ff
+        )
+        # A singleton uid group trips the GRPO ">1 member" assert; with <2
+        # forced rows total, leave them in their original groups (harmless).
+        if n_forced_rows < 2:
+            exclude_forced = False
+        # Same assert, other side: if exclusion would leave a group with
+        # exactly ONE remaining (student) row, keep that group's forced
+        # trajectories in-group instead.
+        keep_forced_in_group: set[int] = set()
+        if exclude_forced:
+            rows_after: dict[int, int] = {}
+            for traj, ff in zip(trajectories, traj_fully_forced):
+                if not ff:
+                    rows_after[traj.group_id] = (
+                        rows_after.get(traj.group_id, 0) + len(traj.step_responses)
+                    )
+            keep_forced_in_group = {g for g, c in rows_after.items() if c == 1}
+
+        prompt_texts: list = []
+        all_images: list = []
+        response_texts: list = []
+        row_rewards: list[float] = []
+        row_uids: list[str] = []
+        row_gts: list[str] = []
+        # Per-row Pope-Dagger provenance. In summary_context each step is its own
+        # row, so the per-row mask is simply "all real response tokens" when the
+        # step was teacher-injected / a fresh-expert step (no token spans needed,
+        # unlike the packed multi_turn builder). 1 = teacher-injected (replayed
+        # prefix OR forced) -> zeroed from the policy gradient; 1 = fresh-expert
+        # subset -> imitated by the SFT/cross-entropy term (sft_coef). Both are
+        # all-zero for on-policy / non-guided runs, so the vanilla summary-context
+        # GRPO path is unchanged.
+        row_teacher_forced: list[bool] = []
+        row_is_expert: list[bool] = []
+
+        for j, traj in enumerate(trajectories):
+            r = rewards[j] if j < len(rewards) else 0.0
+            gt = ground_truths[j] if j < len(ground_truths) else ""
+            n_steps = len(traj.step_responses)
+            teacher_forced_steps = traj.step_teacher_forced or []
+            is_expert_steps = traj.step_is_expert or []
+            uid = (
+                forced_uid
+                if (
+                    exclude_forced
+                    and traj_fully_forced[j]
+                    and traj.group_id not in keep_forced_in_group
+                )
+                else group_uids[traj.group_id]
+            )
+            for s in range(n_steps):
+                if s < len(traj.step_prompts) and traj.step_prompts[s] is not None:
+                    prompt_texts.append(traj.step_prompts[s])
+                    all_images.append(
+                        list(traj.step_images_list[s])
+                        if s < len(traj.step_images_list)
+                        else []
+                    )
+                else:
+                    # Defensive fallback (should not happen for summary_context):
+                    # use the last cached prompt so the row stays well-formed.
+                    prompt_texts.append(
+                        traj.last_prompt or [{"role": "user", "content": ""}]
+                    )
+                    all_images.append(list(traj.last_images or []))
+                response_texts.append(traj.step_responses[s])
+                row_rewards.append(r)
+                row_uids.append(uid)
+                row_gts.append(gt)
+                row_teacher_forced.append(
+                    bool(teacher_forced_steps[s]) if s < len(teacher_forced_steps) else False
+                )
+                row_is_expert.append(
+                    bool(is_expert_steps[s]) if s < len(is_expert_steps) else False
+                )
+
+        n_real = len(prompt_texts)
+
+        # ── pad to a multiple of n_total (= effective actor global batch) ──
+        pad_to = n_total if n_total > 0 else 1
+        pad_count = (-n_real) % pad_to
+        if n_real == 0:
+            # Degenerate (all trajectories empty): emit one full masked batch so
+            # the step is a no-op rather than crashing the split.
+            pad_count = pad_to
+        # compute_grpo_outcome_advantage asserts every uid group has >1 member.
+        # The pad rows all share ONE uid, so a lone pad row would be a singleton
+        # group and trip that assert. Add a full extra block (keeps divisibility
+        # by pad_to) so the pad group has >=2 members. Standalone `if` (not elif)
+        # so it also catches the n_real==0 + pad_to==1 degenerate path.
+        if pad_count == 1:
+            pad_count += pad_to
+        # All pad rows share ONE uid so they form a single all-zero-reward GRPO
+        # group (mean 0, std 0 -> advantage 0 via the +eps in the estimator;
+        # response_mask 0 -> no gradient). Unique-per-row uids would instead make
+        # singleton groups that fail the GRPO ">1" assertion (core_algos.py:209).
+        pad_uid = str(uuid.uuid4())
+        tmpl_prompt = (
+            prompt_texts[0] if prompt_texts else [{"role": "user", "content": ""}]
+        )
+        tmpl_images = all_images[0] if all_images else []
+        tmpl_resp = response_texts[0] if response_texts else ""
+        for _ in range(pad_count):
+            prompt_texts.append(tmpl_prompt)
+            all_images.append(list(tmpl_images))
+            response_texts.append(tmpl_resp)
+            row_rewards.append(0.0)
+            row_uids.append(pad_uid)  # shared pad-group uid (NOT unique per row)
+            row_gts.append("")
+            row_teacher_forced.append(False)
+            row_is_expert.append(False)
+        is_pad = [False] * n_real + [True] * pad_count
+
+        # ── tokenize prompts (with images) ──
+        tokenized = self._tokenize_prompts(prompt_texts, all_images)
+        prompt_ids = tokenized["input_ids"]
+        prompt_mask = tokenized["attention_mask"]
+        prompt_pos = tokenized["position_ids"]
+
+        # ── tokenize responses ──
+        max_resp_len = self.max_response_length
+        eos_id = self.tokenizer.eos_token_id
+        pad_id = self.tokenizer.pad_token_id
+        batch_resp_ids = []
+        batch_resp_mask = []
+        for ridx, resp_text in enumerate(response_texts):
+            ids = self.tokenizer.encode(resp_text, add_special_tokens=False)
+            ids.append(eos_id)
+            if len(ids) > max_resp_len:
+                ids = ids[:max_resp_len]
+            rlen = len(ids)
+            padded = ids + [pad_id] * (max_resp_len - rlen)
+            # Pad (dummy) rows contribute no gradient: zero the response mask.
+            if is_pad[ridx]:
+                mask = [0] * max_resp_len
+            else:
+                mask = [1] * rlen + [0] * (max_resp_len - rlen)
+            batch_resp_ids.append(padded)
+            batch_resp_mask.append(mask)
+
+        response_ids_t = torch.tensor(batch_resp_ids, dtype=prompt_ids.dtype)
+        response_mask_t = torch.tensor(batch_resp_mask, dtype=prompt_mask.dtype)
+
+        # ── Pope-Dagger token masks (per-row = per-step) ──
+        # A row's whole response is teacher-injected (replayed prefix OR forced
+        # expert) or not; the SFT subset is the fresh-expert rows. Reuse the row's
+        # response mask so only its real (non-pad) tokens carry the flag.
+        teacher_mask_rows: list[list[float]] = []
+        sft_mask_rows: list[list[float]] = []
+        zero_row = [0.0] * max_resp_len
+        for ridx in range(len(batch_resp_mask)):
+            base = [float(x) for x in batch_resp_mask[ridx]]
+            teacher_mask_rows.append(
+                base if (not is_pad[ridx] and row_teacher_forced[ridx]) else list(zero_row)
+            )
+            sft_mask_rows.append(
+                base if (not is_pad[ridx] and row_is_expert[ridx]) else list(zero_row)
+            )
+        teacher_token_mask_t = torch.tensor(teacher_mask_rows, dtype=torch.float32)
+        sft_token_mask_t = torch.tensor(sft_mask_rows, dtype=torch.float32)
+
+        bs = prompt_ids.shape[0]
+        full_ids = torch.cat([prompt_ids, response_ids_t], dim=-1)
+        full_mask = torch.cat([prompt_mask, response_mask_t], dim=-1)
+
+        resp_len = response_ids_t.shape[1]
+        delta = torch.arange(1, resp_len + 1, device=prompt_pos.device)
+        if prompt_pos.ndim == 3:  # mrope: (bs, 4, prompt_len)
+            delta = delta.view(1, 1, -1).expand(bs, prompt_pos.shape[1], -1)
+        else:
+            delta = delta.view(1, -1).expand(bs, -1)
+        resp_pos = prompt_pos[..., -1:] + delta
+        full_pos = torch.cat([prompt_pos, resp_pos], dim=-1)
+
+        td = TensorDict(
+            {
+                "prompts": prompt_ids,
+                "responses": response_ids_t,
+                "input_ids": full_ids,
+                "attention_mask": full_mask,
+                "response_mask": response_mask_t,
+                "position_ids": full_pos,
+                # Always emitted (all-zero for non-guided runs) so the actor can
+                # rely on the keys existing — mirrors _build_final_batch_multiturn.
+                "teacher_token_mask": teacher_token_mask_t,
+                "sft_token_mask": sft_token_mask_t,
+            },
+            batch_size=bs,
+        )
+
+        non_tensor = {
+            "uid": np.array(row_uids, dtype=object),
+            "ground_truth": np.array(row_gts, dtype=object),
+            "multi_modal_data": tokenized["multi_modal_data"],
+        }
+
+        # ── place trajectory reward at last (real) response token ──
+        token_level_scores = torch.zeros_like(response_ids_t, dtype=torch.float32)
+        for i in range(bs):
+            if is_pad[i]:
+                continue
+            rlen = int(response_mask_t[i].sum().item())
+            if rlen > 0:
+                token_level_scores[i, rlen - 1] = row_rewards[i]
+        td["token_level_scores"] = token_level_scores
+
+        meta_info = {
+            "min_pixels": self.min_pixels,
+            "max_pixels": self.max_pixels,
+            "video_fps": 2.0,
+        }
+
+        # Ground-truth mask accounting straight from the tensors — if a guided
+        # run reports 0 sft tokens HERE, the SFT path really is dead (vs. the
+        # old dp_actor last-microbatch metric artifact).
+        n_teacher_rows = int(sum(1 for x in row_teacher_forced if x))
+        n_expert_rows = int(sum(1 for x in row_is_expert if x))
+        teacher_tok = int(teacher_token_mask_t.sum().item())
+        sft_tok = int(sft_token_mask_t.sum().item())
+        resp_tok = int(response_mask_t.sum().item())
+        n_forced_trajs = int(sum(traj_fully_forced))
+        logger.info(
+            f"[summary_context] final batch: {n_real} real step-samples "
+            f"+ {pad_count} masked pad -> bs={bs} "
+            f"({n_items} groups x {n_trajectories} rollouts; "
+            f"{n_total} trajectories) | guided masks: "
+            f"teacher_rows={n_teacher_rows} expert_rows={n_expert_rows} "
+            f"teacher_tok={teacher_tok} sft_tok={sft_tok} resp_tok={resp_tok} "
+            f"sft_frac={sft_tok / max(1, resp_tok):.3f} | "
+            f"fully_forced_trajs={n_forced_trajs} "
+            f"(excluded_from_group={exclude_forced and n_forced_trajs > 0})"
+        )
 
         return DataProto(
             batch=td, non_tensor_batch=non_tensor, meta_info=meta_info
@@ -2327,7 +2760,29 @@ class ObjectNavEnvAdapter:
         """Build prompt for the current step. Dispatches based on context_mode."""
         if self.context_mode == "multi_turn":
             return self._build_prompt_multiturn()
+        if self.context_mode == "summary_context":
+            return self._build_prompt_summary_context()
         return self._build_prompt_single_turn()
+
+    def _build_prompt_summary_context(self) -> tuple[list[dict], list[Image.Image]]:
+        """Build the single-turn summary-context prompt for the current step.
+
+        The model's only memory of prior steps is the rolling ``<summary>`` it
+        emitted last step (carried on the producing action's ``.memory``); the
+        only image is the current observation. Delegates to the canonical shared
+        builder so the on-the-wire layout matches the summary-context SFT
+        renderer (``_process_trajectory_summary_context``) byte-for-byte.
+
+        No ``current_step_suffix`` / format reminder is appended — the SFT data
+        had none, so adding one would put rollout out of distribution.
+        """
+        from common.prompting.context_builders import build_summary_context_prompt
+
+        return build_summary_context_prompt(
+            system_prompt=self.system_prompt,
+            state_history=self.state_history,
+            coordinate_normalization_scale=self.coordinate_normalization_scale,
+        )
 
     def _build_prompt_single_turn(self) -> tuple[list[dict], list[Image.Image]]:
         """Build prompt matching the shared SFT-style compatibility format."""

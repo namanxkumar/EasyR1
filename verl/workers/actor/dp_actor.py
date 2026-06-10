@@ -418,8 +418,13 @@ class DataParallelPPOActor(BasePPOActor):
                         )
                         kl_loss = average_loss(kld, response_mask, mode=self.config.loss_avg_mode)
                         loss = pg_loss + kl_loss * self.config.kl_coef
-                        metrics["actor/kl_loss"] = kl_loss.detach().item()
-                        metrics["actor/kl_coef"] = self.config.kl_coef
+                        # append (don't assign): metrics is reduced by np.mean
+                        # across microbatches; plain assignment silently reports
+                        # only the LAST microbatch of the step.
+                        append_to_dict(metrics, {
+                            "actor/kl_loss": kl_loss.detach().item(),
+                            "actor/kl_coef": self.config.kl_coef,
+                        })
                     else:
                         loss = pg_loss
 
@@ -437,11 +442,20 @@ class DataParallelPPOActor(BasePPOActor):
                             log_probs, sft_token_mask, mode=self.config.loss_avg_mode
                         )
                         loss = loss + self.config.sft_coef * sft_loss
-                        metrics["actor/sft_loss"] = sft_loss.detach().item()
-                        metrics["actor/sft_coef"] = self.config.sft_coef
-                        metrics["actor/sft_token_frac"] = (
-                            (sft_token_mask.sum() / (response_mask.sum() + 1e-8)).detach().item()
-                        )
+                        # append (don't assign): plain assignment reports only
+                        # the LAST microbatch — and the summary-context builder
+                        # appends its all-masked pad rows at the batch END, so
+                        # the last microbatch is the one most likely to be
+                        # pad-only / sft-free. This is exactly how a healthy
+                        # guided run reported sft_token_frac=0.0.
+                        append_to_dict(metrics, {
+                            "actor/sft_loss": sft_loss.detach().item(),
+                            "actor/sft_coef": self.config.sft_coef,
+                            "actor/sft_token_frac": (
+                                (sft_token_mask.sum() / (response_mask.sum() + 1e-8)).detach().item()
+                            ),
+                            "actor/sft_token_count": sft_token_mask.sum().detach().item(),
+                        })
 
                     loss = loss * torch.sum(response_mask) * self.world_size / total_response_tokens
                     loss.backward()

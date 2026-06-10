@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -293,6 +294,29 @@ class GuidedMultiturnEnvRollout(MultiturnEnvRollout):
             self.max_depth - 1,  # need at least one student suffix step
         )
 
+        # ── flat async orchestration ─────────────────────────────────────
+        # Per-group chain coroutines sharing ONE event loop: every group's
+        # chain sequence (baseline → iters → next chain) advances
+        # independently, with vLLM continuous batching + the simulator-slot
+        # semaphore mixing all in-flight trajectories. Removes the
+        # sequential-pass barriers of the loop below (which cost step 1 of
+        # the summary sanity ~20 barrier-synced passes ≈ 7100s gen vs the
+        # vanilla single pass ≈ 990s on the same task).
+        if bool(getattr(config.worker.rollout, "async_mode", False)):
+            all_trajs, chains_total = self._generate_chains_flat_async(
+                items_by_group=items_by_group,
+                n_per_prompt=n_per_prompt,
+                actor_rollout_ref_wg=actor_rollout_ref_wg,
+                config=config,
+                override_config=override_config,
+                total_slots=total_slots,
+                global_max_iters=global_max_iters,
+                max_chains_per_group=max_chains_per_group,
+            )
+            return self._finalize_guided_batch(
+                all_trajs, chains_total, n_per_prompt, t_start, metrics
+            )
+
         while any(v > 0 for v in need_per_group.values()):
             if chain_idx >= max_chains_per_group:
                 logger.warning(
@@ -425,6 +449,20 @@ class GuidedMultiturnEnvRollout(MultiturnEnvRollout):
 
             chain_idx += 1
 
+        return self._finalize_guided_batch(
+            all_trajs, chain_idx, n_per_prompt, t_start, metrics
+        )
+
+    def _finalize_guided_batch(
+        self,
+        all_trajs: list[Trajectory],
+        chains_spawned: int,
+        n_per_prompt: int,
+        t_start: float,
+        metrics: dict[str, Any],
+    ) -> DataProto:
+        """Shared tail of the barriered + flat-async orchestrations: n_idx
+        reassignment, metrics, batch build, trajectory cleanup."""
         # Reassign n_idx within each group in chronological order of generation
         # (chain 0 baseline → chain 0 iters → chain 1 baseline → …).
         by_group: dict[int, list[Trajectory]] = {}
@@ -448,15 +486,33 @@ class GuidedMultiturnEnvRollout(MultiturnEnvRollout):
         metrics["guided/avg_dagger_iter"] = float(
             np.mean([t.dagger_iter_index for t in all_trajs])
         )
-        metrics["guided/chains_spawned"] = float(chain_idx)
+        metrics["guided/chains_spawned"] = float(chains_spawned)
         metrics["guided/avg_chain_id"] = float(
             np.mean([t.chain_id for t in all_trajs])
+        )
+        # The honest apples-to-apples number vs a vanilla GRPO run: mean reward
+        # over the on-policy baselines only (dagger_iter 0). The blended
+        # env/avg_reward above is inflated by forced/guided successes.
+        onpolicy = [
+            t.reward if t.reward is not None else 0.0
+            for t in all_trajs
+            if t.dagger_iter_index == 0
+        ]
+        if onpolicy:
+            metrics["guided/onpolicy_avg_reward"] = float(np.mean(onpolicy))
+            metrics["guided/onpolicy_n"] = float(len(onpolicy))
+        # Taper signal: fraction of trajectories carrying any forced step.
+        n_guided = sum(1 for t in all_trajs if any(t.step_teacher_forced or []))
+        metrics["guided/guided_traj_frac"] = (
+            float(n_guided) / max(1, len(all_trajs))
         )
 
         logger.info(
             f"[guided] rollout complete: {len(all_trajs)} trajs in "
             f"{time.time() - t_start:.1f}s | avg_steps={avg_steps:.1f} | "
-            f"avg_reward={avg_reward:.3f}"
+            f"avg_reward={avg_reward:.3f} | "
+            f"onpolicy_avg_reward={metrics.get('guided/onpolicy_avg_reward', float('nan')):.3f} "
+            f"(n={len(onpolicy)})"
         )
 
         self.destroy_controllers()
@@ -469,8 +525,319 @@ class GuidedMultiturnEnvRollout(MultiturnEnvRollout):
             t.step_responses.clear()
             t.step_response_token_ids.clear()
             t.step_response_log_probs.clear()
+            t.async_pre_step_fn = None
         all_trajs.clear()
         return batch
+
+    # ── flat async orchestration ─────────────────────────────────────────
+
+    def _generate_chains_flat_async(
+        self,
+        *,
+        items_by_group: dict[int, dict],
+        n_per_prompt: int,
+        actor_rollout_ref_wg,
+        config,
+        override_config: dict[str, Any] | None,
+        total_slots: int,
+        global_max_iters: int,
+        max_chains_per_group: int,
+    ) -> tuple[list[Trajectory], int]:
+        """Run all groups' chains concurrently in ONE event loop.
+
+        The barriered orchestration runs chain passes sequentially: step 1 of
+        the single-task sanity needed ~7 chains × ~3 passes = ~20 passes, each
+        barrier-synced on its slowest trajectory at ≤ |groups| concurrency.
+        Here each group advances its own chains independently as coroutines:
+
+            group g  ─ chain 0: baseline ─→ iter 1 ─→ iter 2
+                     └ chain 1: baseline ─→ …            (concurrent_chains_per_group)
+
+        Every trajectory is a ``_async_run_traj`` coroutine; vLLM continuous
+        batching + the slot semaphore mix all in-flight trajectories across
+        groups and chains. Within-chain sequential dependency (iter k branches
+        off iter k−1's result) is preserved by ``await``.
+
+        Exact-need accounting: a chain claims one unit of its group's ``need``
+        immediately before launching each trajectory (no await between check
+        and decrement → atomic under asyncio), so a group never over-fills.
+        Failed launches refund the claim and end the chain; the group spawner
+        starts a replacement chain while budget remains.
+        """
+        from pope_dagger.analyzer import BranchSelectorState
+
+        # Per-rollout telemetry accumulators normally reset at the top of the
+        # sync generate_trajectories(); _async_run_traj appends to them, and the
+        # flat path never passes through that init block.
+        self._sumctx_prompt_lens = []
+        self._sumctx_resp_lens = []
+
+        annotate_fn = self.teacher_annotate_fn
+        max_workers = max(1, int(getattr(self.guided_cfg, "teacher_max_workers", 1) or 1))
+        cc = max(1, int(getattr(self.guided_cfg, "concurrent_chains_per_group", 1) or 1))
+        teacher_executor = ThreadPoolExecutor(max_workers=max_workers)
+        # _initialize_batch blocks on ray.get (env acquire + reset, up to ~30s
+        # on a controller respawn); keep it off the event loop.
+        init_executor = ThreadPoolExecutor(max_workers=16)
+
+        # Engine round-robin (mirrors _run_async_episode_loop).
+        n_workers = len(actor_rollout_ref_wg.workers)
+        tp_size = max(1, int(getattr(config.worker.rollout, "tensor_parallel_size", 1)))
+        if n_workers % tp_size != 0:
+            raise RuntimeError(
+                f"n_workers={n_workers} not a multiple of tensor_parallel_size={tp_size}"
+            )
+        n_engines = n_workers // tp_size
+        _engine_counter = {"i": 0}
+
+        def _next_engine_ranks() -> list[int]:
+            e = _engine_counter["i"] % n_engines
+            _engine_counter["i"] += 1
+            base = e * tp_size
+            return list(range(base, base + tp_size))
+
+        counters = {"running": 0, "completed": 0, "failed_steps": 0}
+        need: dict[int, int] = {g: n_per_prompt for g in items_by_group}
+        chains_spawned: dict[int, int] = {g: 0 for g in items_by_group}
+        all_trajs: list[Trajectory] = []
+        t_start = time.time()
+
+        async def _main() -> None:
+            loop = asyncio.get_running_loop()
+            slot_sem = asyncio.Semaphore(total_slots)
+
+            async def init_traj(group_id: int, n_idx: int) -> Optional[Trajectory]:
+                """Acquire + reset an env slot off-loop, with bounded retries
+                (reactive pool shrink can make an apparently-free slot vanish)."""
+                item = items_by_group[group_id]
+                for attempt in range(4):
+                    try:
+                        trajs = await loop.run_in_executor(
+                            init_executor,
+                            self._initialize_batch,
+                            [(group_id, n_idx, item)],
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"[guided-flat] init grp {group_id} failed: {e} "
+                            f"(attempt {attempt + 1}/4)"
+                        )
+                        trajs = []
+                    if trajs:
+                        return trajs[0]
+                    await asyncio.sleep(5.0 * (attempt + 1))
+                return None
+
+            async def run_one(
+                group_id: int,
+                *,
+                dagger_iter: int,
+                chain_id: int,
+                branch_chain: list[int],
+                override_fn,
+            ) -> Optional[Trajectory]:
+                await slot_sem.acquire()
+                try:
+                    t = await init_traj(group_id, dagger_iter)
+                    if t is None:
+                        return None
+                    t.dagger_iter_index = dagger_iter
+                    t.chain_id = chain_id
+                    t.branch_chain = list(branch_chain)
+                    t.async_pre_step_fn = override_fn
+                    return await self._async_run_traj(
+                        t, _next_engine_ranks(), actor_rollout_ref_wg,
+                        config, override_config, counters,
+                    )
+                finally:
+                    slot_sem.release()
+
+            def make_override_fn(plans: dict[int, _IterPlan]):
+                """Per-trajectory async override hook for one iter pass of one
+                chain. The plans dict is chain-local, and a trajectory resolves
+                one step at a time, so `_build_override_for`'s plan-state
+                mutations are race-free even with concurrent chains."""
+
+                async def ov_fn(t: Trajectory):
+                    if t.terminated:
+                        return None
+
+                    def _decide():
+                        ov = self._build_override_for(t, plans)
+                        if ov is None:
+                            return None
+                        if isinstance(ov, _PendingAnnotation):
+                            text, token_ids = annotate_fn(**ov.kwargs)
+                            text, token_ids = self._ensure_summary_for_forced_step(
+                                text, token_ids
+                            )
+                            # Fresh oracle step: PG-masked AND SFT-imitated.
+                            return (text, list(token_ids), True, True)
+                        return ov
+
+                    return await loop.run_in_executor(teacher_executor, _decide)
+
+                return ov_fn
+
+            async def run_chain(group_id: int, chain_id: int) -> list[Trajectory]:
+                # Reserve the chain's FULL potential budget upfront (baseline +
+                # iterations), refunding the unused part at chain end. One-at-a-
+                # time claiming let solved baselines keep the spawner pumping
+                # new chains until need hit 0 — late-finishing FAILED baselines
+                # then found no budget left and never got guided (smoke
+                # 8305499: 6/8 solved, 2 failed, 0 forced steps). Reservation
+                # restores the sequential-chain guarantee: a failed baseline
+                # always has budget for its own iterations.
+                out: list[Trajectory] = []
+                take = min(need[group_id], 1 + global_max_iters)
+                if take <= 0:
+                    return out
+                need[group_id] -= take  # atomic: no await since check
+                used = 0
+                try:
+                    try:
+                        parent = await run_one(
+                            group_id, dagger_iter=0, chain_id=chain_id,
+                            branch_chain=[], override_fn=None,
+                        )
+                    except Exception as e:
+                        logger.error(f"[guided-flat] baseline grp {group_id} chain {chain_id} raised: {e!r}")
+                        parent = None
+                    if parent is None:
+                        return out
+                    used += 1
+                    out.append(parent)
+
+                    sel_state = BranchSelectorState()
+                    for iter_k in range(1, global_max_iters + 1):
+                        if used >= take:
+                            break
+                        if self.guided_cfg.stop_on_solved and _is_solved(parent):
+                            break
+                        is_completion = (
+                            self.guided_cfg.completion_final_iter
+                            and iter_k == global_max_iters
+                        )
+                        plans = self._plan_iteration(
+                            iter_k, {group_id: parent}, items_by_group,
+                            {group_id: sel_state},
+                            chain_id=chain_id, is_completion=is_completion,
+                        )
+                        if not plans:
+                            break
+                        plan = plans[group_id]
+                        try:
+                            tk = await run_one(
+                                group_id, dagger_iter=iter_k, chain_id=chain_id,
+                                branch_chain=list(plan.branch_chain),
+                                override_fn=make_override_fn(plans),
+                            )
+                        except Exception as e:
+                            logger.error(
+                                f"[guided-flat] iter {iter_k} grp {group_id} chain {chain_id} raised: {e!r}"
+                            )
+                            tk = None
+                        if tk is None:
+                            break
+                        used += 1
+                        out.append(tk)
+                        logger.info(
+                            f"[guided-flat] grp {group_id} chain {chain_id} "
+                            f"iter {iter_k}: branch@{plan.branch_step_index} "
+                            f"forced_steps={plan.forced_window_steps_emitted} "
+                            f"solved={_is_solved(tk)}"
+                        )
+                        if plan.forced_window_steps_emitted == 0:
+                            # Answer-only at the branch — nothing forceable left
+                            # in this chain (mirrors chain_done_groups in the
+                            # barriered path).
+                            break
+                        parent = tk
+                        sel_state.forced_window_ranges.append(
+                            (plan.branch_step_index,
+                             plan.branch_step_index + plan.forced_window_steps_emitted)
+                        )
+                finally:
+                    if take - used > 0:
+                        need[group_id] += take - used  # refund unused reservation
+                return out
+
+            async def run_group(group_id: int) -> list[Trajectory]:
+                out: list[Trajectory] = []
+                running: set[asyncio.Task] = set()
+                while True:
+                    while (
+                        need[group_id] > 0
+                        and chains_spawned[group_id] < max_chains_per_group
+                        and len(running) < cc
+                    ):
+                        cid = chains_spawned[group_id]
+                        chains_spawned[group_id] += 1
+                        running.add(
+                            asyncio.create_task(run_chain(group_id, cid))
+                        )
+                    if not running:
+                        break
+                    done, running = await asyncio.wait(
+                        running, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    for d in done:
+                        exc = d.exception()
+                        if exc is not None:
+                            logger.error(
+                                f"[guided-flat] chain task grp {group_id} raised: {exc!r}"
+                            )
+                        else:
+                            out.extend(d.result())
+                if need[group_id] > 0:
+                    logger.warning(
+                        f"[guided-flat] grp {group_id}: chain budget exhausted "
+                        f"with {need[group_id]} trajectories still needed "
+                        f"(group will be under-filled; group-id uid mapping "
+                        f"keeps GRPO grouping correct)"
+                    )
+                return out
+
+            async def progress_logger() -> None:
+                while True:
+                    await asyncio.sleep(15.0)
+                    logger.info(
+                        f"[guided-flat] running={counters['running']} "
+                        f"completed={counters['completed']} "
+                        f"need_total={sum(need.values())} "
+                        f"chains={sum(chains_spawned.values())} "
+                        f"failed_steps={counters['failed_steps']} "
+                        f"elapsed={time.time() - t_start:.0f}s"
+                    )
+
+            plog = asyncio.create_task(progress_logger())
+            try:
+                group_results = await asyncio.gather(
+                    *[run_group(g) for g in items_by_group]
+                )
+            finally:
+                plog.cancel()
+                try:
+                    await plog
+                except (asyncio.CancelledError, Exception):
+                    pass
+            for gr in group_results:
+                all_trajs.extend(gr)
+
+        try:
+            asyncio.run(_main())
+        finally:
+            teacher_executor.shutdown(wait=True)
+            init_executor.shutdown(wait=True)
+
+        logger.info(
+            f"[guided-flat] DONE: {len(all_trajs)} trajs, "
+            f"{sum(chains_spawned.values())} chains, "
+            f"completed={counters['completed']} "
+            f"failed_steps={counters['failed_steps']} "
+            f"elapsed={time.time() - t_start:.1f}s"
+        )
+        return all_trajs, sum(chains_spawned.values())
 
     # ── iteration helpers ────────────────────────────────────────────────
 
@@ -703,6 +1070,42 @@ class GuidedMultiturnEnvRollout(MultiturnEnvRollout):
             branch_step_index=branch,
         ))
 
+    def _ensure_summary_for_forced_step(
+        self, text: str, token_ids: list[int]
+    ) -> tuple[str, list[int]]:
+        """Make a forced-expert step's teacher text carry a ``<summary>``.
+
+        Under ``context_mode='summary_context'`` the next step's prompt sees only
+        the previous step's ``<summary>`` (parsed by the env into
+        ``action.memory``). The teacher annotator (both placeholder and real,
+        ``main.py``) builds text via ``build_assistant_response_no_summary`` —
+        ``<think>`` + action, NO ``<summary>``. Left as-is, the env parses
+        ``action.memory=None`` and the on-policy step *after* the forced window
+        runs memoryless, defeating the whole point of summary-context. So we
+        append a one-line summary derived from the teacher's own ``<think>`` (its
+        intent for the forced action) so memory carries across the handoff.
+
+        No-op for ``multi_turn`` and for text that already has a summary (e.g.
+        replayed-prefix steps reuse the parent's response, which already carries
+        one). The re-encoded ids keep ``step_response_token_ids`` consistent; the
+        summary-context final-batch builder re-encodes from text regardless.
+        """
+        if getattr(self, "context_mode", "multi_turn") != "summary_context":
+            return text, token_ids
+        if not text or "</summary>" in text:
+            return text, token_ids
+        m = re.search(r"<think>(.*?)</think>", text, re.DOTALL)
+        think = (m.group(1).strip() if m else "").replace("\n", " ").strip()
+        summary = ""
+        if think:
+            sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", think) if s.strip()]
+            summary = (sentences[-1] if sentences else think)[:200].strip()
+        if not summary:
+            summary = "Followed the expert action toward the target."
+        new_text = f"{text.rstrip()}\n<summary>{summary}</summary>"
+        new_ids = self.tokenizer.encode(new_text, add_special_tokens=False)
+        return new_text, new_ids
+
     # ── shared pass runner ───────────────────────────────────────────────
 
     def _run_one_pass(
@@ -838,6 +1241,7 @@ class GuidedMultiturnEnvRollout(MultiturnEnvRollout):
             def _run(item: tuple[Trajectory, _PendingAnnotation]):
                 t, pend = item
                 text, token_ids = annotate_fn(**pend.kwargs)
+                text, token_ids = self._ensure_summary_for_forced_step(text, token_ids)
                 return t, text, token_ids
 
             if len(pending) == 1:
@@ -920,6 +1324,10 @@ class GuidedMultiturnEnvRollout(MultiturnEnvRollout):
                 return None
             if isinstance(ov, _PendingAnnotation):
                 text, token_ids = annotate_fn(**ov.kwargs)
+                # Forced steps must carry a <summary> or the next on-policy
+                # step is memoryless under summary_context (same fix as the
+                # sync pre_step hook).
+                text, token_ids = self._ensure_summary_for_forced_step(text, token_ids)
                 # Fresh oracle step: mask from PG (is_teacher) AND imitate via
                 # SFT (is_expert).
                 return (text, list(token_ids), True, True)
