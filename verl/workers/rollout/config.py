@@ -175,7 +175,15 @@ class GuidedRolloutConfig:
     - 'random_regression': pope-dagger V5 selector. Each iter samples a
       branch step uniformly from [suffix_peak..last_unrecovered] of the
       un-forced suffix (steps after the latest forced window). Branch chain
-      is still monotonically increasing (V5 scopes by scan_start)."""
+      is still monotonically increasing (V5 scopes by scan_start).
+    - 'avg_success_step': POPE-DAgger v2 selector. Branch one step before the
+      running on-policy average successful step count (max(0, floor(avg)-1));
+      avg starts at 0 (branch at the beginning) and rises via EMA as the policy
+      solves on its own."""
+
+    avg_success_ema_beta: float = 0.5
+    """EMA smoothing for the v2 ``avg_success_step`` running stat
+    (new = beta*old + (1-beta)*obs; first observation is set directly)."""
 
     random_regression_seed: int | None = None
     """Optional seed for the V5 selector RNG. Mixed with (group_id, iter_k) so

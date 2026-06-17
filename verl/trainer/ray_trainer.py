@@ -179,6 +179,14 @@ def compute_advantage(data: DataProto, adv_estimator: AdvantageEstimator, gamma:
         if "chain_id" in data.non_tensor_batch:
             adv_inputs["chain_id"] = data.non_tensor_batch["chain_id"]
 
+    # Thread POPE-DAgger v2 prefix-sum metadata (summary_context per-step rows).
+    # Keys are written by the summary_context batch builder
+    # (_build_final_batch_summary_context). All four are per-row int arrays.
+    if getattr(adv_estimator, "value", adv_estimator) == "grpo_prefix_sum":
+        for _k in ("pope_traj_idx", "pope_step_idx", "pope_parent_traj_idx", "pope_branch_step"):
+            if _k in data.non_tensor_batch:
+                adv_inputs[_k] = data.non_tensor_batch[_k]
+
     advantages, returns = compute_advantage_return(adv_estimator, **adv_inputs)
     data.batch["advantages"] = advantages
     data.batch["returns"] = returns
@@ -890,6 +898,20 @@ class RayPPOTrainer:
                 try:
                     from verl.utils.pope_dagger_viz import log_advantage_stepview
                     log_advantage_stepview(batch, global_step=self.global_step)
+                except Exception:
+                    pass
+
+                # Saved per-step diagnostic figures (gated by POPE_DAGGER_VIZ_FIGS,
+                # default follows POPE_DAGGER_VIZ): advantage/reward/signal
+                # distributions per group + per trajectory-step (mask-aware) +
+                # a "why it is / isn't learning" dashboard, written under
+                # <save_checkpoint_path>/pope_viz/.
+                try:
+                    from verl.utils.pope_dagger_figs import save_step_figures
+                    save_step_figures(
+                        batch, self.global_step,
+                        self.config.trainer.save_checkpoint_path,
+                    )
                 except Exception:
                     pass
 

@@ -538,6 +538,22 @@ class MultiturnEnvRollout:
 
         logger.info(f"[mem] before _build_final_batch: RSS={_get_rss_mb():.0f}MB")
 
+        # Row count of the final batch must be a multiple of the actor's effective
+        # global batch (global_batch_size * rollout.n), NOT of n_trajectories.
+        # The two are equal under the config invariant global_batch_size ==
+        # rollout_batch_size, but guided rollout can drop a trajectory (e.g.
+        # exclude_fully_forced), making n_trajectories drift one below
+        # (255 vs 256). Padding summary_context rows to a multiple of the runtime
+        # n_trajectories then yields a bs (e.g. 1275) that is NOT divisible by
+        # world_size / global_batch_size → "AssertionError: 1275 % 4 != 0" in
+        # _balance_batch. Pass the config-constant multiple to the builder.
+        try:
+            self._row_pad_multiple = int(config.worker.actor.global_batch_size) * int(
+                config.worker.rollout.n
+            )
+        except Exception:
+            self._row_pad_multiple = None
+
         # ── Build final DataProto batch ──
         batch = self._build_final_batch(
             all_trajectories, all_rewards, all_ground_truths, n_trajectories
@@ -2175,8 +2191,35 @@ class MultiturnEnvRollout:
         # GRPO path is unchanged.
         row_teacher_forced: list[bool] = []
         row_is_expert: list[bool] = []
+        # Per-row trajectory id (j) + step index within trajectory (s), so the
+        # POPE-DAgger step-signal figure can reconstruct a true (trajectory, step)
+        # grid (in summary_context each row IS one step-sample). -1 for pad rows.
+        row_traj_idx: list[int] = []
+        row_step_idx: list[int] = []
+        # Per-row branch ancestry: the builder-index (j) of the parent trajectory
+        # this one branched from, and the branch step index at which they diverge.
+        # A guided traj's parent is the traj in the same (group_id, chain_id) whose
+        # branch_chain is this one's prefix; the dropped last entry is the branch
+        # step. Baseline trajs (empty branch_chain) have parent -1. So the POPE
+        # step-signal figure can draw "branched-from" arrows between rows.
+        row_parent_idx: list[int] = []
+        row_branch_step: list[int] = []
+        # (group_id, chain_id, branch_chain) -> builder index j, used to resolve
+        # each guided trajectory's parent by prefix match.
+        _branch_key_to_j = {
+            (t.group_id, t.chain_id, tuple(t.branch_chain or [])): jj
+            for jj, t in enumerate(trajectories)
+        }
 
         for j, traj in enumerate(trajectories):
+            _bc = list(traj.branch_chain or [])
+            if _bc:
+                _parent_j = _branch_key_to_j.get(
+                    (traj.group_id, traj.chain_id, tuple(_bc[:-1])), -1
+                )
+                _branch_s = int(_bc[-1])
+            else:
+                _parent_j, _branch_s = -1, -1
             r = rewards[j] if j < len(rewards) else 0.0
             gt = ground_truths[j] if j < len(ground_truths) else ""
             n_steps = len(traj.step_responses)
@@ -2216,11 +2259,21 @@ class MultiturnEnvRollout:
                 row_is_expert.append(
                     bool(is_expert_steps[s]) if s < len(is_expert_steps) else False
                 )
+                row_traj_idx.append(j)
+                row_step_idx.append(s)
+                row_parent_idx.append(_parent_j)
+                row_branch_step.append(_branch_s)
 
         n_real = len(prompt_texts)
 
-        # ── pad to a multiple of n_total (= effective actor global batch) ──
-        pad_to = n_total if n_total > 0 else 1
+        # ── pad to a multiple of the actor's effective global batch ──
+        # Prefer the config-constant global_batch_size * rollout.n (set on self
+        # in generate_trajectories) over the runtime n_total: guided rollout can
+        # drop a trajectory so n_total drifts one below the actor global batch
+        # (255 vs 256), and padding to a multiple of 255 leaves bs indivisible by
+        # world_size / global_batch_size (crashes _balance_batch). The two are
+        # equal in the non-guided case, so this is a no-op there.
+        pad_to = getattr(self, "_row_pad_multiple", None) or (n_total if n_total > 0 else 1)
         pad_count = (-n_real) % pad_to
         if n_real == 0:
             # Degenerate (all trajectories empty): emit one full masked batch so
@@ -2252,6 +2305,10 @@ class MultiturnEnvRollout:
             row_gts.append("")
             row_teacher_forced.append(False)
             row_is_expert.append(False)
+            row_traj_idx.append(-1)
+            row_step_idx.append(-1)
+            row_parent_idx.append(-1)
+            row_branch_step.append(-1)
         is_pad = [False] * n_real + [True] * pad_count
 
         # ── tokenize prompts (with images) ──
@@ -2335,6 +2392,10 @@ class MultiturnEnvRollout:
             "uid": np.array(row_uids, dtype=object),
             "ground_truth": np.array(row_gts, dtype=object),
             "multi_modal_data": tokenized["multi_modal_data"],
+            "pope_traj_idx": np.array(row_traj_idx, dtype=np.int64),
+            "pope_step_idx": np.array(row_step_idx, dtype=np.int64),
+            "pope_parent_traj_idx": np.array(row_parent_idx, dtype=np.int64),
+            "pope_branch_step": np.array(row_branch_step, dtype=np.int64),
         }
 
         # ── place trajectory reward at last (real) response token ──

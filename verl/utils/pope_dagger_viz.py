@@ -44,6 +44,15 @@ def viz_enabled() -> bool:
     return os.environ.get("POPE_DAGGER_VIZ") == "1"
 
 
+def figs_enabled() -> bool:
+    """Saved-figure dashboards are gated separately (a bit more costly than log
+    lines). Default follows POPE_DAGGER_VIZ, override with POPE_DAGGER_VIZ_FIGS."""
+    v = os.environ.get("POPE_DAGGER_VIZ_FIGS")
+    if v is not None:
+        return v == "1"
+    return viz_enabled()
+
+
 def _max_groups() -> int:
     try:
         return int(os.environ.get("POPE_DAGGER_VIZ_MAX_GROUPS", "4"))

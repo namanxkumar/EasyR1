@@ -225,6 +225,7 @@ def _create_multiturn_rollout(config: PPOConfig, tokenizer, processor):
             completion_final_iter=guided_cfg.completion_final_iter,
             branch_selection_mode=guided_cfg.branch_selection_mode,
             random_regression_seed=guided_cfg.random_regression_seed,
+            avg_success_ema_beta=guided_cfg.avg_success_ema_beta,
         )
         # Teacher annotator wiring. Server mode → ServerTeacherVLM via
         # pope_dagger.teacher_vlm; co-located mode is not yet implemented.

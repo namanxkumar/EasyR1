@@ -82,6 +82,7 @@ class AdvantageEstimator(str, Enum):
     GRPO = "grpo"
     GRPO_PASSK = "grpo_passk"
     GRPO_BRANCHING = "grpo_branching"
+    GRPO_PREFIX_SUM = "grpo_prefix_sum"
     REINFORCE_PLUS_PLUS = "reinforce_plus_plus"
     REMAX = "remax"
     RLOO = "rloo"
@@ -365,6 +366,143 @@ def compute_grpo_branching_advantage(
                 advantages[i, start : end + 1] = a_val
 
     advantages = advantages * response_mask
+    return advantages, advantages
+
+
+@register_adv_estimator(AdvantageEstimator.GRPO_PREFIX_SUM)
+def compute_grpo_prefix_sum_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index,
+    pope_traj_idx=None,
+    pope_step_idx=None,
+    pope_parent_traj_idx=None,
+    pope_branch_step=None,
+    eps: float = 1e-6,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """POPE-DAgger v2 prefix-summed GRPO advantage (summary_context rows).
+
+    Each batch row is one *step* of one trajectory (summary_context builder).
+    Per-row provenance arrays identify, for every row, which trajectory it
+    belongs to (``pope_traj_idx``), its step index within that trajectory
+    (``pope_step_idx``), and — for guided children — the builder index of the
+    parent trajectory it branched from (``pope_parent_traj_idx``) and the step
+    at which they diverge (``pope_branch_step``). Baseline trajectories and pad
+    rows carry parent ``-1`` / branch ``-1`` (pad rows carry traj ``-1``).
+
+    Advantage construction (per the v2 design):
+      1. Reconstruct one scalar reward per *trajectory* (the row reward is the
+         trajectory reward, identical across that trajectory's rows).
+      2. GRPO baseline: per-uid mean/std taken over **trajectory** rewards (one
+         entry per trajectory, not per row), so longer trajectories don't tilt
+         the group mean.  ``a_traj = (R - mean) / (std + eps)``.
+      3. Base row advantage = its own trajectory's ``a_traj``.
+      4. Prefix sum: for each guided child ``c`` with parent ``p`` (same uid) and
+         branch step ``b``, ADD ``a_traj[c]`` onto the parent's shared-prefix
+         rows (``pope_step_idx < b``).  The parent's prefix tokens are the
+         gradient-carrying copy of the shared prefix (the child's prefix rows are
+         teacher-masked), so summing realizes "the prefix gets the advantages of
+         both the baseline and its guided continuation" — a value indicator:
+         fail->success = negative+positive, fail->fail = double-negative.
+
+    Off-policy guidance (replayed prefix + forced steps) carries no gradient
+    because its rows are zeroed by ``teacher_token_mask`` in the actor loss and
+    (with ``sft_coef=0``) no SFT term either — handled outside this estimator.
+
+    Falls back to standard group-wide GRPO when the pope_* metadata is absent,
+    keeping this estimator safe on non-guided / non-summary_context runs.
+    """
+    if pope_traj_idx is None or pope_step_idx is None:
+        return compute_grpo_outcome_advantage(
+            token_level_rewards=token_level_rewards,
+            response_mask=response_mask,
+            index=index,
+            eps=eps,
+        )
+
+    bsz = token_level_rewards.shape[0]
+    scores = token_level_rewards.sum(dim=-1)
+
+    def _as_int(x):
+        try:
+            return int(x.item())
+        except AttributeError:
+            return int(x)
+
+    traj_of = [_as_int(pope_traj_idx[i]) for i in range(bsz)]
+    step_of = [_as_int(pope_step_idx[i]) for i in range(bsz)]
+    parent_of = (
+        [_as_int(pope_parent_traj_idx[i]) for i in range(bsz)]
+        if pope_parent_traj_idx is not None
+        else [-1] * bsz
+    )
+    branch_of = (
+        [_as_int(pope_branch_step[i]) for i in range(bsz)]
+        if pope_branch_step is not None
+        else [-1] * bsz
+    )
+
+    # ── per-trajectory reward / uid / parent / branch (constant across rows) ──
+    traj_reward: dict[int, torch.Tensor] = {}
+    traj_uid: dict[int, Any] = {}
+    traj_parent: dict[int, int] = {}
+    traj_branch: dict[int, int] = {}
+    for i in range(bsz):
+        tj = traj_of[i]
+        if tj < 0:  # pad row
+            continue
+        if tj not in traj_reward:
+            traj_reward[tj] = scores[i]
+            traj_uid[tj] = _hashable_uid(index[i])
+            traj_parent[tj] = parent_of[i]
+            traj_branch[tj] = branch_of[i]
+
+    # ── GRPO baseline over trajectory rewards, per uid ──
+    uid2rewards: dict[Any, list[torch.Tensor]] = defaultdict(list)
+    for tj, r in traj_reward.items():
+        uid2rewards[traj_uid[tj]].append(r)
+
+    uid2mean, uid2std = {}, {}
+    for uid, rs in uid2rewards.items():
+        stacked = torch.stack(rs)
+        uid2mean[uid] = stacked.mean()
+        uid2std[uid] = stacked.std() if stacked.numel() > 1 else torch.zeros_like(stacked.sum())
+
+    a_traj: dict[int, torch.Tensor] = {}
+    for tj, r in traj_reward.items():
+        uid = traj_uid[tj]
+        a_traj[tj] = (r - uid2mean[uid]) / (uid2std[uid] + eps)
+
+    # ── base per-row advantage = own trajectory's z-score ──
+    row_adv = torch.zeros(bsz, dtype=token_level_rewards.dtype, device=token_level_rewards.device)
+    for i in range(bsz):
+        tj = traj_of[i]
+        if tj >= 0 and tj in a_traj:
+            row_adv[i] = a_traj[tj]
+
+    # ── prefix sum: add each child's a_traj onto its parent's shared-prefix rows ──
+    # Map (parent traj, branch step) so we can apply per child. A parent may have
+    # multiple children; each contributes its advantage to the parent's prefix
+    # rows below that child's branch step.
+    child_contrib: list[tuple[int, int, torch.Tensor]] = []  # (parent, branch_step, a_child)
+    for tj in traj_reward:
+        p = traj_parent[tj]
+        b = traj_branch[tj]
+        if p >= 0 and b >= 0 and p in a_traj and traj_uid.get(p) == traj_uid[tj]:
+            child_contrib.append((p, b, a_traj[tj]))
+
+    if child_contrib:
+        for i in range(bsz):
+            tj = traj_of[i]
+            if tj < 0:
+                continue
+            s = step_of[i]
+            for p, b, a_child in child_contrib:
+                if tj == p and s < b:
+                    row_adv[i] = row_adv[i] + a_child
+
+    advantages = row_adv.unsqueeze(-1) * response_mask
     return advantages, advantages
 
 

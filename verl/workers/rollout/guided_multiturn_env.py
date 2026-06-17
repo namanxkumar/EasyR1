@@ -129,7 +129,13 @@ class GuidedConfig:
     # "fixed_step_k": iter k forces step k-1 (deterministic ladder).
     # "random_regression": V5 pope-dagger selector — random step sampled
     # from [suffix_peak..last_unrecovered] of the latest unforced suffix.
+    # "avg_success_step": POPE-DAgger v2 selector — branch one step before the
+    #   running average successful step count (``max(0, floor(avg)-1)``), where
+    #   ``avg`` is an on-policy EMA updated after every rollout.
     branch_selection_mode: str = "random_regression"
+    # EMA smoothing for the v2 ``avg_success_step`` running stat. The new value
+    # is ``beta*old + (1-beta)*new``; first observation is set directly.
+    avg_success_ema_beta: float = 0.5
     # Optional seed for the V5 random selector (mixed with group_id + iter_k).
     random_regression_seed: int | None = None
     # Forced-window length is *not* fixed at 1: each iter forces consecutive
@@ -231,6 +237,12 @@ class GuidedMultiturnEnvRollout(MultiturnEnvRollout):
         self.teacher_annotate_fn = (
             teacher_annotate_fn or _build_placeholder_annotator(self.tokenizer)
         )
+        # POPE-DAgger v2 running stat: on-policy EMA of the step count at which
+        # successful baseline (dagger_iter==0) trajectories solved. Drives the
+        # ``avg_success_step`` branch selector. Persists across rollouts on this
+        # rollout-worker instance, so it accumulates over training steps.
+        self._avg_success_step_count: float = 0.0
+        self._avg_success_seen: bool = False
 
     # Override to short-circuit when guidance is disabled at runtime.
     def generate_trajectories(
@@ -501,6 +513,62 @@ class GuidedMultiturnEnvRollout(MultiturnEnvRollout):
         if onpolicy:
             metrics["guided/onpolicy_avg_reward"] = float(np.mean(onpolicy))
             metrics["guided/onpolicy_n"] = float(len(onpolicy))
+
+        # ── POPE-DAgger v2 stats / required visualizations ──────────────────
+        # Partition trajectories into the four design categories. "unguided" =
+        # on-policy baseline (dagger_iter==0); "guided" = a continuation after a
+        # forced branch (dagger_iter>=1). success = reward>=1.0 (_is_solved).
+        unguided = [t for t in all_trajs if t.dagger_iter_index == 0]
+        guided = [t for t in all_trajs if t.dagger_iter_index >= 1]
+        n_un = len(unguided)
+        n_gu = len(guided)
+        un_succ = [t for t in unguided if _is_solved(t)]
+        gu_succ = [t for t in guided if _is_solved(t)]
+        n_total = max(1, len(all_trajs))
+
+        # Pure on-policy successes per iteration (count + rate).
+        metrics["guided/onpolicy_successes"] = float(len(un_succ))
+        onp_rate = (len(un_succ) / n_un) if n_un else 0.0
+        metrics["guided/onpolicy_success_rate"] = float(onp_rate)
+        # Overall success rate (all trajectories) over time.
+        metrics["guided/success_rate"] = float(
+            sum(1 for t in all_trajs if _is_solved(t)) / n_total
+        )
+
+        # Guidance boost: improvement in success rate after guidance.
+        gu_rate = (len(gu_succ) / n_gu) if n_gu else 0.0
+        metrics["guided/guided_success_rate"] = float(gu_rate)
+        # Percentage-point lift and relative-percent lift over the on-policy rate.
+        metrics["guided/guidance_boost_pp"] = float((gu_rate - onp_rate) * 100.0)
+        if onp_rate > 0.0:
+            metrics["guided/guidance_boost_pct"] = float(
+                (gu_rate - onp_rate) / onp_rate * 100.0
+            )
+
+        # Four-category group ratios (fraction of all trajectories).
+        metrics["guided/ratio_guided_success"] = float(len(gu_succ) / n_total)
+        metrics["guided/ratio_guided_failure"] = float((n_gu - len(gu_succ)) / n_total)
+        metrics["guided/ratio_unguided_success"] = float(len(un_succ) / n_total)
+        metrics["guided/ratio_unguided_failure"] = float((n_un - len(un_succ)) / n_total)
+
+        # ── update the on-policy avg_success_step_count EMA (drives the v2
+        # branch selector next rollout). Only baseline (on-policy) successes
+        # count — the step at which the policy solved on its own. ──
+        succ_steps = [int(t.num_steps) for t in un_succ if t.num_steps is not None]
+        if succ_steps:
+            new_obs = float(np.mean(succ_steps))
+            beta = float(self.guided_cfg.avg_success_ema_beta)
+            if not self._avg_success_seen:
+                self._avg_success_step_count = new_obs
+                self._avg_success_seen = True
+            else:
+                self._avg_success_step_count = (
+                    beta * self._avg_success_step_count + (1.0 - beta) * new_obs
+                )
+        # Always log the current running value (constant across a rollout, but
+        # the time series over training steps is the required visualization).
+        metrics["guided/avg_success_step_count"] = float(self._avg_success_step_count)
+
         # Taper signal: fraction of trajectories carrying any forced step.
         n_guided = sum(1 for t in all_trajs if any(t.step_teacher_forced or []))
         metrics["guided/guided_traj_frac"] = (
@@ -867,6 +935,12 @@ class GuidedMultiturnEnvRollout(MultiturnEnvRollout):
                 continue
             if mode == "fixed_step_k":
                 branch_step = iter_k - 1
+            elif mode == "avg_success_step":
+                # POPE-DAgger v2: branch one step before the running average
+                # success step. Initially 0 -> branch at step 0 (the beginning).
+                # Clamp to a valid student-suffix step on this parent.
+                branch_step = max(0, int(self._avg_success_step_count) - 1)
+                branch_step = min(branch_step, max(0, parent.num_steps - 1))
             elif mode == "random_regression":
                 state = (
                     selector_states[group_id]
