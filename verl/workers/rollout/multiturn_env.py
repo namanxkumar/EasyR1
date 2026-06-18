@@ -2204,6 +2204,12 @@ class MultiturnEnvRollout:
         # step-signal figure can draw "branched-from" arrows between rows.
         row_parent_idx: list[int] = []
         row_branch_step: list[int] = []
+        # Per-row dagger iteration (0 = on-policy baseline, >=1 = guided/prefixed)
+        # and chain id, mirrored from the trajectory so the per-group advantage
+        # dump can separate prefixed vs baseline groups offline (the multiturn
+        # builder already emits these; summary_context must too).
+        row_dagger_iter: list[int] = []
+        row_chain_id: list[int] = []
         # (group_id, chain_id, branch_chain) -> builder index j, used to resolve
         # each guided trajectory's parent by prefix match.
         _branch_key_to_j = {
@@ -2263,6 +2269,8 @@ class MultiturnEnvRollout:
                 row_step_idx.append(s)
                 row_parent_idx.append(_parent_j)
                 row_branch_step.append(_branch_s)
+                row_dagger_iter.append(int(getattr(traj, "dagger_iter_index", 0)))
+                row_chain_id.append(int(getattr(traj, "chain_id", 0)))
 
         n_real = len(prompt_texts)
 
@@ -2309,6 +2317,8 @@ class MultiturnEnvRollout:
             row_step_idx.append(-1)
             row_parent_idx.append(-1)
             row_branch_step.append(-1)
+            row_dagger_iter.append(0)
+            row_chain_id.append(0)
         is_pad = [False] * n_real + [True] * pad_count
 
         # ── tokenize prompts (with images) ──
@@ -2396,6 +2406,10 @@ class MultiturnEnvRollout:
             "pope_step_idx": np.array(row_step_idx, dtype=np.int64),
             "pope_parent_traj_idx": np.array(row_parent_idx, dtype=np.int64),
             "pope_branch_step": np.array(row_branch_step, dtype=np.int64),
+            # Mirror the multiturn builder so the per-group advantage dump can
+            # separate prefixed (>=1) vs baseline (0) groups in summary_context.
+            "dagger_iter_index": np.array(row_dagger_iter, dtype=np.int64),
+            "chain_id": np.array(row_chain_id, dtype=np.int64),
         }
 
         # ── place trajectory reward at last (real) response token ──
