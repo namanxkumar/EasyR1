@@ -901,6 +901,15 @@ class RayPPOTrainer:
                 except Exception:
                     pass
 
+                # Always-on structured per-group advantage dump (gated only by
+                # the POPE_PREFIX_DUMP directory): recovers prefixed-vs-baseline
+                # group advantages offline. Cheap; independent of the figures.
+                try:
+                    from verl.utils.pope_dagger_dump import dump_group_advantages
+                    dump_group_advantages(batch, global_step=self.global_step)
+                except Exception:
+                    pass
+
                 # Saved per-step diagnostic figures (gated by POPE_DAGGER_VIZ_FIGS,
                 # default follows POPE_DAGGER_VIZ): advantage/reward/signal
                 # distributions per group + per trajectory-step (mask-aware) +

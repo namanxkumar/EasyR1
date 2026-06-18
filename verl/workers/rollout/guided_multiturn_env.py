@@ -38,7 +38,9 @@ consumes.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import re
 import time
 from collections import deque
@@ -68,12 +70,25 @@ class _PendingAnnotation:
     group) and fans the calls out on a thread pool, so the vLLM teacher server
     batches the inflight HTTP requests instead of serializing them one
     trajectory at a time. ``kwargs`` are the ``teacher_annotate_fn`` arguments.
+
+    ``group_key`` (optional) lets the pre_step hook deduplicate annotations:
+    when several active trajectories share a key (e.g. the N student suffixes of
+    one prefixed group, all replaying the SAME deterministic prefix to the SAME
+    branch pose), the teacher is called ONCE and the identical text broadcast to
+    every sibling — which is required for correctness, not just speed, since the
+    teacher is stochastic and the siblings must share a byte-identical
+    prefix+guidance for the within-group GRPO comparison to be fair. ``None``
+    (the chain orchestration's default) makes every pending its own group.
+    ``on_annotated(text, token_ids)`` is invoked once per resolved group so the
+    caller can cache the result (e.g. onto a ``PrefixSpec``) for later waves.
     """
 
-    __slots__ = ("kwargs",)
+    __slots__ = ("kwargs", "group_key", "on_annotated")
 
-    def __init__(self, kwargs: dict):
+    def __init__(self, kwargs: dict, group_key=None, on_annotated=None):
         self.kwargs = kwargs
+        self.group_key = group_key
+        self.on_annotated = on_annotated
 
 
 class ExpertActionFn(Protocol):
@@ -159,6 +174,26 @@ class GuidedConfig:
     # ``max_iters=2`` this yields one middle-injection iter + one completion iter.
     completion_final_iter: bool = True
 
+    # ── prefix-testing orchestration (docs/experiments/pope_dagger_prefixtesting.md) ──
+    # "chain" (default — the v2 baseline→iters chain above) or "prefix_groups"
+    # (this experiment: split the batch into an on-policy baseline half + a
+    # prefixed half where each group is k student suffixes sharing ONE
+    # prefix+single-guidance-step, GRPO'd within the group, prefix+guidance
+    # masked). See ``_generate_prefix_groups``.
+    orchestration_mode: str = "chain"
+    # Fraction of the batch's prompts rolled out as on-policy baseline groups;
+    # the remaining (1-frac) prompts become prefixed groups built from the
+    # baselines' failures. 0.5 = 16 baseline + 16 prefixed at batch_size=32.
+    prefix_baseline_fraction: float = 0.5
+    # How many distinct failure prefixes to harvest from each baseline group
+    # (each becomes one prefixed group). 1 = one prefix per baseline group.
+    prefix_failures_per_group: int = 1
+    # Whether the single guidance step is SFT-imitated (is_expert=True) in
+    # addition to being PG-masked. For pure PrefixRL (the experiment default)
+    # this is False — the guidance is pure conditioning, gradient flows only
+    # through the student suffix. (sft_coef=0 also nullifies SFT regardless.)
+    guidance_is_expert: bool = False
+
 
 @dataclass
 class _IterPlan:
@@ -182,6 +217,31 @@ class _IterPlan:
     progress_resume_target: float | None = None
     forced_window_max_bp: float = 0.0
     forced_window_steps_emitted: int = 0
+
+
+@dataclass
+class PrefixSpec:
+    """One prefixed group for the prefix-testing orchestration.
+
+    All ``n_per_prompt`` student suffixes of this group share the SAME prefix
+    (the parent failure's steps ``0..branch-1``, replayed deterministically) and
+    the SAME single guidance step at ``branch_step_index`` (the teacher's
+    strategy-bearing forced step). They diverge only afterward, when the student
+    takes over. ``annotation`` caches the resolved ``(text, token_ids)`` of the
+    guidance step so siblings reaching the branch in later rollout waves reuse
+    the first wave's teacher call (cross-wave dedup; within-wave dedup is handled
+    by the pre_step hook's ``group_key`` batching).
+    """
+
+    parent: Trajectory
+    branch_step_index: int
+    group_id: int
+    # Resolved guidance-step text + tokens (filled on first annotation).
+    annotation: Optional[tuple[str, list[int]]] = None
+    # True once the branch was reached but produced no forceable guidance step
+    # (oracle exhausted / answer-only at branch): the whole group degrades to a
+    # pure on-policy rollout from the prefix pose, no masking past the prefix.
+    no_guidance: bool = False
 
 
 # ─── default annotator (no-VLM, placeholder reasoning) ─────────────────────
@@ -288,6 +348,19 @@ class GuidedMultiturnEnvRollout(MultiturnEnvRollout):
         items_by_group: dict[int, dict] = {i: it for i, it in enumerate(all_items)}
 
         from pope_dagger.analyzer import BranchSelectorState
+
+        # ── prefix-testing orchestration dispatch ────────────────────────
+        if getattr(self.guided_cfg, "orchestration_mode", "chain") == "prefix_groups":
+            return self._generate_prefix_groups(
+                items_by_group=items_by_group,
+                n_per_prompt=n_per_prompt,
+                actor_rollout_ref_wg=actor_rollout_ref_wg,
+                config=config,
+                override_config=override_config,
+                total_slots=total_slots,
+                t_start=t_start,
+                metrics=metrics,
+            )
 
         all_trajs: list[Trajectory] = []
         # Remaining slots per group; decremented each time a trajectory is
@@ -584,6 +657,19 @@ class GuidedMultiturnEnvRollout(MultiturnEnvRollout):
         )
 
         self.destroy_controllers()
+
+        # Per-trajectory outcome dump (follow-detection + guided-vs-baseline
+        # success). Must run BEFORE the cleanup loop clears step_responses.
+        try:
+            from verl.utils.pope_dagger_dump import dump_trajectory_outcomes
+            dump_trajectory_outcomes(
+                all_trajs,
+                rollout_idx=int(getattr(self, "_rollout_idx", 0)),
+                rank=getattr(self, "rank", 0),
+            )
+        except Exception:  # pragma: no cover — diagnostics must never crash
+            pass
+
         batch = self._build_final_batch(
             all_trajs, all_rewards, all_ground_truths, n_per_prompt
         )
@@ -596,6 +682,322 @@ class GuidedMultiturnEnvRollout(MultiturnEnvRollout):
             t.async_pre_step_fn = None
         all_trajs.clear()
         return batch
+
+    # ── prefix-testing orchestration ──────────────────────────────────────
+
+    def _generate_prefix_groups(
+        self,
+        *,
+        items_by_group: dict[int, dict],
+        n_per_prompt: int,
+        actor_rollout_ref_wg,
+        config,
+        override_config: dict[str, Any] | None,
+        total_slots: int,
+        t_start: float,
+        metrics: dict[str, Any],
+    ) -> DataProto:
+        """Prefix-testing orchestration (pope_dagger_prefixtesting.md).
+
+        One GRPO iteration, two passes over a split batch:
+
+        1. **Baseline half** — the first ``prefix_baseline_fraction`` of the
+           batch's prompts are rolled out fully on-policy (``dagger_iter=0``).
+           These are the honest apples-to-apples groups vs a vanilla GRPO run.
+        2. **Prefixed half** — from each baseline group's *failures* we harvest a
+           prefix (steps ``0..branch-1``) and inject ONE strategy-bearing
+           guidance step at ``branch`` (avg_success_step heuristic). Each such
+           ``PrefixSpec`` becomes a fresh group whose ``n_per_prompt`` student
+           suffixes all share that prefix+guidance (replayed deterministically,
+           deduped to a single teacher call) and diverge only afterward
+           (``dagger_iter=1``). Prefix+guidance are PG-masked; GRPO normalizes
+           within each group. If failures are too few, remaining prefixed slots
+           are padded with fresh on-policy baseline groups (``dagger_iter=0``).
+
+        Both passes run in lockstep (sync) mode so the per-group guidance dedup
+        in the pre_step hook is deterministic — set ``rollout.async_mode=false``.
+        """
+        # Monotonic rollout counter shared by the per-group guidance dump
+        # (_log_prefixed_prompts) and the per-trajectory outcome dump
+        # (_finalize_guided_batch) so they join on (rollout_idx, group_id).
+        self._rollout_idx = int(getattr(self, "_rollout_idx", -1)) + 1
+
+        n_prompts = len(items_by_group)
+        frac = float(self.guided_cfg.prefix_baseline_fraction)
+        n_baseline = max(1, min(n_prompts - 1, int(round(n_prompts * frac))))
+        n_prefixed = n_prompts - n_baseline
+        baseline_gids = list(range(n_baseline))
+        prefixed_gids = list(range(n_baseline, n_prompts))
+
+        logger.info(
+            f"[guided.prefix] batch split: {n_baseline} baseline groups + "
+            f"{n_prefixed} prefixed groups (n_per_prompt={n_per_prompt}); "
+            f"avg_success_step_count={self._avg_success_step_count:.2f}"
+        )
+
+        # ── Pass A: on-policy baseline half ──────────────────────────────
+        baseline_trajs = self._run_one_pass(
+            items_per_prompt=[(g, items_by_group[g]) for g in baseline_gids],
+            n_per_prompt=n_per_prompt,
+            actor_rollout_ref_wg=actor_rollout_ref_wg,
+            config=config,
+            override_config=override_config,
+            total_slots=total_slots,
+            override_provider=None,
+            dagger_iter_index=0,
+            branch_chain=[],
+            chain_id=0,
+        )
+        for t in baseline_trajs:
+            t.dagger_iter_index = 0
+            t.branch_chain = []
+            t.chain_id = 0
+        all_trajs: list[Trajectory] = list(baseline_trajs)
+        logger.info(
+            f"[guided.prefix] baseline pass: {len(baseline_trajs)} trajectories"
+        )
+
+        # ── Select prefixes from baseline failures ───────────────────────
+        branch_step = max(0, int(self._avg_success_step_count) - 1)
+        plans = self._select_prefixes(
+            baseline_trajs=baseline_trajs,
+            prefixed_gids=prefixed_gids,
+            branch_step=branch_step,
+        )
+        n_real_prefixed = len(plans)
+        pad_gids = [g for g in prefixed_gids if g not in plans]
+        metrics["guided/prefix_branch_step"] = float(branch_step)
+        metrics["guided/prefix_groups"] = float(n_real_prefixed)
+        metrics["guided/prefix_pad_groups"] = float(len(pad_gids))
+        logger.info(
+            f"[guided.prefix] selected {n_real_prefixed} prefixed groups "
+            f"(branch_step={branch_step}); padding {len(pad_gids)} with on-policy"
+        )
+
+        # ── Pass B1: prefixed half (replay prefix + single guidance step) ─
+        # Each prefixed group is seeded with its PARENT's task item (the parent
+        # may come from any baseline group; replaying its recorded actions only
+        # reaches the same branch pose in the parent's own task). For the
+        # single-task sanity every item is identical, but this keeps the general
+        # multi-task case correct.
+        if plans:
+            prefixed_trajs = self._run_one_pass(
+                items_per_prompt=[
+                    (g, items_by_group[plans[g].parent.group_id]) for g in plans.keys()
+                ],
+                n_per_prompt=n_per_prompt,
+                actor_rollout_ref_wg=actor_rollout_ref_wg,
+                config=config,
+                override_config=override_config,
+                total_slots=total_slots,
+                override_provider=lambda t, _p=plans: self._build_prefix_override_for(t, _p),
+                dagger_iter_index=1,
+                branch_chain=None,
+                chain_id=1,
+            )
+            for t in prefixed_trajs:
+                spec = plans.get(t.group_id)
+                t.dagger_iter_index = 1
+                t.chain_id = 1
+                t.branch_chain = [spec.branch_step_index] if spec else []
+            all_trajs.extend(prefixed_trajs)
+            logger.info(
+                f"[guided.prefix] prefixed pass: {len(prefixed_trajs)} trajectories"
+            )
+
+        # ── Pass B2: pad unfilled prefixed slots with on-policy groups ────
+        if pad_gids:
+            pad_trajs = self._run_one_pass(
+                items_per_prompt=[(g, items_by_group[g]) for g in pad_gids],
+                n_per_prompt=n_per_prompt,
+                actor_rollout_ref_wg=actor_rollout_ref_wg,
+                config=config,
+                override_config=override_config,
+                total_slots=total_slots,
+                override_provider=None,
+                dagger_iter_index=0,
+                branch_chain=[],
+                chain_id=0,
+            )
+            for t in pad_trajs:
+                t.dagger_iter_index = 0
+                t.branch_chain = []
+                t.chain_id = 0
+            all_trajs.extend(pad_trajs)
+            logger.info(
+                f"[guided.prefix] padding pass: {len(pad_trajs)} on-policy trajectories"
+            )
+
+        # Dump the prefixed prompts (prefix steps + guidance) for analysis.
+        self._log_prefixed_prompts(plans, metrics)
+
+        return self._finalize_guided_batch(
+            all_trajs, chains_spawned=1, n_per_prompt=n_per_prompt,
+            t_start=t_start, metrics=metrics,
+        )
+
+    def _select_prefixes(
+        self,
+        *,
+        baseline_trajs: list[Trajectory],
+        prefixed_gids: list[int],
+        branch_step: int,
+    ) -> dict[int, PrefixSpec]:
+        """Harvest one prefix per requested prefixed slot from baseline failures.
+
+        Groups baselines by their source group, takes up to
+        ``prefix_failures_per_group`` failures (reward < 1.0) from each, and
+        assigns them round-robin to the prefixed group ids. A failure is only
+        usable if it ran at least ``branch_step`` steps (so the prefix has the
+        steps to replay); shorter failures are skipped. Returns a dict
+        ``prefixed_group_id -> PrefixSpec``; unfilled slots are left out (the
+        caller pads them on-policy).
+        """
+        by_group: dict[int, list[Trajectory]] = {}
+        for t in baseline_trajs:
+            by_group.setdefault(t.group_id, []).append(t)
+
+        k = max(1, int(self.guided_cfg.prefix_failures_per_group))
+        # Collect candidate failures, interleaving across source groups so the
+        # prefixes are diverse rather than all drawn from one group.
+        per_group_failures: list[list[Trajectory]] = []
+        for g in sorted(by_group):
+            fails = [
+                t for t in by_group[g]
+                if not _is_solved(t) and len(t.step_responses) >= branch_step
+            ]
+            per_group_failures.append(fails[:k])
+
+        candidates: list[Trajectory] = []
+        depth = max((len(f) for f in per_group_failures), default=0)
+        for d in range(depth):
+            for fails in per_group_failures:
+                if d < len(fails):
+                    candidates.append(fails[d])
+
+        plans: dict[int, PrefixSpec] = {}
+        for gid, parent in zip(prefixed_gids, candidates):
+            # Clamp the branch to the parent's available prefix length; a branch
+            # past the parent's end has no guidance pose to replay to.
+            b = min(branch_step, len(parent.step_responses))
+            plans[gid] = PrefixSpec(
+                parent=parent, branch_step_index=b, group_id=gid,
+            )
+        return plans
+
+    def _build_prefix_override_for(
+        self,
+        t: Trajectory,
+        plans: dict[int, PrefixSpec],
+    ) -> Optional[tuple[str, list[int], bool, bool]] | _PendingAnnotation:
+        """``override_provider`` for the prefixed pass.
+
+        - ``step < branch``: deterministic prefix replay from the parent failure
+          (PG-masked conditioning, never SFT'd).
+        - ``step == branch``: the SINGLE guidance step. If already annotated for
+          this group, return the cached text; else defer a teacher call
+          (deduped per group by the pre_step hook). Oracle exhaustion / an
+          answer-only branch degrades the group to a pure on-policy suffix.
+        - ``step > branch``: the student runs free (return None).
+        """
+        spec = plans.get(t.group_id)
+        if spec is None:
+            return None
+        step_idx = t.num_steps
+        branch = spec.branch_step_index
+        parent = spec.parent
+
+        # ── 1. Prefix replay ────────────────────────────────────────────
+        if step_idx < branch:
+            if step_idx >= len(parent.step_responses):
+                return None
+            text = parent.step_responses[step_idx]
+            token_ids = parent.step_response_token_ids[step_idx]
+            # Masked from PG (is_teacher=True), not SFT'd (is_expert=False):
+            # replayed on-policy tokens, conditioning only.
+            return text, list(token_ids), True, False
+
+        # ── 2. Single guidance step at the branch ───────────────────────
+        if step_idx == branch and not spec.no_guidance:
+            if spec.annotation is not None:
+                text, token_ids = spec.annotation
+                return text, list(token_ids), True, bool(self.guided_cfg.guidance_is_expert)
+            expert_action = self.expert_action_fn(
+                t.pool, t.slot_id, _dataset_item_for(t),
+            )
+            if not expert_action or not str(expert_action).strip():
+                spec.no_guidance = True
+                return None
+            if (
+                not self.guided_cfg.force_expert_answer
+                and _is_answer_action(expert_action)
+            ):
+                spec.no_guidance = True
+                return None
+
+            def _cache(text, token_ids, _s=spec):
+                _s.annotation = (text, list(token_ids))
+
+            return _PendingAnnotation(
+                dict(
+                    pool=t.pool,
+                    slot_id=t.slot_id,
+                    episode_id=t.episode_id,
+                    expert_action_formatted=expert_action,
+                    parent=parent,
+                    branch_step_index=branch,
+                ),
+                group_key=t.group_id,
+                on_annotated=_cache,
+            )
+
+        # ── 3. Student suffix (step > branch, or no-guidance fallback) ───
+        return None
+
+    def _log_prefixed_prompts(
+        self,
+        plans: dict[int, PrefixSpec],
+        metrics: dict[str, Any],
+    ) -> None:
+        """Persist the prefixed prompts (replayed prefix + guidance step) so the
+        guidance behavior can be audited. Controlled by the ``POPE_PREFIX_DUMP``
+        env var (a directory); a per-rollout JSONL of one record per prefixed
+        group is appended. Best-effort: never raises into the rollout.
+        """
+        dump_dir = os.environ.get("POPE_PREFIX_DUMP", "").strip()
+        if not dump_dir or not plans:
+            return
+        try:
+            os.makedirs(dump_dir, exist_ok=True)
+            recs = []
+            for gid, spec in sorted(plans.items()):
+                parent = spec.parent
+                b = spec.branch_step_index
+                guidance_text = (
+                    spec.annotation[0] if spec.annotation is not None else None
+                )
+                recs.append({
+                    "rollout_idx": int(getattr(self, "_rollout_idx", 0)),
+                    "group_id": gid,
+                    "branch_step": b,
+                    "parent_episode_id": getattr(parent, "episode_id", None),
+                    "parent_num_steps": int(getattr(parent, "num_steps", 0) or 0),
+                    "parent_reward": float(parent.reward) if parent.reward is not None else None,
+                    "prefix_responses": list(parent.step_responses[:b]),
+                    "guidance_text": guidance_text,
+                    "no_guidance": bool(spec.no_guidance),
+                })
+            n_with_guidance = sum(1 for r in recs if r["guidance_text"])
+            metrics["guided/prefix_with_guidance"] = float(n_with_guidance)
+            # One file per rollout-worker; appended across training steps. The
+            # step index is not available here, so records are timestamp-free and
+            # ordered by append; the plot script reads them in order.
+            path = os.path.join(dump_dir, f"prefixed_prompts_rank{getattr(self, 'rank', 0)}.jsonl")
+            with open(path, "a") as f:
+                for r in recs:
+                    f.write(json.dumps(r) + "\n")
+        except Exception as e:  # pragma: no cover — diagnostics must never crash
+            logger.warning(f"[guided.prefix] failed to dump prefixed prompts: {e!r}")
 
     # ── flat async orchestration ─────────────────────────────────────────
 
@@ -1308,27 +1710,62 @@ class GuidedMultiturnEnvRollout(MultiturnEnvRollout):
             if not pending:
                 return
 
+            # SFT flag for the freshly-annotated forced/guidance step. The chain
+            # orchestration imitates forced steps (is_expert=True); the prefix-
+            # testing orchestration defers to ``guidance_is_expert`` (pure
+            # PrefixRL → False: the guidance is conditioning, gradient flows only
+            # through the student suffix).
+            forced_is_expert = (
+                bool(self.guided_cfg.guidance_is_expert)
+                if getattr(self.guided_cfg, "orchestration_mode", "chain") == "prefix_groups"
+                else True
+            )
+
             # Annotate phase (parallel): fan the deferred teacher calls out so
             # the vLLM teacher server batches the concurrent requests. Without
             # this, a step's N forced annotations run serially (each a slow 32B
             # call), stalling the whole rollout loop and idling the simulators.
-            def _run(item: tuple[Trajectory, _PendingAnnotation]):
+            #
+            # Deduplicate by ``group_key`` first: all pendings sharing a key
+            # (the N student suffixes of one prefixed group at their common
+            # branch) resolve to ONE teacher call, broadcast byte-identically to
+            # every sibling — required so the within-group GRPO comparison sees a
+            # shared prefix+guidance. Keyless pendings (chain orchestration) each
+            # form their own singleton group, preserving prior behavior.
+            groups: dict[Any, list[tuple[Trajectory, _PendingAnnotation]]] = {}
+            order: list[Any] = []
+            for item in pending:
                 t, pend = item
-                text, token_ids = annotate_fn(**pend.kwargs)
-                text, token_ids = self._ensure_summary_for_forced_step(text, token_ids)
-                return t, text, token_ids
+                key = pend.group_key if pend.group_key is not None else id(t)
+                if key not in groups:
+                    groups[key] = []
+                    order.append(key)
+                groups[key].append(item)
 
-            if len(pending) == 1:
-                t, text, token_ids = _run(pending[0])
-                t.pending_response_override = (text, list(token_ids), True, True)
+            def _run_group(key):
+                t0, pend0 = groups[key][0]
+                text, token_ids = annotate_fn(**pend0.kwargs)
+                text, token_ids = self._ensure_summary_for_forced_step(text, token_ids)
+                return key, text, token_ids
+
+            def _apply(key, text, token_ids):
+                members = groups[key]
+                ov = (text, list(token_ids), True, forced_is_expert)
+                for t, _pend in members:
+                    t.pending_response_override = ov
+                cb = members[0][1].on_annotated
+                if cb is not None:
+                    cb(text, list(token_ids))
+
+            if len(order) == 1:
+                key, text, token_ids = _run_group(order[0])
+                _apply(key, text, token_ids)
                 return
 
-            with ThreadPoolExecutor(max_workers=min(len(pending), max_workers)) as ex:
-                for fut in as_completed([ex.submit(_run, item) for item in pending]):
-                    t, text, token_ids = fut.result()
-                    # Fresh oracle step: mask from PG (is_teacher=True) AND
-                    # imitate via SFT (is_expert=True).
-                    t.pending_response_override = (text, list(token_ids), True, True)
+            with ThreadPoolExecutor(max_workers=min(len(order), max_workers)) as ex:
+                for fut in as_completed([ex.submit(_run_group, key) for key in order]):
+                    key, text, token_ids = fut.result()
+                    _apply(key, text, token_ids)
 
         self._pre_step_hook = pre_step
         try:

@@ -185,6 +185,35 @@ class GuidedRolloutConfig:
     """EMA smoothing for the v2 ``avg_success_step`` running stat
     (new = beta*old + (1-beta)*obs; first observation is set directly)."""
 
+    # ── prefix-testing orchestration (pope_dagger_prefixtesting.md) ──────
+    orchestration_mode: str = "chain"
+    """'chain' (default — the v2 baseline→iters chain) or 'prefix_groups' (the
+    prefix-testing experiment: split the batch into an on-policy baseline half +
+    a prefixed half where each group is k student suffixes sharing ONE
+    prefix + single strategy-bearing guidance step, GRPO'd within the group,
+    prefix+guidance masked). Requires ``rollout.async_mode=false`` so the
+    per-group guidance dedup is deterministic."""
+
+    prefix_baseline_fraction: float = 0.5
+    """prefix_groups only: fraction of the batch's prompts rolled out as
+    on-policy baseline groups; the rest become prefixed groups built from the
+    baselines' failures. 0.5 → 16 baseline + 16 prefixed at batch_size=32."""
+
+    prefix_failures_per_group: int = 1
+    """prefix_groups only: how many distinct failure prefixes to harvest from
+    each baseline group (each becomes one prefixed group)."""
+
+    guidance_is_expert: bool = False
+    """prefix_groups only: whether the single guidance step is SFT-imitated
+    (is_expert=True) in addition to being PG-masked. Pure PrefixRL → False."""
+
+    teacher_system_prompt_path: Optional[str] = None
+    """Optional override path for the teacher annotation system prompt. The
+    prefix-testing experiment points this at the strategy prompt
+    (``annotation_system_prompt_multiturn_strategy.txt``) so the teacher's
+    forced step carries an explicit, route-derived strategy in a full-fact
+    ``<summary>``. None → the teacher uses its schema-derived default."""
+
     random_regression_seed: int | None = None
     """Optional seed for the V5 selector RNG. Mixed with (group_id, iter_k) so
     each (prompt, iter) gets a deterministic but distinct sample. None →
