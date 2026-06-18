@@ -226,6 +226,10 @@ def _create_multiturn_rollout(config: PPOConfig, tokenizer, processor):
             branch_selection_mode=guided_cfg.branch_selection_mode,
             random_regression_seed=guided_cfg.random_regression_seed,
             avg_success_ema_beta=guided_cfg.avg_success_ema_beta,
+            orchestration_mode=guided_cfg.orchestration_mode,
+            prefix_baseline_fraction=guided_cfg.prefix_baseline_fraction,
+            prefix_failures_per_group=guided_cfg.prefix_failures_per_group,
+            guidance_is_expert=guided_cfg.guidance_is_expert,
         )
         # Teacher annotator wiring. Server mode → ServerTeacherVLM via
         # pope_dagger.teacher_vlm; co-located mode is not yet implemented.
@@ -249,6 +253,11 @@ def _create_multiturn_rollout(config: PPOConfig, tokenizer, processor):
                     past_context_steps=guided_cfg.teacher_past_context_steps,
                     future_context_steps=guided_cfg.teacher_future_context_steps,
                     max_workers=guided_cfg.teacher_max_workers,
+                    system_prompt_path=guided_cfg.teacher_system_prompt_path,
+                    # summary_context guidance: the strategy prompt mandates a
+                    # trailing <summary> with a 'Strategy:' sentence. Gate on the
+                    # custom teacher prompt being set (the prefix-testing path).
+                    emit_summary=bool(guided_cfg.teacher_system_prompt_path),
                 )
                 teacher = ServerTeacherVLM(tcfg)
 
@@ -258,6 +267,7 @@ def _create_multiturn_rollout(config: PPOConfig, tokenizer, processor):
                 from pope_dagger_sanity.types import TrajectoryStepRecord
                 from common.prompting.response_format import (
                     build_assistant_response_no_summary,
+                    build_assistant_response_trailing_summary,
                 )
                 _placeholder = _build_placeholder_annotator(tokenizer)
                 _ACTION_TAG_RE = _re.compile(
@@ -364,15 +374,26 @@ def _create_multiturn_rollout(config: PPOConfig, tokenizer, processor):
                         )
                         annotated = teacher.annotate_branch(req)
                         reasoning = (annotated[0].reasoning if annotated else "") or ""
+                        summary = (annotated[0].summary if annotated else "") or ""
                         if not reasoning.strip():
                             logging.warning(
                                 f"[guided] teacher returned empty reasoning for slot {slot_id} "
                                 f"(ep={episode_id}); using placeholder for this step"
                             )
                             return _fallback()
-                        text = build_assistant_response_no_summary(
-                            reasoning, entry_d["action_str"],
-                        )
+                        # Under summary_context the strategy teacher emits a
+                        # trailing <summary> (all prior facts + the recovery
+                        # strategy). Carry it so the next on-policy step inherits
+                        # memory; otherwise (standard teacher) emit think+action
+                        # and let _ensure_summary_for_forced_step synthesize one.
+                        if summary.strip():
+                            text = build_assistant_response_trailing_summary(
+                                reasoning, entry_d["action_str"], summary.strip(),
+                            )
+                        else:
+                            text = build_assistant_response_no_summary(
+                                reasoning, entry_d["action_str"],
+                            )
                         token_ids = tokenizer.encode(text, add_special_tokens=False)
                         return text, token_ids
                     except Exception as e:
