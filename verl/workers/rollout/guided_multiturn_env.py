@@ -301,8 +301,36 @@ class GuidedMultiturnEnvRollout(MultiturnEnvRollout):
         # successful baseline (dagger_iter==0) trajectories solved. Drives the
         # ``avg_success_step`` branch selector. Persists across rollouts on this
         # rollout-worker instance, so it accumulates over training steps.
+        #
+        # NOTE: this EMA is process-local and is NOT part of the verl checkpoint.
+        # On resume (NCCL hang restart, preemption, or — for a >48h run — the
+        # inevitable walltime-limit re-queue) it would otherwise reset to 0.0,
+        # forcing the first resumed rollout to branch_step=0 (guidance injected
+        # at step 0 instead of ~avg_success-1) and wasting that step's guidance.
+        # ``POPE_INIT_AVG_SUCCESS_STEP`` seeds it to the value the EMA held at the
+        # end of the resumed-from checkpoint, so step N resumes with the correct
+        # branch_step immediately. Read once at construction.
         self._avg_success_step_count: float = 0.0
         self._avg_success_seen: bool = False
+        _seed = os.environ.get("POPE_INIT_AVG_SUCCESS_STEP", "").strip()
+        if _seed:
+            try:
+                _seed_val = float(_seed)
+            except ValueError:
+                logger.warning(
+                    f"[guided] ignoring non-numeric "
+                    f"POPE_INIT_AVG_SUCCESS_STEP={_seed!r}"
+                )
+            else:
+                if _seed_val > 0.0:
+                    self._avg_success_step_count = _seed_val
+                    self._avg_success_seen = True
+                    logger.info(
+                        f"[guided] seeded avg_success_step_count="
+                        f"{_seed_val:.2f} from POPE_INIT_AVG_SUCCESS_STEP "
+                        f"(resume EMA restore; first branch_step="
+                        f"{max(0, int(_seed_val) - 1)})"
+                    )
 
     # Override to short-circuit when guidance is disabled at runtime.
     def generate_trajectories(
