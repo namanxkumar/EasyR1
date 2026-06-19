@@ -1610,7 +1610,32 @@ class GuidedMultiturnEnvRollout(MultiturnEnvRollout):
             for n_idx in range(n_per_prompt):
                 pending_queue.append((group_id, n_idx, item_data))
 
-        initial_count = min(len(pending_queue), total_slots)
+        # Cap the initial batch by the LIVE available slot count, not the static
+        # `total_slots`. prefix_groups runs three passes back-to-back within one
+        # rollout (baseline -> prefixed -> pad); when the prior pass has just
+        # drained, slot releases are still settling (async release + reactive
+        # memory-pressure shrink in release_env), so live availability can dip
+        # below total_slots for a moment. Sizing the initial batch off the static
+        # count then over-subscribes and _initialize_batch raises "No simulator
+        # slots available" (e.g. group=19, n=6 at branch_step=3). The leftover
+        # stays in pending_queue and the continuous loop's refill path (which
+        # already caps by live availability) picks it up as slots free. Poll a
+        # few times so a transient empty read doesn't strand the whole pass.
+        live_available = 0
+        for _attempt in range(10):
+            live_available = sum(
+                ray.get([p.get_available_count.remote() for p in self.simulator_pools])
+            )
+            if live_available > 0 or not pending_queue:
+                break
+            time.sleep(1.0)
+        initial_count = min(len(pending_queue), total_slots, max(live_available, 0))
+        if live_available < total_slots and pending_queue:
+            logger.info(
+                f"  _run_one_pass: live slots {live_available} < total_slots "
+                f"{total_slots}; seeding {initial_count} now, "
+                f"{len(pending_queue) - initial_count} via refill"
+            )
         initial_batch = [pending_queue.popleft() for _ in range(initial_count)]
         active = self._initialize_batch(initial_batch)
         all_trajs: list[Trajectory] = list(active)
