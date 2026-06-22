@@ -230,6 +230,9 @@ def _create_multiturn_rollout(config: PPOConfig, tokenizer, processor):
             prefix_baseline_fraction=guided_cfg.prefix_baseline_fraction,
             prefix_failures_per_group=guided_cfg.prefix_failures_per_group,
             guidance_is_expert=guided_cfg.guidance_is_expert,
+            prefix_allocation=guided_cfg.prefix_allocation,
+            prefix_max_group_alloc_fraction=guided_cfg.prefix_max_group_alloc_fraction,
+            prefix_allow_failure_reuse=guided_cfg.prefix_allow_failure_reuse,
         )
         # Teacher annotator wiring. Server mode → ServerTeacherVLM via
         # pope_dagger.teacher_vlm; co-located mode is not yet implemented.

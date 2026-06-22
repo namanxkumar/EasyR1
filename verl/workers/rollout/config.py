@@ -207,6 +207,25 @@ class GuidedRolloutConfig:
     """prefix_groups only: whether the single guidance step is SFT-imitated
     (is_expert=True) in addition to being PG-masked. Pure PrefixRL → False."""
 
+    prefix_allocation: str = "uniform"
+    """prefix_groups only: how the fixed prefixed-slot budget is distributed
+    across baseline source groups. 'uniform' = each baseline group donates up to
+    ``prefix_failures_per_group`` failures, assigned round-robin (legacy).
+    'failure_weighted' = reallocate the budget proportional to each group's
+    usable-failure count (a group that fails more seeds more prefixed groups; a
+    mostly-successful group seeds few/none), with a per-group cap for diversity."""
+
+    prefix_max_group_alloc_fraction: float = 0.5
+    """failure_weighted only: cap on the fraction of the total prefixed-slot
+    budget a single baseline group may seed (diversity guard so one
+    pathologically hard task can't consume every prefixed slot)."""
+
+    prefix_allow_failure_reuse: bool = False
+    """failure_weighted only: if True a hot group may seed more prefixed groups
+    than it has distinct failures by cycling failures (each with an independent
+    teacher annotation). If False (default) a group's allocation is capped at its
+    distinct-failure count and any shortfall pads on-policy."""
+
     teacher_system_prompt_path: Optional[str] = None
     """Optional override path for the teacher annotation system prompt. The
     prefix-testing experiment points this at the strategy prompt

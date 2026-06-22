@@ -40,6 +40,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -193,6 +194,19 @@ class GuidedConfig:
     # this is False — the guidance is pure conditioning, gradient flows only
     # through the student suffix. (sft_coef=0 also nullifies SFT regardless.)
     guidance_is_expert: bool = False
+    # How the fixed prefixed-slot budget is split across baseline source groups.
+    # "uniform" (legacy): each baseline group donates up to
+    # prefix_failures_per_group failures, round-robin. "failure_weighted":
+    # reallocate the budget proportional to each group's usable-failure count
+    # (worse groups seed more prefixed groups; above-average groups seed none),
+    # capped per group by prefix_max_group_alloc_fraction.
+    prefix_allocation: str = "uniform"
+    # failure_weighted only: max fraction of the total prefixed-slot budget a
+    # single baseline group may seed (diversity guard).
+    prefix_max_group_alloc_fraction: float = 0.5
+    # failure_weighted only: allow a hot group to seed more prefixed groups than
+    # it has distinct failures by reusing them (independent teacher annotations).
+    prefix_allow_failure_reuse: bool = False
 
 
 @dataclass
@@ -885,23 +899,29 @@ class GuidedMultiturnEnvRollout(MultiturnEnvRollout):
         for t in baseline_trajs:
             by_group.setdefault(t.group_id, []).append(t)
 
-        k = max(1, int(self.guided_cfg.prefix_failures_per_group))
-        # Collect candidate failures, interleaving across source groups so the
-        # prefixes are diverse rather than all drawn from one group.
-        per_group_failures: list[list[Trajectory]] = []
-        for g in sorted(by_group):
-            fails = [
+        # Usable failures per source group (failed AND ran far enough to replay
+        # the prefix), preserving rollout order within each group.
+        usable: dict[int, list[Trajectory]] = {
+            g: [
                 t for t in by_group[g]
                 if not _is_solved(t) and len(t.step_responses) >= branch_step
             ]
-            per_group_failures.append(fails[:k])
+            for g in sorted(by_group)
+        }
 
-        candidates: list[Trajectory] = []
-        depth = max((len(f) for f in per_group_failures), default=0)
-        for d in range(depth):
-            for fails in per_group_failures:
-                if d < len(fails):
-                    candidates.append(fails[d])
+        if str(self.guided_cfg.prefix_allocation) == "failure_weighted":
+            candidates = self._failure_weighted_candidates(usable, len(prefixed_gids))
+        else:
+            k = max(1, int(self.guided_cfg.prefix_failures_per_group))
+            # Uniform (legacy): up to k failures per group, interleaved across
+            # source groups so the prefixes are diverse rather than all from one.
+            per_group_failures = [fails[:k] for fails in usable.values()]
+            candidates = []
+            depth = max((len(f) for f in per_group_failures), default=0)
+            for d in range(depth):
+                for fails in per_group_failures:
+                    if d < len(fails):
+                        candidates.append(fails[d])
 
         plans: dict[int, PrefixSpec] = {}
         for gid, parent in zip(prefixed_gids, candidates):
@@ -912,6 +932,80 @@ class GuidedMultiturnEnvRollout(MultiturnEnvRollout):
                 parent=parent, branch_step_index=b, group_id=gid,
             )
         return plans
+
+    def _failure_weighted_candidates(
+        self,
+        usable: dict[int, list[Trajectory]],
+        budget: int,
+    ) -> list[Trajectory]:
+        """Allocate the fixed prefixed-slot ``budget`` across source groups
+        proportional to each group's usable-failure count.
+
+        A group that fails more seeds more prefixed groups; a group at/above the
+        on-policy average (few failures) seeds few or none; a zero-failure group
+        seeds nothing. Allocation per group is capped at
+        ``prefix_max_group_alloc_fraction * budget`` (diversity guard) and, with
+        ``prefix_allow_failure_reuse=False``, at the group's distinct-failure
+        supply. Integer allocation: floor of the proportional target, then leftover
+        slots to the uncapped group with the largest failure count (ties → lower
+        group id). Returns the flattened candidate failures (interleaved across
+        groups for ordering diversity); unfilled budget falls through to padding.
+        """
+        groups = sorted(usable)  # deterministic order
+        counts = {g: len(usable[g]) for g in groups}
+        total_fail = sum(counts.values())
+        if budget <= 0 or total_fail == 0:
+            return []  # all-success / nothing to harvest → caller pads on-policy
+
+        reuse = bool(self.guided_cfg.prefix_allow_failure_reuse)
+        cap_frac = float(self.guided_cfg.prefix_max_group_alloc_fraction)
+        # Per-group ceiling: diversity cap, and (unless reuse) the supply of
+        # distinct failures. cap of 0 only when the group has no failures.
+        diversity_cap = max(1, math.ceil(cap_frac * budget))
+        cap = {
+            g: (diversity_cap if reuse else min(diversity_cap, counts[g]))
+            if counts[g] > 0 else 0
+            for g in groups
+        }
+
+        # Largest-remainder base = floor of proportional target, clamped to cap.
+        alloc = {
+            g: min(int((budget * counts[g]) // total_fail), cap[g])
+            for g in groups
+        }
+        # Distribute leftover slots to the uncapped group with the largest raw
+        # failure count (faithful to "worst gets most"); among equally-failing
+        # groups prefer the one allocated least so far (round-robin for prefix
+        # diversity), then the lower group id.
+        remaining = budget - sum(alloc.values())
+        while remaining > 0:
+            pool = [g for g in groups if alloc[g] < cap[g]]
+            if not pool:
+                break  # every group at its cap → shortfall pads on-policy
+            g = max(pool, key=lambda g: (counts[g], -alloc[g], -g))
+            alloc[g] += 1
+            remaining -= 1
+
+        # Materialize candidates, interleaved across groups so consecutive
+        # prefixed gids draw from different source tasks where possible.
+        picks: dict[int, list[Trajectory]] = {}
+        for g in groups:
+            n = alloc[g]
+            fails = usable[g]
+            if not n:
+                continue
+            picks[g] = (
+                [fails[i % len(fails)] for i in range(n)]  # reuse: cycle
+                if reuse else fails[:n]
+            )
+        candidates: list[Trajectory] = []
+        depth = max((len(v) for v in picks.values()), default=0)
+        for d in range(depth):
+            for g in groups:
+                v = picks.get(g)
+                if v and d < len(v):
+                    candidates.append(v[d])
+        return candidates
 
     def _build_prefix_override_for(
         self,
