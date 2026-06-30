@@ -86,6 +86,10 @@ class AdvantageEstimator(str, Enum):
     REINFORCE_PLUS_PLUS = "reinforce_plus_plus"
     REMAX = "remax"
     RLOO = "rloo"
+    # SDPO: pure self-distillation — no policy gradient, no group baseline. The
+    # loss is entirely the forward-KL distillation term (teacher = student+hint),
+    # so advantages are identically zero and n=1 (16 trajs/step) is valid.
+    PURE_DISTILLATION = "pure_distillation"
 
 
 ADV_ESTIMATOR_MAP: dict[str, Any] = {}
@@ -172,6 +176,22 @@ def compute_gae_advantage_return(
     returns = advantages + values
     advantages = VF.masked_whiten(advantages, response_mask)
     return advantages, returns
+
+
+@register_adv_estimator(AdvantageEstimator.PURE_DISTILLATION)
+def compute_pure_distillation_advantage(
+    token_level_rewards: torch.Tensor, response_mask: torch.Tensor, index: torch.Tensor, **kwargs
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """SDPO: identically-zero advantages/returns.
+
+    The objective is pure forward-KL distillation (no policy-gradient term, no
+    group baseline), so there is nothing to estimate here. n=1 is valid — no
+    ``len > 1`` assertion. The actor's distillation loss carries the entire
+    gradient; multiplying a zero advantage into ``pg_loss`` makes the PG term
+    vanish even if the actor still computes it.
+    """
+    zeros = torch.zeros_like(token_level_rewards)
+    return zeros, zeros
 
 
 @register_adv_estimator(AdvantageEstimator.GRPO)

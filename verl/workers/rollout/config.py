@@ -131,6 +131,35 @@ class MultiturnEnvConfig:
     val_n: int = 1
     """Rollouts per validation episode (typically 1 for deterministic eval)."""
 
+    # ── SDPO in-loop hint pass ─────────────────────────────────────
+    sdpo_hint_pass: bool = False
+    """Enable the post-rollout SDPO hint pass: a 32B ReAct verifier annotates
+    each trajectory's steps with privileged hints (``traj.step_hints``) used as
+    the self-distillation target. Also enables per-step privileged frame capture
+    (seg/depth/pose) during rollout. Off = vanilla/POPE behaviour, no overhead."""
+    sdpo_teacher_vlm_node: Optional[str] = None
+    """Hostname of the 32B teacher vLLM server (served as ``qwen_vllm``). When a
+    ``sdpo_teacher_job_name`` is set, the node is re-resolved via squeue each step
+    and this acts only as a fallback."""
+    sdpo_teacher_vlm_port: Optional[int] = None
+    """Port of the 32B teacher vLLM server."""
+    sdpo_teacher_job_name: Optional[str] = None
+    """SLURM job name of the teacher server. When set, the hint pass re-discovers
+    the teacher's node:port via squeue each training step (survives the teacher's
+    12h debug-pool restarts, which change its node). Falls back to the explicit
+    node/port above if discovery fails."""
+    sdpo_hint_workers: int = 8
+    """Thread-pool width for concurrent ReAct verifications in the hint pass."""
+    sdpo_hint_max_iters_per_step: int = 8
+    """ReAct tool-call budget per step (lower = faster/cheaper hint pass)."""
+    sdpo_hint_source: str = "react"
+    """Source of the per-step self-distillation hint when ``sdpo_hint_pass=true``:
+    ``"react"`` (default) runs the 32B ReAct verifier (needs a teacher server);
+    ``"privileged"`` runs a no-LLM pass that injects a compact perfect-perception
+    + perfect-memory snippet derived directly from the frame-backed StaticReplayer
+    ground truth (no teacher server, much faster, NO GT/map leak — only the
+    agent's own encountered observations). See ``sdpo.distill.run_privileged_pass``."""
+
 
 @dataclass
 class GuidedRolloutConfig:

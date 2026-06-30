@@ -92,6 +92,16 @@ class AlgorithmConfig:
     """filter out low reward samples if online filtering"""
     filter_high: float = 0.99
     """filter out high reward samples if online filtering"""
+    use_distillation_loss: bool = False
+    """enable SDPO self-distillation: distill a hint-conditioned teacher forward into the no-hint policy"""
+    distillation_coef: float = 1.0
+    """weight on the self-distillation term added to the actor loss"""
+    distillation_alpha: float = 0.0
+    """generalised JSD interpolation: 0.0 = forward KL(teacher||student) (OPSD beta=0), 1.0 = reverse, (0,1) = JSD"""
+    distillation_topk: int = 64
+    """number of teacher top-k tokens to match per position (full-vocab-normalised, plus an add-tail bucket)"""
+    distillation_token_clip: "float | None" = None
+    """optional per-token KL ceiling (OPSD jsd.clamp(max=...)); None disables clipping"""
 
 
 @dataclass
@@ -160,6 +170,11 @@ class PPOConfig:
         self.worker.actor.use_kl_loss = self.algorithm.use_kl_loss
         self.worker.actor.kl_penalty = self.algorithm.kl_penalty
         self.worker.actor.kl_coef = self.algorithm.kl_coef
+        self.worker.actor.use_distillation_loss = self.algorithm.use_distillation_loss
+        self.worker.actor.distillation_coef = self.algorithm.distillation_coef
+        self.worker.actor.distillation_alpha = self.algorithm.distillation_alpha
+        self.worker.actor.distillation_topk = self.algorithm.distillation_topk
+        self.worker.actor.distillation_token_clip = self.algorithm.distillation_token_clip
         # use_rollout_log_probs requires parity_log_probs to actually capture
         # the tensor from vLLM — auto-enable the capture flag so the user
         # can't silently mis-configure (would otherwise fall through to FSDP

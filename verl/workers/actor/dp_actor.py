@@ -283,6 +283,63 @@ class DataParallelPPOActor(BasePPOActor):
 
         return log_probs
 
+    def _forward_response_logits(
+        self, micro_batch: dict[str, torch.Tensor], temperature: float, prefix: str = ""
+    ) -> torch.Tensor:
+        """Non-padding-free forward returning response-position logits.
+
+        Returns ``(bsz, response_length, vocab)`` logits at the positions whose
+        token-i logits predict response token i (temperature-divided). Used ONLY
+        by the SDPO self-distillation path, which needs full logits (for the
+        teacher top-k + student gather), not just chosen-token log-probs.
+
+        ``prefix`` selects which tensors to forward: ``""`` reads
+        ``input_ids``/``attention_mask``/``position_ids`` (the student, hint-free);
+        ``"teacher_"`` reads ``teacher_input_ids``/``teacher_attention_mask``/
+        ``teacher_position_ids`` (the same θ with the hint in the prompt). The
+        ``responses`` and ``multi_modal_inputs`` (same image) are shared.
+
+        Only the plain non-padding-free regime is supported — the SDPO config
+        sets ``padding_free=false`` and no ``past_k_steps``. We raise on the
+        padding-free / K-window paths rather than silently mis-slicing.
+        """
+        if self.config.padding_free or getattr(self.config, "past_k_steps", None):
+            raise NotImplementedError(
+                "SDPO distillation requires padding_free=false and no past_k_steps "
+                "(needs full response-position logits for the teacher top-k gather)."
+            )
+
+        input_ids = micro_batch[f"{prefix}input_ids"]
+        attention_mask = micro_batch[f"{prefix}attention_mask"]
+        position_ids = micro_batch[f"{prefix}position_ids"]
+        responses = micro_batch["responses"]
+        response_length = responses.size(-1)
+
+        if position_ids.dim() == 3:  # qwen2vl mrope
+            position_ids = position_ids.transpose(0, 1)  # (bsz, 4, seqlen) -> (4, bsz, seqlen)
+
+        multi_modal_inputs = {}
+        if "multi_modal_inputs" in micro_batch:
+            multi_modal_inputs = batch_collate(micro_batch["multi_modal_inputs"])
+            multi_modal_inputs = {key: torch.cat(value, dim=0) for key, value in multi_modal_inputs.items()}
+
+        output = self.actor_module(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            **multi_modal_inputs,
+            use_cache=False,
+        )
+        logits: torch.Tensor = output.logits[:, -response_length - 1 : -1, :].contiguous()
+        logits.div_(temperature)
+        if logits.shape[:2] != responses.shape:
+            raise RuntimeError(
+                f"distill logits/responses shape mismatch (prefix={prefix!r}): "
+                f"logits={tuple(logits.shape)} responses={tuple(responses.shape)} "
+                f"input_ids={tuple(input_ids.shape)} response_length={response_length}"
+            )
+        return logits
+
     def _optimizer_step(self) -> torch.Tensor:
         if isinstance(self.actor_module, FSDP):
             grad_norm = self.actor_module.clip_grad_norm_(self.config.max_grad_norm)
@@ -364,6 +421,20 @@ class DataParallelPPOActor(BasePPOActor):
         # SFT/cross-entropy term below when sft_coef > 0.
         if "sft_token_mask" in data.batch.keys():
             select_keys.append("sft_token_mask")
+        # SDPO self-distillation: a separate hint-conditioned teacher forward over
+        # teacher_input_ids (prompt+HINT+resp) → top-k forward-KL into the no-hint
+        # policy. Gated on use_distillation_loss AND the teacher tensors being
+        # present (vanilla/POPE-DAgger batches lack them ⇒ this path is inert).
+        use_distill = getattr(self.config, "use_distillation_loss", False) and (
+            "teacher_input_ids" in data.batch.keys()
+        )
+        if use_distill:
+            select_keys.extend([
+                "teacher_input_ids",
+                "teacher_attention_mask",
+                "teacher_position_ids",
+                "self_distillation_mask",
+            ])
         select_keys.extend(["old_log_probs", "ref_log_probs", "advantages"])
         non_tensor_select_keys = ["multi_modal_inputs"]
 
@@ -390,8 +461,32 @@ class DataParallelPPOActor(BasePPOActor):
                     old_log_probs = model_inputs["old_log_probs"]
                     advantages = model_inputs["advantages"]
 
-                    # all return: (bsz, response_length)
-                    log_probs = self._forward_micro_batch(model_inputs, temperature=temperature)
+                    # SDPO: gate the distill forward path on use_distill — a
+                    # BATCH-LEVEL constant (config flag AND teacher_input_ids present
+                    # in the whole batch), identical across ALL ranks. It MUST NOT be
+                    # gated per-micro-batch on the hint count: under FSDP every
+                    # _forward_response_logits triggers a param all-gather, so if rank
+                    # A's micro-batch has a hinted row (student + teacher forward = 2
+                    # all-gathers) while rank B's same-index micro-batch has none
+                    # (1 forward), the ranks issue a DIFFERENT number of collectives
+                    # and NCCL dead-locks (a 30-min _ALLGATHER_BASE timeout -> SIGABRT;
+                    # this is what killed run 8872617). Non-hinted rows are zeroed by
+                    # self_distillation_mask inside the loss (and teacher==student for
+                    # them -> KL 0), so always running the teacher forward is a no-op
+                    # for them while keeping every rank's collective sequence identical.
+                    sd_mask_mb = model_inputs.get("self_distillation_mask") if use_distill else None
+
+                    if use_distill:
+                        # Student forward keeps full response-position logits so the
+                        # SAME forward feeds both the PG log-probs and the teacher
+                        # top-k gather (no second student forward).
+                        student_logits = self._forward_response_logits(
+                            model_inputs, temperature=temperature, prefix=""
+                        )
+                        log_probs = self.log_probs_from_logits(student_logits, model_inputs["responses"])
+                    else:
+                        # all return: (bsz, response_length)
+                        log_probs = self._forward_micro_batch(model_inputs, temperature=temperature)
 
                     teacher_token_mask = model_inputs.get("teacher_token_mask")
                     pg_loss, pg_metrics = compute_policy_loss(
@@ -455,6 +550,50 @@ class DataParallelPPOActor(BasePPOActor):
                                 (sft_token_mask.sum() / (response_mask.sum() + 1e-8)).detach().item()
                             ),
                             "actor/sft_token_count": sft_token_mask.sum().detach().item(),
+                        })
+
+                    # SDPO self-distillation term: a separate no_grad teacher
+                    # forward over teacher_input_ids (prompt+HINT+resp) gives the
+                    # hint-conditioned target; we distill its top-k forward-KL into
+                    # the no-hint student. The heavy logic (top-k gather + the KL)
+                    # lives in src/sdpo/distill — EasyR1 only orchestrates the two
+                    # forwards. Gated on use_distill (batch-level, all-rank-identical)
+                    # — see the forward-path comment above for why per-micro-batch
+                    # gating dead-locks FSDP. All vanilla/POPE-DAgger runs have
+                    # use_distill=False so this block is inert for them.
+                    if use_distill:
+                        from sdpo.distill.loss import (
+                            compute_self_distillation_loss,
+                            gather_teacher_topk,
+                        )
+
+                        with torch.no_grad():
+                            teacher_logits = self._forward_response_logits(
+                                model_inputs, temperature=temperature, prefix="teacher_"
+                            )
+                        student_topk_lp, teacher_topk_lp = gather_teacher_topk(
+                            student_logits, teacher_logits, k=self.config.distillation_topk
+                        )
+                        del teacher_logits
+                        distill_loss, distill_metrics = compute_self_distillation_loss(
+                            student_distill_log_probs=student_topk_lp,
+                            teacher_distill_log_probs=teacher_topk_lp,
+                            response_mask=response_mask,
+                            alpha=self.config.distillation_alpha,
+                            token_clip=self.config.distillation_token_clip,
+                            add_tail=True,
+                            self_distillation_mask=sd_mask_mb,
+                            loss_avg_mode=self.config.loss_avg_mode,
+                        )
+                        loss = loss + self.config.distillation_coef * distill_loss
+                        append_to_dict(metrics, {
+                            "actor/distill_loss": distill_metrics["distill_loss"],
+                            "actor/distill_kl_preclip": distill_metrics["distill_kl_preclip"],
+                            "actor/distill_clipfrac": distill_metrics.get("distill_clipfrac", 0.0),
+                            "actor/distill_coef": self.config.distillation_coef,
+                            "actor/distill_row_frac": (
+                                (sd_mask_mb.float().sum() / sd_mask_mb.numel()).detach().item()
+                            ),
                         })
 
                     loss = loss * torch.sum(response_mask) * self.world_size / total_response_tokens

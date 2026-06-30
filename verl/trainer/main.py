@@ -133,6 +133,7 @@ def _create_simulator_pools(mt_cfg, n_gpus: int):
                 context_mode=mt_cfg.context_mode,
                 past_k_steps=mt_cfg.past_k_steps,
                 reward_mode=mt_cfg.reward_mode,
+                sdpo_capture=bool(getattr(mt_cfg, "sdpo_hint_pass", False)),
             )
             pools.append(pool)
             pool_idx += 1

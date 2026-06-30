@@ -250,6 +250,24 @@ class Trajectory:
     # Left empty (and unused) in multi_turn / single_turn modes.
     step_prompts: list[list[dict]] = field(default_factory=list)
     step_images_list: list[list[Any]] = field(default_factory=list)
+    # Per-step SDPO teacher hint (the 32B ReAct verifier's focused hint for this
+    # step, or "" when the teacher abstains / no hint). Populated by the
+    # post-rollout SDPO hint pass; left empty for vanilla/POPE-DAgger runs.
+    # Aligned 1:1 with step_responses. A non-empty entry makes the
+    # summary-context builder emit a hint-conditioned teacher forward + a
+    # self_distillation_mask=1 on that step's row. An empty/None entry abstains
+    # (mask=0). A list of all-"" with the SDPO smoke flag set is the HINT=""
+    # control (teacher==student -> KL≈0 -> loss≈GRPO).
+    step_hints: list[str] = field(default_factory=list)
+    # Per-step SDPO privileged capture: ``{"viewed": bundle, "result": bundle}``
+    # (each bundle = seg/color_to_id/depth/intrinsics/pose) or None when capture
+    # was off / failed for that step. Aligned 1:1 with step_responses. Consumed
+    # by the in-loop hint pass to build a frame-backed StaticReplayer — the
+    # verifier answers GT tools from these instead of live AI2Thor.
+    step_privileged: list[Any] = field(default_factory=list)
+    # Episode-level scene constants for the StaticReplayer (target id/pos/name,
+    # reachable_positions, synset map). Captured once on the first SDPO step.
+    sdpo_scene: dict | None = None
 
     # Per-step phase timings (async rollout instrumentation). Each entry:
     # {"prompt_ms": float, "gen_ms": float, "env_ms": float}. Empty when
@@ -553,6 +571,90 @@ class MultiturnEnvRollout:
             )
         except Exception:
             self._row_pad_multiple = None
+
+        # SDPO self-distillation: when on, the summary_context builder additionally
+        # emits a hint-conditioned teacher view (teacher_input_ids/mask/position_ids
+        # + self_distillation_mask) per step row. Gated so vanilla / POPE-DAgger
+        # batches (flag off) stay byte-identical. Hint text comes from each
+        # trajectory's `step_hints` (populated by the in-loop ReAct hint pass);
+        # rows with an empty hint emit a teacher view == student view (KL≈0) and a
+        # zero self_distillation_mask, so an all-empty batch trains exactly as GRPO.
+        try:
+            self._emit_teacher_tensors = bool(
+                getattr(config.worker.actor, "use_distillation_loss", False)
+            )
+        except Exception:
+            self._emit_teacher_tensors = False
+
+        # ── SDPO in-loop hint pass ──────────────────────────────────────────
+        # Annotate each trajectory's per-step `step_hints` from the 32B ReAct
+        # verifier (frame-backed StaticReplayer; no live AI2Thor, no teacher-node
+        # replay). Runs AFTER controllers are destroyed (uses captured frames
+        # only) and BEFORE the summary-context builder reads step_hints. Heavy
+        # logic lives in the main repo (sdpo.distill.run_hint_pass); this is the
+        # thin EasyR1 seam.
+        # ``override_config`` is set only by the validation rollout
+        # (val_override_config); training passes None. Skip the hint pass during
+        # validation — val neither trains nor reads step_hints, so the 32B compute
+        # would be pure waste.
+        try:
+            mt_cfg = config.worker.multiturn_env
+            is_val = override_config is not None or getattr(
+                self, "_sdpo_skip_hint_pass", False
+            )
+            hint_source = str(getattr(mt_cfg, "sdpo_hint_source", "react") or "react")
+            if (
+                not is_val
+                and bool(getattr(mt_cfg, "sdpo_hint_pass", False))
+                and hint_source == "privileged"
+            ):
+                # No-teacher arm: inject a perfect-perception+memory snippet from
+                # the frame-backed StaticReplayer GT (no LLM, no teacher server).
+                from sdpo.distill.privileged_pass import run_privileged_pass
+
+                run_privileged_pass(
+                    all_trajectories,
+                    max_workers=int(getattr(mt_cfg, "sdpo_hint_workers", 8)),
+                    logger=logger,
+                )
+            elif not is_val and bool(getattr(mt_cfg, "sdpo_hint_pass", False)):
+                from sdpo.distill.hint_pass import run_hint_pass
+
+                node = getattr(mt_cfg, "sdpo_teacher_vlm_node", None)
+                port = getattr(mt_cfg, "sdpo_teacher_vlm_port", None)
+                # Prefer live squeue re-discovery by job name (the teacher's node
+                # changes across its 12h restarts); fall back to the static
+                # node/port if discovery fails.
+                job_name = getattr(mt_cfg, "sdpo_teacher_job_name", None)
+                if job_name:
+                    try:
+                        from pope_dagger.teacher_vlm import _discover_via_squeue
+
+                        d_node, d_port = _discover_via_squeue(str(job_name))
+                        node, port = d_node, int(d_port)
+                    except Exception as e:
+                        logger.warning(
+                            f"[sdpo] teacher squeue discovery failed ({job_name!r}: "
+                            f"{e}); falling back to static node={node} port={port}."
+                        )
+                if node and port:
+                    run_hint_pass(
+                        all_trajectories,
+                        vlm_node=str(node),
+                        vlm_port=int(port),
+                        max_workers=int(getattr(mt_cfg, "sdpo_hint_workers", 8)),
+                        max_iters_per_step=int(
+                            getattr(mt_cfg, "sdpo_hint_max_iters_per_step", 8)
+                        ),
+                        logger=logger,
+                    )
+                else:
+                    logger.warning(
+                        "[sdpo] sdpo_hint_pass=true but teacher node/port unset; "
+                        "skipping hint pass (all steps abstain -> loss == GRPO)."
+                    )
+        except Exception as e:
+            logger.error(f"[sdpo] hint pass raised, continuing without hints: {e}")
 
         # ── Build final DataProto batch ──
         batch = self._build_final_batch(
@@ -923,10 +1025,14 @@ class MultiturnEnvRollout:
                     n_terminated_this_step += 1
                     n_failed_this_step += 1
                     t.step_distances.append(None)
+                    t.step_privileged.append(None)  # keep 1:1 with step_responses
                     continue
 
                 reward, terminated, _info = result
                 t.step_distances.append(_info.get("dist_before"))
+                t.step_privileged.append(_info.get("sdpo_priv"))
+                if t.sdpo_scene is None and _info.get("sdpo_scene"):
+                    t.sdpo_scene = _info.get("sdpo_scene")
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug(
                         f"  [step {global_step}][grp {t.group_id}/{t.n_idx}] "
@@ -1221,8 +1327,12 @@ class MultiturnEnvRollout:
                         )
                         t.terminated = True
                         t.step_distances.append(None)
+                        t.step_privileged.append(None)  # keep 1:1 with step_responses
                         break
                     t.step_distances.append(info.get("dist_before"))
+                    t.step_privileged.append(info.get("sdpo_priv"))
+                    if t.sdpo_scene is None and info.get("sdpo_scene"):
+                        t.sdpo_scene = info.get("sdpo_scene")
                     t.step_phase_times.append({
                         "prompt_ms": prompt_ms,
                         "gen_ms": 0.0,
@@ -1367,8 +1477,12 @@ class MultiturnEnvRollout:
                     )
                     t.terminated = True
                     t.step_distances.append(None)
+                    t.step_privileged.append(None)  # keep 1:1 with step_responses
                     break
                 t.step_distances.append(info.get("dist_before"))
+                t.step_privileged.append(info.get("sdpo_priv"))
+                if t.sdpo_scene is None and info.get("sdpo_scene"):
+                    t.sdpo_scene = info.get("sdpo_scene")
 
                 env_ms = (time.time() - t_gen_done) * 1000.0
                 t.step_phase_times.append({
@@ -2210,6 +2324,10 @@ class MultiturnEnvRollout:
         # builder already emits these; summary_context must too).
         row_dagger_iter: list[int] = []
         row_chain_id: list[int] = []
+        # Per-row SDPO hint text (verifier step-level correction). "" when the
+        # step has no hint or SDPO is off; the teacher view of such a row equals
+        # the student view (KL≈0) and its self_distillation_mask is 0.
+        row_hints: list[str] = []
         # (group_id, chain_id, branch_chain) -> builder index j, used to resolve
         # each guided trajectory's parent by prefix match.
         _branch_key_to_j = {
@@ -2267,6 +2385,10 @@ class MultiturnEnvRollout:
                 )
                 row_traj_idx.append(j)
                 row_step_idx.append(s)
+                step_hints = getattr(traj, "step_hints", None) or []
+                row_hints.append(
+                    str(step_hints[s]) if s < len(step_hints) and step_hints[s] else ""
+                )
                 row_parent_idx.append(_parent_j)
                 row_branch_step.append(_branch_s)
                 row_dagger_iter.append(int(getattr(traj, "dagger_iter_index", 0)))
@@ -2319,6 +2441,7 @@ class MultiturnEnvRollout:
             row_branch_step.append(-1)
             row_dagger_iter.append(0)
             row_chain_id.append(0)
+            row_hints.append("")
         is_pad = [False] * n_real + [True] * pad_count
 
         # ── tokenize prompts (with images) ──
@@ -2382,6 +2505,58 @@ class MultiturnEnvRollout:
         resp_pos = prompt_pos[..., -1:] + delta
         full_pos = torch.cat([prompt_pos, resp_pos], dim=-1)
 
+        # ── SDPO teacher view (hint-conditioned) ──
+        # When SDPO is on, emit a parallel teacher input: the SAME response ids
+        # scored under a prompt extended with the step's hint. The hint-extension
+        # is a thin call into src/sdpo/distill (logic kept out of the fork). Rows
+        # with an empty hint get a teacher prompt == student prompt (KL≈0) and a
+        # zero self_distillation_mask, so an all-empty batch trains exactly as GRPO
+        # while still exercising the teacher forward (HINT-empty smoke).
+        teacher_tensors: "dict | None" = None
+        if getattr(self, "_emit_teacher_tensors", False):
+            from sdpo.distill.teacher_prompt import inject_hint
+
+            teacher_prompt_texts = [
+                inject_hint(prompt_texts[i], row_hints[i] if i < len(row_hints) else "")
+                for i in range(len(prompt_texts))
+            ]
+            t_tok = self._tokenize_prompts(teacher_prompt_texts, all_images)
+            t_prompt_ids = t_tok["input_ids"]
+            t_prompt_mask = t_tok["attention_mask"]
+            t_prompt_pos = t_tok["position_ids"]
+
+            t_full_ids = torch.cat([t_prompt_ids, response_ids_t], dim=-1)
+            t_full_mask = torch.cat([t_prompt_mask, response_mask_t], dim=-1)
+            t_resp_len = response_ids_t.shape[1]
+            t_delta = torch.arange(1, t_resp_len + 1, device=t_prompt_pos.device)
+            if t_prompt_pos.ndim == 3:  # mrope: (bs, 4, prompt_len)
+                t_delta = t_delta.view(1, 1, -1).expand(bs, t_prompt_pos.shape[1], -1)
+            else:
+                t_delta = t_delta.view(1, -1).expand(bs, -1)
+            t_resp_pos = t_prompt_pos[..., -1:] + t_delta
+            t_full_pos = torch.cat([t_prompt_pos, t_resp_pos], dim=-1)
+
+            # Gate: distill a row only when it is real, on-policy (not teacher-
+            # forced), and carries a non-empty hint. Pad rows / forced rows /
+            # hintless rows contribute zero distillation gradient.
+            sd_rows = [
+                1.0
+                if (
+                    not is_pad[ridx]
+                    and not row_teacher_forced[ridx]
+                    and ridx < len(row_hints)
+                    and bool(row_hints[ridx])
+                )
+                else 0.0
+                for ridx in range(bs)
+            ]
+            teacher_tensors = {
+                "teacher_input_ids": t_full_ids,
+                "teacher_attention_mask": t_full_mask,
+                "teacher_position_ids": t_full_pos,
+                "self_distillation_mask": torch.tensor(sd_rows, dtype=torch.float32),
+            }
+
         td = TensorDict(
             {
                 "prompts": prompt_ids,
@@ -2397,6 +2572,12 @@ class MultiturnEnvRollout:
             },
             batch_size=bs,
         )
+
+        # SDPO: attach the hint-conditioned teacher view (only when enabled, so
+        # vanilla / POPE-DAgger batches keep exactly the keys they had before).
+        if teacher_tensors is not None:
+            for _k, _v in teacher_tensors.items():
+                td[_k] = _v
 
         non_tensor = {
             "uid": np.array(row_uids, dtype=object),
@@ -2437,6 +2618,14 @@ class MultiturnEnvRollout:
         sft_tok = int(sft_token_mask_t.sum().item())
         resp_tok = int(response_mask_t.sum().item())
         n_forced_trajs = int(sum(traj_fully_forced))
+        if teacher_tensors is not None:
+            n_hint_rows = int(teacher_tensors["self_distillation_mask"].sum().item())
+            logger.info(
+                f"[sdpo] teacher view emitted: {n_hint_rows}/{bs} rows distilled "
+                f"(non-empty hint + on-policy + real); "
+                f"teacher_seq_len={teacher_tensors['teacher_input_ids'].shape[1]} "
+                f"student_seq_len={full_ids.shape[1]}"
+            )
         logger.info(
             f"[summary_context] final batch: {n_real} real step-samples "
             f"+ {pad_count} masked pad -> bs={bs} "
@@ -2765,6 +2954,7 @@ class ObjectNavEnvAdapter:
         context_mode: str = "multi_turn",
         past_k_steps: "int | None" = None,
         reward_mode: str = "continuous",
+        sdpo_capture: bool = False,
     ):
         self.env = env
         self.state_history = state_history
@@ -2774,6 +2964,13 @@ class ObjectNavEnvAdapter:
         self.max_observations = max_observations
         self.context_mode = context_mode
         self.past_k_steps = past_k_steps
+        # SDPO: capture per-step privileged frames (seg/depth/intrinsics/pose) +
+        # one scene constant dict during rollout, so the in-loop ReAct hint pass
+        # can answer ground-truth tools from a frame-backed StaticReplayer (no live
+        # AI2Thor on the teacher node, no separate replay). Free capture: grabbed
+        # off ``last_event`` which env.step already rendered. See sdpo.distill.
+        self.sdpo_capture = bool(sdpo_capture)
+        self._sdpo_scene_cache: "dict | None" = None
         if reward_mode not in ("continuous", "bimodal", "bimodal_noprogress", "success"):
             raise ValueError(
                 "reward_mode must be 'continuous', 'bimodal', 'bimodal_noprogress', "
@@ -2829,6 +3026,9 @@ class ObjectNavEnvAdapter:
         # first forced step (the branch) of this episode.
         self.expert_trajectory_cache = None
         self.expert_cache_base_num_steps = 0
+        # SDPO: scene constants (notably reachable_positions) differ per episode —
+        # rebuild lazily on the first captured step of this episode.
+        self._sdpo_scene_cache = None
         return {"observation": initial_state.observation}
 
     def build_prompt(self) -> tuple[list[dict], list[Image.Image]]:
@@ -2968,6 +3168,58 @@ class ObjectNavEnvAdapter:
             return 1.0 if -180 <= angle <= 180 else 0.0
         return 0.0
 
+    def _sdpo_capture_bundle(self, pose: dict) -> "dict | None":
+        """Grab the current frame's seg/depth/intrinsics off ``last_event``.
+
+        Zero extra render cost: the AI2Thor controller always renders depth +
+        instance segmentation, and ``env.step`` already populated ``last_event``.
+        We read it rather than issuing a fresh ``Pass``. Returns None on any
+        failure (capture must never break rollout) — the converter tolerates
+        missing bundles.
+        """
+        try:
+            ev = self.env._ai2thor.ai2thor_controller.last_event
+            if ev is None:
+                return None
+            seg = getattr(ev, "instance_segmentation_frame", None)
+            color_to_id = getattr(ev, "color_to_object_id", None)
+            depth = getattr(ev, "depth_frame", None)
+            if seg is None or color_to_id is None or depth is None:
+                return None
+            intrinsics = self.env._ai2thor.get_camera_intrinsics()
+            return {
+                "seg": np.asarray(seg).copy(),
+                "color_to_id": dict(color_to_id),
+                "depth": np.asarray(depth).copy(),
+                "intrinsics": intrinsics,
+                "pose": deepcopy(pose),
+            }
+        except Exception as e:  # never let capture break rollout
+            logger.warning(f"[sdpo] frame capture failed: {e}")
+            return None
+
+    def _sdpo_scene(self) -> dict:
+        """Episode-level scene constants for the verifier's StaticReplayer.
+
+        Cached: ``reachable_positions`` issues a controller round-trip, so we
+        compute it once per episode (first captured step).
+        """
+        if self._sdpo_scene_cache is not None:
+            return self._sdpo_scene_cache
+        item = getattr(self, "dataset_item", None) or {}
+        try:
+            reachable = self.env._ai2thor.get_reachable_positions()
+        except Exception:
+            reachable = None
+        self._sdpo_scene_cache = {
+            "target_object_id": item.get("target_object_id"),
+            "target_object_position": item.get("target_object_position"),
+            "target_name": item.get("target_object"),
+            "reachable_positions": reachable,
+            "synset_to_object_ids": item.get("synset_to_object_ids"),
+        }
+        return self._sdpo_scene_cache
+
     def step(self, action_text: str) -> tuple[float, bool, dict[str, Any]]:
         self.num_steps += 1
 
@@ -2995,7 +3247,17 @@ class ObjectNavEnvAdapter:
         action.response = action_text
 
         # Capture the observation the agent was looking at when it chose this action
-        prev_observation = self.state_history.get_last_state().observation
+        prev_state = self.state_history.get_last_state()
+        prev_observation = prev_state.observation
+
+        # SDPO: capture the VIEWED frame (seg/depth) BEFORE stepping — last_event
+        # still holds the pose the agent decided this action from (prev result pose
+        # == this viewed pose). Free read off last_event.
+        sdpo_viewed = (
+            self._sdpo_capture_bundle(prev_state.agent_state)
+            if self.sdpo_capture
+            else None
+        )
 
         # Step the environment
         try:
@@ -3017,6 +3279,15 @@ class ObjectNavEnvAdapter:
             return 0.0, False, {"action_type": "error", "dist_before": dist_before}
 
         self.state_history.append(action, deepcopy(new_state))
+
+        # SDPO: capture the RESULT frame AFTER the env.step render — last_event now
+        # holds the pose the agent ended up at. result pose of step i == viewed pose
+        # of step i+1 (same pose signature), keeping the StaticReplayer keyed.
+        sdpo_result = (
+            self._sdpo_capture_bundle(new_state.agent_state)
+            if self.sdpo_capture
+            else None
+        )
 
         # Track distance + accumulate forward-only progress (ViGoRL style:
         # cumulative max(0, prev - curr) across turns, raw absolute units).
@@ -3060,11 +3331,15 @@ class ObjectNavEnvAdapter:
         else:
             action_type = "unknown"
 
-        return new_state.reward, terminated, {
+        info = {
             "action_type": action_type,
             "dist_before": dist_before,
             "dist_after": new_state.shortest_path_distance_to_target,
         }
+        if self.sdpo_capture and (sdpo_viewed is not None or sdpo_result is not None):
+            info["sdpo_priv"] = {"viewed": sdpo_viewed, "result": sdpo_result}
+            info["sdpo_scene"] = self._sdpo_scene()
+        return new_state.reward, terminated, info
 
     def _debug_save_answer_image(self, action, new_state, prev_observation=None) -> None:
         """Save the observation image with the answer coordinate drawn on it.

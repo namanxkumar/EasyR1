@@ -161,6 +161,12 @@ class ActorConfig:
     use_kl_loss: bool = field(default=False, init=False)
     kl_penalty: str = field(default="kl", init=False)
     kl_coef: float = field(default=0.0, init=False)
+    # SDPO self-distillation auto keys (mirrored from AlgorithmConfig in PPOConfig.post_init)
+    use_distillation_loss: bool = field(default=False, init=False)
+    distillation_coef: float = field(default=1.0, init=False)
+    distillation_alpha: float = field(default=0.0, init=False)
+    distillation_topk: int = field(default=64, init=False)
+    distillation_token_clip: "float | None" = field(default=None, init=False)
 
 
 @dataclass

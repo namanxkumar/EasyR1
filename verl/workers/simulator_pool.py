@@ -58,6 +58,7 @@ class SimulatorPool:
         context_mode: str = "multi_turn",
         past_k_steps: "int | None" = None,
         reward_mode: str = "continuous",
+        sdpo_capture: bool = False,
     ):
         # Force AI2Thor to use the specified GPU (set before any CUDA init).
         # On Linux64 (H100 / AI2THOR_USE_LINUX64=1) leave CUDA_VISIBLE_DEVICES
@@ -80,6 +81,10 @@ class SimulatorPool:
         self.context_mode = context_mode
         self.past_k_steps = past_k_steps
         self.reward_mode = reward_mode
+        # SDPO: when set, the adapter captures per-step privileged frames
+        # (instance-seg / depth / pose / intrinsics) so the post-rollout hint pass
+        # can answer the verifier's ground-truth tools without a live simulator.
+        self.sdpo_capture = sdpo_capture
 
         # Slot management
         self.slots: list[Optional[Any]] = [None] * num_slots
@@ -415,6 +420,7 @@ class SimulatorPool:
                 context_mode=self.context_mode,
                 past_k_steps=self.past_k_steps,
                 reward_mode=self.reward_mode,
+                sdpo_capture=self.sdpo_capture,
             )
 
             # Stash the dataset item on the adapter so guided rollouts can
