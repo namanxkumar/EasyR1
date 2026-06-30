@@ -44,6 +44,7 @@ import math
 import os
 import re
 import time
+import traceback
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -53,9 +54,54 @@ import numpy as np
 import ray
 
 from verl.protocol import DataProto
+from verl.workers.rollout.forced_depth import (
+    forced_g_from_plan,
+    step_leave_on_policy,
+)
 from verl.workers.rollout.multiturn_env import MultiturnEnvRollout, Trajectory
 
 logger = logging.getLogger(__name__)
+
+
+# Deterministic answer-oriented handoff text (prefix_force_depth, L<=1). No-leak:
+# references only the task goal + "should be in view" + the action format; the
+# student concludes the answer pixel from its own current frame. Injected instead
+# of the base judge's prose, which reliably tells the student to keep approaching.
+_ANSWER_HANDOFF_SUMMARY = (
+    "I have moved into position and the target object should now be in view in my "
+    "current frame. The correct move is to ANSWER it directly — not to explore, "
+    "turn, or click the floor to get closer. I will emit <answer> at the target's "
+    "location in the image now."
+)
+_ANSWER_HANDOFF_HINT = (
+    "You are now in position and the object you were sent to find should be visible "
+    "in your current image. Do NOT explore, turn, or click the floor to approach it "
+    "any further. Emit your final <answer> at the target's location in the image now."
+)
+
+# Pixel-tuple patterns for the no-leak answer-case sanitizer: an <answer>(x,y) /
+# <answer>x=..,y=.. tag, or a bare "(x,y)" coordinate pair. The self-teacher judge
+# sees the target in [VISIBLE OBJECTS] and can leak its exact pixel into the hint/
+# summary that gets injected into the student's prompt; strip it so the student must
+# locate the target in its own view.
+_ANSWER_TAG_COORDS_RE = re.compile(r"<answer>\s*\(?[^<)]*\)?\s*</answer>", re.I)
+_BARE_COORDS_RE = re.compile(r"\(\s*\d{1,4}\s*,\s*\d{1,4}\s*\)")
+
+
+def _strip_answer_coords(text: str) -> str:
+    """Remove any leaked target pixel from judge-generated answer-case text.
+
+    Replaces ``<answer>(x,y)</answer>`` with a bare ``<answer>`` and drops bare
+    ``(x,y)`` tuples, so the injected hint/summary still says "answer the target you
+    see" without handing the student the exact coordinates (no-leak invariant)."""
+    if not text:
+        return text
+    text = _ANSWER_TAG_COORDS_RE.sub("<answer>", text)
+    text = _BARE_COORDS_RE.sub("", text)
+    # Tidy double spaces / stray " with " left by a removed tuple.
+    text = re.sub(r"\bwith\s+\.", ".", text)
+    text = re.sub(r"\s{2,}", " ", text).strip()
+    return text
 
 
 # ─── strategy hooks ────────────────────────────────────────────────────────
@@ -90,6 +136,75 @@ class _PendingAnnotation:
         self.kwargs = kwargs
         self.group_key = group_key
         self.on_annotated = on_annotated
+
+
+class _PendingHint:
+    """Deferred colocated SELF-teacher hint for one prefixed group's branch step
+    (``teacher_mode='self'``).
+
+    Unlike ``_PendingAnnotation`` (which yields a forced response that REPLACES
+    the student's turn, PG-masked), a ``_PendingHint`` yields NO response
+    override. The pre_step hook reconstructs the no-leak branch nav state on the
+    sim actor, runs the in-process judge (same engine/weights) to get a
+    corrective ``<hint>``, wraps it via ``diagnose.build_diagnosis_block``, and
+    sets ``pending_prompt_suffix`` on every sibling so the student re-decides on
+    its OWN — the student's response carries the policy gradient (train-on-it).
+
+    All k siblings of a prefixed group share ``group_key`` (== group_id), so the
+    judge is run ONCE per group and the identical hint is broadcast to every
+    sibling — required for a fair within-group GRPO comparison. ``slot_id`` is
+    the representative slot whose replayed prefix defines the (shared) branch
+    pose; ``on_resolved(hint_text)`` caches the hint onto the PrefixSpec for
+    later waves.
+    """
+
+    __slots__ = ("slot_id", "pool", "group_key", "on_resolved", "intended_action",
+                 "parent_suffix")
+
+    def __init__(self, slot_id, pool, group_key=None, on_resolved=None,
+                 intended_action=None, parent_suffix=None):
+        self.slot_id = slot_id
+        self.pool = pool
+        self.group_key = group_key
+        self.on_resolved = on_resolved
+        # Gap B: the parent's failed branch-step action text (e.g.
+        # "<explore>ground:(756,836)</explore>"). The pool casts its pixel to a
+        # world point and adds a VALID "Intent" correction to the judge menu.
+        self.intended_action = intended_action
+        # Forced-depth: the parent failure's raw responses from branch to end
+        # (the failed continuation). The judge diagnoses recurring suffix-level
+        # errors (pointing/format) and forms one general corrective hint.
+        self.parent_suffix = parent_suffix
+
+
+class _PendingForcedHandoff:
+    """Deferred combined judge call at the LAST forced step (prefix_force_depth).
+
+    At the last of G forced expert steps the colocated judge is run ONCE per
+    group to emit BOTH (a) a teacher ``<summary>`` carried into the on-policy
+    handoff step under summary_context, and (b) a suffix-derived corrective
+    ``<hint>`` cached for injection at the handoff (branch+G). The resolver
+    builds the forced response ``<think>..</think><summary>..</summary>{action}``
+    for THIS step (PG-masked) and stores the hint block on the PrefixSpec.
+
+    ``expert_action`` is the oracle action to force this step (already fetched in
+    the single-threaded decide phase, like ``_PendingAnnotation``).
+    ``parent_suffix`` is the parent's failed branch→end responses.
+    ``on_resolved(hint_block)`` caches the hint for the handoff step.
+    """
+
+    __slots__ = ("slot_id", "pool", "group_key", "on_resolved", "intended_action",
+                 "parent_suffix", "expert_action")
+
+    def __init__(self, slot_id, pool, expert_action, group_key=None,
+                 on_resolved=None, intended_action=None, parent_suffix=None):
+        self.slot_id = slot_id
+        self.pool = pool
+        self.expert_action = expert_action
+        self.group_key = group_key
+        self.on_resolved = on_resolved
+        self.intended_action = intended_action
+        self.parent_suffix = parent_suffix
 
 
 class ExpertActionFn(Protocol):
@@ -208,6 +323,32 @@ class GuidedConfig:
     # it has distinct failures by reusing them (independent teacher annotations).
     prefix_allow_failure_reuse: bool = False
 
+    # ── teacher backend (self-teacher path) ───────────────────────────────
+    # MUST be threaded through from the config.py GuidedConfig (main.py builds
+    # this slim dataclass field-by-field). When absent, ``_build_prefix_override_for``
+    # silently defaults to "server" and routes the branch step through the expert
+    # placeholder annotator instead of the colocated self-teacher diagnosis hint.
+    teacher_mode: str = "server"
+    # Sampling temperature for the colocated self-teacher judge (teacher_mode='self').
+    judge_temperature: float = 0.5
+    # Prompt-length budget for the self-teacher judge ONLY (see config.py docstring).
+    # The shared _tokenize_prompts right-truncates the diagnosis system prompt+menu+image
+    # at the student's 1536 cap otherwise. Requires worker.rollout.max_model_len headroom.
+    teacher_max_prompt_length: int = 4096
+
+    # ── moving forced-depth controller (prefix_groups + teacher_mode='self') ──
+    # See config.py GuidedRolloutConfig for the full docstrings. When
+    # prefix_force_depth is True, prefixed groups force G expert steps from the
+    # branch (G = max(0, expert_plan_len_from_branch - round(L))), attach a
+    # teacher strategy summary to the last forced step, and inject the
+    # suffix-derived hint at the handoff (branch+G). L is a global leave-on-policy
+    # count controlled toward prefix_depth_target prefixed-group success.
+    prefix_force_depth: bool = False
+    prefix_depth_target: float = 0.5
+    prefix_depth_ema_beta: float = 0.5
+    prefix_depth_deadband: float = 0.05
+    prefix_min_leave_on_policy: int = 1
+
 
 @dataclass
 class _IterPlan:
@@ -252,10 +393,26 @@ class PrefixSpec:
     group_id: int
     # Resolved guidance-step text + tokens (filled on first annotation).
     annotation: Optional[tuple[str, list[int]]] = None
+    # SELF-teacher mode (teacher_mode='self'): the resolved diagnosis hint BLOCK
+    # (already wrapped by build_diagnosis_block) cached across rollout waves so
+    # siblings reaching the branch later reuse the first wave's judge call. The
+    # block is injected as a USER-turn suffix, not a forced response.
+    hint_block: Optional[str] = None
     # True once the branch was reached but produced no forceable guidance step
     # (oracle exhausted / answer-only at branch): the whole group degrades to a
     # pure on-policy rollout from the prefix pose, no masking past the prefix.
     no_guidance: bool = False
+    # ── moving forced-depth fields (prefix_force_depth) ──────────────────
+    # Number of expert steps forced from the branch (G), computed lazily on the
+    # first sibling to reach the branch: G = max(0, expert_plan_len - round(L)).
+    # None = not yet computed; 0 collapses to the legacy single-hint-at-branch
+    # path. ``handoff_step`` = branch_step_index + forced_g is the first
+    # on-policy step (where the suffix-derived hint is injected).
+    forced_g: Optional[int] = None
+    handoff_step: Optional[int] = None
+    # True once the last-forced-step combined judge call (summary+hint) resolved
+    # and cached its hint on ``hint_block`` — guards against re-resolving.
+    handoff_resolved: bool = False
 
 
 # ─── default annotator (no-VLM, placeholder reasoning) ─────────────────────
@@ -311,6 +468,18 @@ class GuidedMultiturnEnvRollout(MultiturnEnvRollout):
         self.teacher_annotate_fn = (
             teacher_annotate_fn or _build_placeholder_annotator(self.tokenizer)
         )
+        # Prove the teacher backend reached the rollout. If teacher_mode is not
+        # threaded through main.py's slim GuidedConfig copy this silently reads
+        # "server" and the self-teacher hint path is never taken (placeholder
+        # expert annotation is used instead).
+        logger.info(
+            "[guided] rollout init: teacher_mode=%s judge_temperature=%s "
+            "orchestration=%s (annotate_fn=%s)",
+            getattr(self.guided_cfg, "teacher_mode", "server"),
+            getattr(self.guided_cfg, "judge_temperature", None),
+            getattr(self.guided_cfg, "orchestration_mode", "chain"),
+            "default-placeholder" if teacher_annotate_fn is None else "wired",
+        )
         # POPE-DAgger v2 running stat: on-policy EMA of the step count at which
         # successful baseline (dagger_iter==0) trajectories solved. Drives the
         # ``avg_success_step`` branch selector. Persists across rollouts on this
@@ -344,6 +513,35 @@ class GuidedMultiturnEnvRollout(MultiturnEnvRollout):
                         f"{_seed_val:.2f} from POPE_INIT_AVG_SUCCESS_STEP "
                         f"(resume EMA restore; first branch_step="
                         f"{max(0, int(_seed_val) - 1)})"
+                    )
+
+        # ── moving forced-depth controller state (prefix_force_depth) ──────
+        # L = number of trailing on-policy steps left to the student from the
+        # branch. Per-task forced count G = max(0, expert_plan_len - round(L)).
+        # L starts at prefix_min_leave_on_policy (force all but the trailing
+        # leave-count) and is nudged each rollout toward prefix_depth_target
+        # prefixed-group success via an EMA. Process-local (not checkpointed);
+        # POPE_INIT_LEAVE_ON_POLICY seeds it on resume.
+        self._leave_on_policy: float = float(
+            getattr(self.guided_cfg, "prefix_min_leave_on_policy", 1)
+        )
+        self._prefix_success_ema: float = 0.0
+        self._prefix_success_ema_seen: bool = False
+        _seed_L = os.environ.get("POPE_INIT_LEAVE_ON_POLICY", "").strip()
+        if _seed_L:
+            try:
+                _seed_Lv = float(_seed_L)
+            except ValueError:
+                logger.warning(
+                    f"[guided] ignoring non-numeric "
+                    f"POPE_INIT_LEAVE_ON_POLICY={_seed_L!r}"
+                )
+            else:
+                if _seed_Lv >= 1.0:
+                    self._leave_on_policy = _seed_Lv
+                    logger.info(
+                        f"[guided] seeded leave_on_policy={_seed_Lv:.2f} "
+                        f"from POPE_INIT_LEAVE_ON_POLICY (resume restore)"
                     )
 
     # Override to short-circuit when guidance is disabled at runtime.
@@ -684,6 +882,38 @@ class GuidedMultiturnEnvRollout(MultiturnEnvRollout):
         # the time series over training steps is the required visualization).
         metrics["guided/avg_success_step_count"] = float(self._avg_success_step_count)
 
+        # ── moving forced-depth controller update (prefix_force_depth) ──────
+        # Drive the global leave-on-policy count L toward prefix_depth_target
+        # prefixed-group success. The prefixed groups ARE the guided (dagger
+        # iter>=1) continuations, so gu_rate is the controlled signal. EMA-smooth
+        # it, then: success > target+deadband → student is coping, leave MORE on
+        # policy (L+=1, force fewer steps); success < target-deadband → too hard,
+        # force MORE (L-=1, floor at prefix_min_leave_on_policy). One update per
+        # rollout/training iteration.
+        if getattr(self.guided_cfg, "prefix_force_depth", False) and n_gu > 0:
+            (
+                self._leave_on_policy,
+                self._prefix_success_ema,
+                self._prefix_success_ema_seen,
+            ) = step_leave_on_policy(
+                self._leave_on_policy,
+                self._prefix_success_ema,
+                self._prefix_success_ema_seen,
+                gu_rate,
+                beta=float(self.guided_cfg.prefix_depth_ema_beta),
+                target=float(self.guided_cfg.prefix_depth_target),
+                deadband=float(self.guided_cfg.prefix_depth_deadband),
+                floor=float(self.guided_cfg.prefix_min_leave_on_policy),
+            )
+            logger.info(
+                f"[guided] forced-depth controller: gu_rate={gu_rate:.3f} "
+                f"ema={self._prefix_success_ema:.3f} "
+                f"target={float(self.guided_cfg.prefix_depth_target):.2f} "
+                f"-> leave_on_policy L={self._leave_on_policy:.1f}"
+            )
+        metrics["guided/leave_on_policy"] = float(self._leave_on_policy)
+        metrics["guided/prefix_success_ema"] = float(self._prefix_success_ema)
+
         # Taper signal: fraction of trajectories carrying any forced step.
         n_guided = sum(1 for t in all_trajs if any(t.step_teacher_forced or []))
         metrics["guided/guided_traj_frac"] = (
@@ -899,12 +1129,21 @@ class GuidedMultiturnEnvRollout(MultiturnEnvRollout):
         for t in baseline_trajs:
             by_group.setdefault(t.group_id, []).append(t)
 
+        # Per-parent mistake-aware branch selection (Gap A): when
+        # ``branch_selection_mode == "random_regression"`` each parent gets its
+        # OWN branch step sampled from its progress-regression region (reusing
+        # the V5 selector), instead of the global ``avg_success_step`` scalar
+        # that collapses to 0 on a base model that rarely succeeds.
+        mode = str(self.guided_cfg.branch_selection_mode)
         # Usable failures per source group (failed AND ran far enough to replay
         # the prefix), preserving rollout order within each group.
+        # random_regression needs a >=2-step progress series; the scalar modes
+        # need the parent to reach the fixed branch step.
+        min_steps = 2 if mode == "random_regression" else branch_step
         usable: dict[int, list[Trajectory]] = {
             g: [
                 t for t in by_group[g]
-                if not _is_solved(t) and len(t.step_responses) >= branch_step
+                if not _is_solved(t) and len(t.step_responses) >= min_steps
             ]
             for g in sorted(by_group)
         }
@@ -925,9 +1164,24 @@ class GuidedMultiturnEnvRollout(MultiturnEnvRollout):
 
         plans: dict[int, PrefixSpec] = {}
         for gid, parent in zip(prefixed_gids, candidates):
+            if mode == "random_regression":
+                # Mistake-region branch (per parent): sample a step in the
+                # parent's [peak..last_unrecovered] progress regression. No
+                # forced windows yet → the whole trajectory is the suffix.
+                from pope_dagger.analyzer import BranchSelectorState
+                b = self._select_branch_random_regression(
+                    parent=parent, state=BranchSelectorState(),
+                    group_id=gid, iter_k=1, chain_id=1,
+                )
+                if b is None:
+                    # No usable progress series — leave this slot for on-policy
+                    # padding rather than forcing a degenerate step-0 branch.
+                    continue
+            else:
+                b = branch_step
             # Clamp the branch to the parent's available prefix length; a branch
             # past the parent's end has no guidance pose to replay to.
-            b = min(branch_step, len(parent.step_responses))
+            b = min(b, len(parent.step_responses))
             plans[gid] = PrefixSpec(
                 parent=parent, branch_step_index=b, group_id=gid,
             )
@@ -1039,8 +1293,48 @@ class GuidedMultiturnEnvRollout(MultiturnEnvRollout):
             # replayed on-policy tokens, conditioning only.
             return text, list(token_ids), True, False
 
+        # ── 1b. Moving forced-depth path (prefix_force_depth + self-teacher) ─
+        # Force G expert steps from the branch, attach a teacher summary to the
+        # last forced step, and inject the suffix-derived hint at the handoff.
+        fd_on = (
+            bool(getattr(self.guided_cfg, "prefix_force_depth", False))
+            and str(getattr(self.guided_cfg, "teacher_mode", "server")) == "self"
+        )
+        if fd_on and step_idx >= branch and not spec.no_guidance:
+            return self._build_forced_depth_override(t, spec, step_idx)
+
         # ── 2. Single guidance step at the branch ───────────────────────
         if step_idx == branch and not spec.no_guidance:
+            # SELF-teacher: inject a no-leak diagnosis HINT as a user-turn suffix
+            # (no forced response; the student re-decides on its own). The hint
+            # is resolved by the pre_step hook via the in-process judge.
+            if str(getattr(self.guided_cfg, "teacher_mode", "server")) == "self":
+                if spec.hint_block is not None:
+                    # Cross-wave cache hit: inject directly, no override.
+                    t.pending_prompt_suffix = spec.hint_block
+                    return None
+
+                def _cache_hint(hint_block, _s=spec):
+                    _s.hint_block = hint_block
+
+                # Gap B: the parent's OWN action at the branch step is the
+                # pointing intent we want to validate/correct. The pose was
+                # replayed up to branch-1, so the slot now stands exactly where
+                # the parent emitted this action — its ground pixel casts from
+                # the same camera. Pass the raw text; the pool parses+casts it.
+                intended_action = (
+                    parent.step_responses[branch]
+                    if 0 <= branch < len(parent.step_responses)
+                    else None
+                )
+
+                return _PendingHint(
+                    slot_id=t.slot_id,
+                    pool=t.pool,
+                    group_key=t.group_id,
+                    on_resolved=_cache_hint,
+                    intended_action=intended_action,
+                )
             if spec.annotation is not None:
                 text, token_ids = spec.annotation
                 return text, list(token_ids), True, bool(self.guided_cfg.guidance_is_expert)
@@ -1076,6 +1370,134 @@ class GuidedMultiturnEnvRollout(MultiturnEnvRollout):
         # ── 3. Student suffix (step > branch, or no-guidance fallback) ───
         return None
 
+    def _build_forced_depth_override(
+        self, t: Trajectory, spec: PrefixSpec, step_idx: int,
+    ) -> Optional[tuple[str, list[int], bool, bool]] | "_PendingAnnotation" | "_PendingHint" | "_PendingForcedHandoff":
+        """Override provider for the moving forced-depth path (self-teacher).
+
+        Layout from the branch ``b`` with forced count ``G`` (handoff ``h=b+G``):
+          - ``b <= step < h-1``: intermediate forced expert step (templated
+            summary; PG-masked). ``_PendingAnnotation``.
+          - ``step == h-1`` (last forced step, only if G>=1): combined judge call
+            emitting the teacher ``<summary>`` (carried into the handoff under
+            summary_context) + the suffix-derived ``<hint>`` (cached for ``h``).
+            ``_PendingForcedHandoff``.
+          - ``G == 0`` (h==b): no forced steps; inject a suffix-derived hint at
+            the branch (``_PendingHint``, want_summary=False).
+          - ``step == h``: inject the cached hint block as a user-turn suffix.
+          - ``step > h``: student runs free.
+        """
+        branch = spec.branch_step_index
+        parent = spec.parent
+
+        # Lazily compute G on the first sibling to reach the branch (serial decide
+        # phase → no race). compute_expert_plan_length builds the branch-relative
+        # oracle cache and returns actions-remaining incl. the terminal answer.
+        if spec.forced_g is None:
+            plan_len = None
+            try:
+                plan_len = ray.get(
+                    t.pool.compute_expert_plan_length.remote(t.slot_id)
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[guided.fd] grp {t.group_id}: plan-length failed: {e!r}"
+                )
+            g = forced_g_from_plan(plan_len, self._leave_on_policy)
+            spec.forced_g = g
+            spec.handoff_step = branch + g
+            logger.info(
+                f"[guided.fd] grp {t.group_id}: plan_len={plan_len} "
+                f"L={self._leave_on_policy:.1f} -> forced_g={g} "
+                f"handoff={spec.handoff_step}"
+            )
+
+        g = int(spec.forced_g)
+        handoff = int(spec.handoff_step)
+
+        # Parent's failed continuation from the branch to the end — the suffix the
+        # judge diagnoses for recurring (pointing/format) errors.
+        parent_suffix = list(parent.step_responses[branch:])
+        # Gap B: the parent's own branch action (pointing intent to validate).
+        intended_action = (
+            parent.step_responses[branch]
+            if 0 <= branch < len(parent.step_responses)
+            else None
+        )
+
+        # ── handoff and beyond: inject the cached hint once, then run free ──
+        if step_idx >= handoff:
+            if step_idx == handoff and spec.hint_block is not None:
+                t.pending_prompt_suffix = spec.hint_block
+            return None
+
+        # ── G == 0: branch IS the handoff; resolve a suffix-derived hint here.
+        # (Unreached: handoff==branch makes step_idx>=handoff true above. Kept
+        # explicit for clarity — the cross-wave miss is handled by issuing a
+        # _PendingHint when hint_block is still None at the branch.)
+        if g == 0:
+            if spec.hint_block is not None:
+                t.pending_prompt_suffix = spec.hint_block
+                return None
+
+            def _cache_hint0(hint_block, _s=spec):
+                _s.hint_block = hint_block
+                _s.handoff_resolved = True
+
+            return _PendingHint(
+                slot_id=t.slot_id, pool=t.pool, group_key=t.group_id,
+                on_resolved=_cache_hint0, intended_action=intended_action,
+                parent_suffix=parent_suffix,
+            )
+
+        # ── forced region (G >= 1): fetch this step's expert action ──
+        expert_action = self.expert_action_fn(
+            t.pool, t.slot_id, _dataset_item_for(t),
+        )
+        if not expert_action or not str(expert_action).strip():
+            # Oracle exhausted early → hand off here (treat as handoff).
+            spec.handoff_step = step_idx
+            return None
+        if (
+            not self.guided_cfg.force_expert_answer
+            and _is_answer_action(expert_action)
+        ):
+            # Reached the terminal answer earlier than planned → hand off so the
+            # answer step is always student-generated.
+            spec.handoff_step = step_idx
+            return None
+
+        is_last_forced = step_idx == handoff - 1
+        if is_last_forced:
+            # Combined judge call: teacher summary (this step) + suffix hint (h).
+            def _cache_handoff(hint_block, _s=spec):
+                _s.hint_block = hint_block
+                _s.handoff_resolved = True
+
+            return _PendingForcedHandoff(
+                slot_id=t.slot_id, pool=t.pool, expert_action=expert_action,
+                group_key=t.group_id, on_resolved=_cache_handoff,
+                intended_action=intended_action, parent_suffix=parent_suffix,
+            )
+
+        # Intermediate forced step: templated summary, no judge call.
+        def _cache_inter(text, token_ids):
+            # No cross-step caching (each forced step is pose-specific).
+            return
+
+        return _PendingAnnotation(
+            dict(
+                pool=t.pool,
+                slot_id=t.slot_id,
+                episode_id=t.episode_id,
+                expert_action_formatted=expert_action,
+                parent=parent,
+                branch_step_index=branch,
+            ),
+            group_key=t.group_id,
+            on_annotated=_cache_inter,
+        )
+
     def _log_prefixed_prompts(
         self,
         plans: dict[int, PrefixSpec],
@@ -1098,6 +1520,10 @@ class GuidedMultiturnEnvRollout(MultiturnEnvRollout):
                 guidance_text = (
                     spec.annotation[0] if spec.annotation is not None else None
                 )
+                # In self-teacher mode the injected directive lives on
+                # ``hint_block`` (a prompt suffix), not ``annotation``. Record it
+                # so the actual judge hint is auditable from the dump.
+                hint_block = getattr(spec, "hint_block", None)
                 recs.append({
                     "rollout_idx": int(getattr(self, "_rollout_idx", 0)),
                     "group_id": gid,
@@ -1107,9 +1533,16 @@ class GuidedMultiturnEnvRollout(MultiturnEnvRollout):
                     "parent_reward": float(parent.reward) if parent.reward is not None else None,
                     "prefix_responses": list(parent.step_responses[:b]),
                     "guidance_text": guidance_text,
+                    "hint_block": hint_block,
                     "no_guidance": bool(spec.no_guidance),
+                    # Forced-depth fields (None when prefix_force_depth is off).
+                    "forced_g": spec.forced_g,
+                    "handoff_step": spec.handoff_step,
+                    "parent_suffix": list(parent.step_responses[b:]),
                 })
-            n_with_guidance = sum(1 for r in recs if r["guidance_text"])
+            n_with_guidance = sum(
+                1 for r in recs if r["guidance_text"] or r["hint_block"]
+            )
             metrics["guided/prefix_with_guidance"] = float(n_with_guidance)
             # One file per rollout-worker; appended across training steps. The
             # step index is not available here, so records are timestamp-free and
@@ -1835,6 +2268,8 @@ class GuidedMultiturnEnvRollout(MultiturnEnvRollout):
             # mutations happen here (single-threaded), so only the stateless
             # teacher HTTP calls run concurrently.
             pending: list[tuple[Trajectory, _PendingAnnotation]] = []
+            hint_pending: list[tuple[Trajectory, _PendingHint]] = []
+            handoff_pending: list[tuple[Trajectory, _PendingForcedHandoff]] = []
             for t in active_now:
                 if t.terminated:
                     continue
@@ -1851,8 +2286,29 @@ class GuidedMultiturnEnvRollout(MultiturnEnvRollout):
                     continue
                 if isinstance(ov, _PendingAnnotation):
                     pending.append((t, ov))
+                elif isinstance(ov, _PendingForcedHandoff):
+                    handoff_pending.append((t, ov))
+                elif isinstance(ov, _PendingHint):
+                    hint_pending.append((t, ov))
                 else:
                     t.pending_response_override = ov
+
+            # SELF-teacher: resolve diagnosis hints via the in-process judge and
+            # inject them as USER-turn suffixes (no override). Run BEFORE the
+            # _PendingAnnotation path so the two never interleave (a config uses
+            # exactly one teacher_mode, so only one list is ever non-empty).
+            if hint_pending:
+                self._resolve_self_teacher_hints(
+                    hint_pending, actor_rollout_ref_wg, config
+                )
+
+            # Forced-depth last-forced step: combined judge call yields a forced
+            # response (teacher summary + expert action) for THIS step AND caches
+            # the suffix-derived hint for the handoff step.
+            if handoff_pending:
+                self._resolve_forced_handoffs(
+                    handoff_pending, actor_rollout_ref_wg, config
+                )
 
             if not pending:
                 return
@@ -1923,6 +2379,394 @@ class GuidedMultiturnEnvRollout(MultiturnEnvRollout):
             )
         finally:
             self._pre_step_hook = None
+
+    # ── colocated self-teacher (teacher_mode='self') ──────────────────────
+    def _resolve_self_teacher_hints(
+        self,
+        hint_pending: list[tuple[Trajectory, "_PendingHint"]],
+        actor_rollout_ref_wg,
+        config,
+    ) -> None:
+        """Resolve diagnosis hints for the branch step and inject them as
+        USER-turn suffixes (``pending_prompt_suffix``), NOT response overrides.
+
+        One judge call per unique ``group_key`` (all siblings share the same
+        replayed prefix → same branch pose → same hint), broadcast to every
+        member so within-group GRPO sees an identical injected hint. The judge
+        runs through the SAME in-process engine/weights as the student.
+        """
+        from privileged_eval.diagnose import (
+            build_diagnosis_block,
+            parse_diagnosis_response,
+        )
+
+        # Dedup by group_key (keyless → singleton per trajectory).
+        groups: dict[Any, list[tuple[Trajectory, _PendingHint]]] = {}
+        order: list[Any] = []
+        for item in hint_pending:
+            t, pend = item
+            key = pend.group_key if pend.group_key is not None else id(t)
+            if key not in groups:
+                groups[key] = []
+                order.append(key)
+            groups[key].append(item)
+
+        # Build the judge request per group on its representative slot (the
+        # no-leak nav-state reconstruction; no model call). ray.get is blocking
+        # but cheap relative to generation; fan out the remote calls first.
+        req_futures = {}
+        for key in order:
+            t0, pend0 = groups[key][0]
+            req_futures[key] = pend0.pool.build_branch_diagnosis_request.remote(
+                pend0.slot_id,
+                intended_action=getattr(pend0, "intended_action", None),
+                parent_suffix=getattr(pend0, "parent_suffix", None),
+                want_summary=False,
+            )
+        reqs: dict[Any, Optional[dict]] = {}
+        for key in order:
+            try:
+                reqs[key] = ray.get(req_futures[key])
+            except Exception as e:
+                logger.warning(f"[self-teacher] grp {key}: diagnosis request failed: {e!r}")
+                reqs[key] = None
+
+        # Keys whose reconstruction succeeded AND have a branch image get a judge
+        # call; the rest degrade to a pure on-policy suffix-free branch (no hint).
+        # The diagnosis user_text ends with one `<image>` placeholder, so a missing
+        # branch image would desync image/placeholder counts in vLLM — skip those.
+        def _live(k):
+            r = reqs.get(k)
+            return r is not None and r.get("branch_image") is not None
+        live_keys = [k for k in order if _live(k)]
+        if not live_keys:
+            logger.warning("[self-teacher] no live diagnosis requests this step; skipping hints.")
+            return
+
+        judge_prompts = []
+        judge_images = []
+        for k in live_keys:
+            r = reqs[k]
+            judge_prompts.append([
+                {"role": "system", "content": r["system_prompt"]},
+                {"role": "user", "content": r["user_text"]},
+            ])
+            judge_images.append([r["branch_image"]])
+
+        try:
+            responses = self._engine_generate_judge(
+                judge_prompts, judge_images, actor_rollout_ref_wg, config
+            )
+        except Exception as e:
+            logger.error(f"[self-teacher] judge generation failed: {e!r}\n{traceback.format_exc()}")
+            return
+
+        # Raw judge I/O audit dump (best-effort). Captures the FULL judge prompt
+        # (system + menu user_text), branch-image presence, prompt token count vs
+        # the teacher cap, and the raw + parsed judge response — so the teacher's
+        # behavior is verifiable end-to-end (esp. that the un-truncated judge now
+        # commits to a concrete RECOMMENDED action). Controlled by POPE_PREFIX_DUMP.
+        dump_dir = os.environ.get("POPE_PREFIX_DUMP", "").strip()
+        if dump_dir:
+            try:
+                os.makedirs(dump_dir, exist_ok=True)
+                teacher_cap = getattr(self.guided_cfg, "teacher_max_prompt_length", None)
+                jpath = os.path.join(dump_dir, f"judge_io_rank{getattr(self, 'rank', 0)}.jsonl")
+                with open(jpath, "a") as jf:
+                    for k, resp in zip(live_keys, responses):
+                        r = reqs[k]
+                        sysp = r.get("system_prompt", "") or ""
+                        usr = r.get("user_text", "") or ""
+                        try:
+                            n_tok = len(self.tokenizer.encode(sysp + usr, add_special_tokens=False))
+                        except Exception:
+                            n_tok = None
+                        parsed_dbg = parse_diagnosis_response(resp or "")
+                        jf.write(json.dumps({
+                            "rollout_idx": int(getattr(self, "_rollout_idx", 0)),
+                            "group_key": str(k),
+                            "judge_system_prompt": sysp,
+                            "judge_user_text": usr,
+                            "has_branch_image": r.get("branch_image") is not None,
+                            "prompt_text_tokens": n_tok,
+                            "teacher_max_prompt_length": teacher_cap,
+                            "truncated": (n_tok is not None and teacher_cap is not None and n_tok > teacher_cap),
+                            "judge_raw_response": resp,
+                            "judge_parsed_hint": parsed_dbg.get("hint", ""),
+                        }) + "\n")
+            except Exception as e:  # pragma: no cover — diagnostics must never crash
+                logger.warning(f"[self-teacher] judge I/O dump failed: {e!r}")
+
+        for k, resp in zip(live_keys, responses):
+            parsed = parse_diagnosis_response(resp or "")
+            hint = parsed.get("hint", "").strip()
+            if not hint:
+                logger.warning(f"[self-teacher] grp {k}: judge produced empty hint; no injection.")
+                continue
+            block = build_diagnosis_block(hint)
+            members = groups[k]
+            for t, _pend in members:
+                t.pending_prompt_suffix = block
+            cb = members[0][1].on_resolved
+            if cb is not None:
+                cb(block)
+
+    def _engine_generate_judge(
+        self,
+        prompts: list[list[dict]],
+        images_list: list[list],
+        actor_rollout_ref_wg,
+        config,
+    ) -> list[str]:
+        """Run the in-process judge: tokenize the (system+user+image) prompts,
+        generate via the same ``generate_sequences`` engine the student uses, and
+        decode. Returns one response string per prompt (order-preserving).
+
+        Mirrors the base loop's vLLM generate path (tokenize → DataProto → pad →
+        generate → unpad → decode) at the judge temperature, n=1.
+        """
+        from ...protocol import DataProto, pad_dataproto_to_divisor, unpad_dataproto
+
+        # Use the teacher-specific prompt budget so the diagnosis system prompt +
+        # menu + branch image survive (the student's max_prompt_length would right-
+        # truncate them). Requires worker.rollout.max_model_len >= this + response.
+        tokenized = self._tokenize_prompts(
+            prompts,
+            images_list,
+            for_generation=True,
+            max_prompt_length=getattr(self.guided_cfg, "teacher_max_prompt_length", None),
+        )
+        meta_info = {
+            "eos_token_id": self.tokenizer.eos_token_id,
+            "min_pixels": self.min_pixels,
+            "max_pixels": self.max_pixels,
+            "video_fps": getattr(config.data, "video_fps", 2.0),
+            "n": 1,
+            "temperature": float(getattr(self.guided_cfg, "judge_temperature", 0.5)),
+            "top_p": 1.0,
+        }
+        gen_batch = DataProto.from_single_dict(tokenized, meta_info=meta_info)
+        gen_batch, pad_size = pad_dataproto_to_divisor(
+            gen_batch, actor_rollout_ref_wg.world_size
+        )
+        gen_output = actor_rollout_ref_wg.generate_sequences(gen_batch)
+        gen_output = unpad_dataproto(gen_output, pad_size)
+        response_ids = gen_output.batch["responses"]
+        response_mask = gen_output.batch["response_mask"]
+        out: list[str] = []
+        for i in range(len(prompts)):
+            length = int(response_mask[i].sum().item())
+            out.append(
+                self.tokenizer.decode(
+                    response_ids[i][:length], skip_special_tokens=True
+                )
+            )
+        return out
+
+    def _resolve_forced_handoffs(
+        self,
+        handoff_pending: list[tuple[Trajectory, "_PendingForcedHandoff"]],
+        actor_rollout_ref_wg,
+        config,
+    ) -> None:
+        """Resolve the last-forced-step combined judge call (prefix_force_depth).
+
+        ONE judge call per group at the last-forced pose (want_summary=True). The
+        judge sees the parent's failed branch→end suffix and emits a teacher
+        ``<summary>`` (carried into the handoff under summary_context) plus a
+        suffix-derived ``<hint>`` (cached on the spec for the handoff step). This
+        step's forced response is ``<think>..</think><summary>{summary}</summary>
+        {expert_action}`` — PG-masked, identical across siblings so the within-
+        group GRPO comparison shares a byte-identical prefix+guidance.
+        """
+        from privileged_eval.diagnose import (
+            build_diagnosis_block,
+            parse_diagnosis_response,
+        )
+
+        # Dedup by group_key (keyless → singleton per trajectory).
+        groups: dict[Any, list[tuple[Trajectory, _PendingForcedHandoff]]] = {}
+        order: list[Any] = []
+        for item in handoff_pending:
+            t, pend = item
+            key = pend.group_key if pend.group_key is not None else id(t)
+            if key not in groups:
+                groups[key] = []
+                order.append(key)
+            groups[key].append(item)
+
+        forced_is_expert = bool(self.guided_cfg.guidance_is_expert)
+
+        # Under forced-depth the on-policy region always ENDS with the oracle's
+        # terminal answer step. ``L = round(self._leave_on_policy)`` is the global
+        # number of steps left on policy, so when L <= 1 the single on-policy step
+        # after this handoff IS the answer. In that regime we tell the TEACHER the
+        # next action is the answer, so it GENERATES an answer-oriented summary+hint
+        # (the default forced-depth prompt + hint block keep the student approaching
+        # forever, which is exactly why these groups died at reward 0). No-leak: the
+        # teacher only points at what is observable; it never hands over coords.
+        on_policy_left = int(round(float(getattr(self, "_leave_on_policy", 1.0))))
+        answer_next = on_policy_left <= 1
+
+        # Build the judge request per group (no-leak nav state + parent suffix).
+        req_futures = {}
+        for key in order:
+            t0, pend0 = groups[key][0]
+            req_futures[key] = pend0.pool.build_branch_diagnosis_request.remote(
+                pend0.slot_id,
+                intended_action=getattr(pend0, "intended_action", None),
+                parent_suffix=getattr(pend0, "parent_suffix", None),
+                want_summary=True,
+                answer_next=answer_next,
+            )
+        reqs: dict[Any, Optional[dict]] = {}
+        for key in order:
+            try:
+                reqs[key] = ray.get(req_futures[key])
+            except Exception as e:
+                logger.warning(f"[guided.fd] grp {key}: diagnosis request failed: {e!r}")
+                reqs[key] = None
+
+        def _live(k):
+            r = reqs.get(k)
+            return r is not None and r.get("branch_image") is not None
+        live_keys = [k for k in order if _live(k)]
+
+        # Helper to emit the forced response (broadcast to all siblings of a key).
+        def _emit_forced(key, summary_text, answer_mode=False):
+            members = groups[key]
+            rep_action = members[0][1].expert_action
+            if answer_mode:
+                summary = (summary_text or "").strip() or _ANSWER_HANDOFF_SUMMARY
+                think = (
+                    "<think>\nThis was the last positioning move. The target should now "
+                    "be in view, so the next move is to answer it directly rather than "
+                    "explore or approach further.\n</think>\n"
+                )
+            else:
+                summary = (summary_text or "").strip() or (
+                    "Heading toward the target area; will verify the nearest cue next."
+                )
+                think = (
+                    "<think>\nContinuing along the planned route toward the target "
+                    "based on what has been seen so far.\n</think>\n"
+                )
+            text = f"{think}<summary>{summary}</summary>\n{rep_action}"
+            token_ids = self.tokenizer.encode(text, add_special_tokens=False)
+            ov = (text, list(token_ids), True, forced_is_expert)
+            for t, _pend in members:
+                t.pending_response_override = ov
+
+        # Keys whose reconstruction failed: still force the action, but with a
+        # templated summary and NO hint (degrade gracefully, never desync images).
+        # When answer_next, the template at least orients toward answering.
+        for key in order:
+            if key not in live_keys:
+                logger.warning(
+                    f"[guided.fd] grp {key}: no live diagnosis request; "
+                    f"forcing action with templated summary, no hint."
+                )
+                _emit_forced(key, None, answer_mode=answer_next)
+                if answer_next:
+                    cb = groups[key][0][1].on_resolved
+                    if cb is not None:
+                        cb(build_diagnosis_block(_ANSWER_HANDOFF_HINT, answer_next=True))
+
+        if not live_keys:
+            return
+
+        judge_prompts = []
+        judge_images = []
+        for k in live_keys:
+            r = reqs[k]
+            judge_prompts.append([
+                {"role": "system", "content": r["system_prompt"]},
+                {"role": "user", "content": r["user_text"]},
+            ])
+            judge_images.append([r["branch_image"]])
+
+        try:
+            responses = self._engine_generate_judge(
+                judge_prompts, judge_images, actor_rollout_ref_wg, config
+            )
+        except Exception as e:
+            logger.error(
+                f"[guided.fd] judge generation failed: {e!r}\n{traceback.format_exc()}"
+            )
+            # Fall back: force the action with a templated summary, no hint.
+            for k in live_keys:
+                _emit_forced(k, None, answer_mode=answer_next)
+                if answer_next:
+                    cb = groups[k][0][1].on_resolved
+                    if cb is not None:
+                        cb(build_diagnosis_block(_ANSWER_HANDOFF_HINT, answer_next=True))
+            return
+
+        # Optional raw judge I/O audit dump (shared POPE_PREFIX_DUMP knob).
+        dump_dir = os.environ.get("POPE_PREFIX_DUMP", "").strip()
+        if dump_dir:
+            try:
+                os.makedirs(dump_dir, exist_ok=True)
+                jpath = os.path.join(
+                    dump_dir, f"judge_handoff_rank{getattr(self, 'rank', 0)}.jsonl"
+                )
+                with open(jpath, "a") as jf:
+                    for k, resp in zip(live_keys, responses):
+                        r = reqs[k]
+                        parsed_dbg = parse_diagnosis_response(resp or "")
+                        jf.write(json.dumps({
+                            "rollout_idx": int(getattr(self, "_rollout_idx", 0)),
+                            "group_key": str(k),
+                            "answer_next": bool(answer_next),
+                            "judge_user_text": r.get("user_text", ""),
+                            "judge_raw_response": resp,
+                            "judge_parsed_summary": parsed_dbg.get("summary", ""),
+                            "judge_parsed_hint": parsed_dbg.get("hint", ""),
+                        }) + "\n")
+            except Exception as e:  # pragma: no cover
+                logger.warning(f"[guided.fd] judge I/O dump failed: {e!r}")
+
+        for k, resp in zip(live_keys, responses):
+            parsed = parse_diagnosis_response(resp or "")
+            summary = parsed.get("summary", "").strip()
+            hint = parsed.get("hint", "").strip()
+            # Under answer_next the teacher is asked (via the POSITION-REACHED system
+            # override) to GENERATE an answer-oriented summary/hint. The base judge is
+            # unreliable, so sanitize: keep its text only if it actually orients to
+            # answering; if it emitted nothing or reverted to a navigation directive
+            # (ground:/direction:/explore — fighting the override), fall back to the
+            # answer template so the injected block stays coherent rather than telling
+            # the student to answer while handing it a "turn left" hint.
+            if answer_next:
+                def _is_answer_oriented(s):
+                    s = (s or "").lower()
+                    nav = ("ground:" in s or "direction:" in s or "<explore" in s)
+                    return ("answer" in s) and not nav
+                if not _is_answer_oriented(hint):
+                    hint = _ANSWER_HANDOFF_HINT
+                if not _is_answer_oriented(summary):
+                    summary = _ANSWER_HANDOFF_SUMMARY
+                # No-leak backstop: even with the coord-free banner the base judge can
+                # leak the exact pixel (it sees the target in [VISIBLE OBJECTS] and may
+                # guess/emit a tuple). Strip any (x,y) tuple and <answer>(...) coords
+                # from the injected text so the student never receives the answer pixel
+                # — it must read the target's location from its own current view.
+                hint = _strip_answer_coords(hint)
+                summary = _strip_answer_coords(summary)
+            # Emit this step's forced response with the TEACHER-generated summary
+            # (answer_mode keeps the forced <think> consistent with answering).
+            _emit_forced(k, summary, answer_mode=answer_next)
+            # Cache the (sanitized) hint for the handoff step.
+            if hint:
+                block = build_diagnosis_block(hint, answer_next=answer_next)
+                cb = groups[k][0][1].on_resolved
+                if cb is not None:
+                    cb(block)
+            else:
+                logger.warning(
+                    f"[guided.fd] grp {k}: judge produced empty hint; "
+                    f"handoff step will run with no injected hint."
+                )
 
     def _run_async_episode_loop_with_overrides(
         self,

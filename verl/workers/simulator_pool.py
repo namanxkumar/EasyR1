@@ -678,6 +678,36 @@ class SimulatorPool:
         _adapter, _item, step = resolved
         return getattr(step.action, "formatted", None) or None
 
+    def compute_expert_plan_length(self, slot_id: int) -> Optional[int]:
+        """Number of expert actions remaining from the slot's CURRENT pose.
+
+        Drives the moving forced-depth controller: called at the branch pose
+        (after the prefix is replayed, before any forced step) it builds + caches
+        the branch-relative expert ``SparseTrajectory`` (the same cache
+        ``_next_expert_sparse_step`` indexes during forcing) and returns
+        ``len(steps) - 1`` — i.e. how many actions, INCLUDING the terminal
+        ``<answer/>``, the oracle would take to solve from here. The forced depth
+        is then ``G = max(0, plan_len - L)`` with ``L >= 1`` so the answer step is
+        always left on-policy. Returns ``None`` if the oracle is unavailable.
+
+        Must be called BEFORE the first ``compute_expert_action`` on this slot so
+        the cache ``base`` is captured at the branch pose (matching the forcing
+        index math); calling it later still returns a valid length but the
+        controller only queries it at the branch.
+        """
+        adapter = self.slots[slot_id]
+        if adapter is None:
+            raise ValueError(f"Slot {slot_id} is empty")
+        # Trigger the lazy cache build via the shared resolver (which captures
+        # expert_cache_base_num_steps at the current pose on first call).
+        self._next_expert_sparse_step(slot_id)
+        cache = getattr(adapter, "expert_trajectory_cache", None)
+        steps = getattr(cache, "steps", None) if cache is not None else None
+        if not steps:
+            return None
+        # steps[0] is the no-op "initial" step; steps[1:] are the actions.
+        return max(0, len(steps) - 1)
+
     def compute_expert_entry(self, slot_id: int, past_k: int = 0, future_k: int = 0):
         """Return the next expert step as a rich dict for teacher annotation.
 
@@ -803,6 +833,198 @@ class SimulatorPool:
             "past_steps": past_steps,
             "future_steps": future_steps,
         }
+
+    # ── colocated self-teacher (no-leak diagnosis judge) ──────────────
+    def _cast_intended_xz(self, env, intended_action):
+        """Gap B: cast the parent's failed branch-step ``ground:(x,y)`` to a
+        world (x, z) so the diagnosis menu can offer a VALID navigable
+        correction of the agent's own pointing intent. ``intended_action`` is
+        the raw parent response text at the branch step. Returns None for
+        non-ground actions (answer/turn) or any cast failure — the menu then
+        degrades to the ordinary frontier list."""
+        if not intended_action:
+            return None
+        try:
+            import re as _re
+            m = _re.search(r"ground:\(\s*(-?\d+)\s*,\s*(-?\d+)\s*\)", str(intended_action))
+            if m is None:
+                return None
+            mx, my = int(m.group(1)), int(m.group(2))
+            from privileged_eval import geometry as _geom
+            rx, ry = _geom.to_render_px((mx, my), env.configuration.render_width)
+            casted, _, _ = env._ai2thor.cast_ray_to_ground_coordinates(
+                (rx, ry),
+                relaxation_pixels=env.configuration.ground_snap_relaxation_pixels,
+            )
+            if casted is None:
+                return None
+            return (float(casted["x"]), float(casted["z"]))
+        except Exception as e:
+            logger.warning(f"_cast_intended_xz failed: {e!r}")
+            return None
+
+    def build_branch_diagnosis_request(
+        self,
+        slot_id: int,
+        intended_action: Optional[str] = None,
+        parent_suffix: Optional[list] = None,
+        want_summary: bool = False,
+        answer_next: bool = False,
+    ) -> Optional[dict]:
+        """Assemble the no-leak diagnosis judge prompt at the slot's CURRENT pose.
+
+        This is the privileged, NO-MODEL half of the colocated self-teacher. The
+        prefix has already been replayed into this slot (steps ``0..branch-1``
+        executed via forced overrides), so ``state_history`` holds the branch
+        pose. We reconstruct the perfect-recall navigation state the student
+        *would* have here — built ONLY from frames it has personally rendered
+        (the privileged_eval no-leak invariant) — and return the judge's system
+        prompt + user text + the branch camera image. The driver then runs the
+        judge through the SAME in-process engine (``generate_sequences``) and
+        injects the resulting hint into the branch step's user turn.
+
+        Returns ``None`` (caller falls back to plain on-policy) when the oracle
+        inputs are unavailable or reconstruction fails.
+
+        Mirrors ``guidance_eval.run_guided`` (replayed_states + parent_history +
+        branch_obs) but reads them from the live ``state_history`` instead of an
+        offline replay loop.
+        """
+        adapter = self.slots[slot_id]
+        if adapter is None:
+            raise ValueError(f"Slot {slot_id} is empty")
+        env = getattr(adapter, "env", None)
+        data = getattr(adapter, "dataset_item", None) or getattr(adapter, "item_data", None)
+        sh = getattr(adapter, "state_history", None)
+        if env is None or not isinstance(data, dict) or sh is None:
+            logger.warning(
+                f"Slot {slot_id}: cannot build diagnosis request "
+                f"(env={env is not None}, data={isinstance(data, dict)}, sh={sh is not None})"
+            )
+            return None
+
+        try:
+            from privileged_eval import diagnose as _diag
+        except Exception as e:
+            logger.warning(f"privileged_eval.diagnose import failed: {e!r}")
+            return None
+
+        try:
+            # replayed_states = [initial, after_step0, ..., branch pose] in
+            # num_actions order (mirrors run_guided lines 863-868). A no-op
+            # error_state is a deepcopy carrying the prior frame's agent_state +
+            # extra_info, so the mapper fold + PerceptionSnapshot stay valid.
+            pairs = sh.action_state_pairs or []
+            replayed_states = [sh.root_state] + [st for (_act, st) in pairs]
+
+            # The rollout slot runs with capture_extra_info=False, so the live
+            # states carry NO depth/seg — the privileged mapper then folds 0 m2
+            # floor and PerceptionSnapshot yields an EMPTY [DESTINATIONS]/[VISIBLE
+            # OBJECTS] menu, which is exactly why the judge has been inventing
+            # coordinates. The AI2Thor controller still RENDERS depth + instance
+            # segmentation (those flags are independent of capture_extra_info), so
+            # re-render them at the CURRENT branch pose and patch the branch state.
+            # That gives the reconstruction a real current-frame floor/object set
+            # to build the menu from (intrinsics come from env, pose-independent).
+            # Earlier poses are unrecoverable here, but at the step-1 branches this
+            # base-model regime produces, the branch frame is what the menu needs.
+            try:
+                import copy as _copy
+                depth_img = env._ai2thor.get_depth_image()
+                seg_img, seg_map = env._ai2thor.get_instance_segmentation()
+                if depth_img is not None and seg_img is not None and seg_map:
+                    branch = _copy.copy(replayed_states[-1])
+                    ei = dict(getattr(branch, "extra_info", None) or {})
+                    ei["depth_image"] = depth_img
+                    ei["object_segmentation_image"] = seg_img
+                    ei["object_segmentation_mapping"] = seg_map
+                    branch.extra_info = ei
+                    replayed_states = replayed_states[:-1] + [branch]
+                else:
+                    logger.warning(
+                        f"Slot {slot_id}: branch re-render returned empty depth/seg "
+                        f"(depth={depth_img is not None}, seg={seg_img is not None}, "
+                        f"map={bool(seg_map)})"
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"Slot {slot_id}: branch depth/seg re-render failed: {e!r}"
+                )
+
+            # parent_history: the student's own prefix steps (step_index,
+            # raw <think>/<summary> response, the action tag it chose). The
+            # action object carries .response (set in adapter.step). Extract the
+            # emitted action tag the same way guidance_eval._action_tag does.
+            import re as _re
+            ap = getattr(adapter, "action_proposer", None)
+            tags = [t for t in (
+                getattr(ap, "answer_tag", None),
+                getattr(ap, "explore_tag", None),
+                getattr(ap, "action_instruction_tag", None),
+            ) if t]
+
+            def _action_tag(resp: str) -> str:
+                resp = resp or ""
+                for tag in tags:
+                    m = _re.search(rf"<{tag}\b[^>]*>.*?</{tag}>|<{tag}\b[^>]*/>", resp, _re.S)
+                    if m:
+                        return m.group(0)
+                return ""
+
+            class _Rec:
+                __slots__ = ("step_index", "model_response", "parsed_action", "env_feedback")
+
+                def __init__(self, step_index, model_response, parsed_action, env_feedback):
+                    self.step_index = step_index
+                    self.model_response = model_response
+                    self.parsed_action = parsed_action
+                    self.env_feedback = env_feedback
+
+            parent_history = []
+            for k, (act, _st) in enumerate(pairs):
+                resp = getattr(act, "response", "") or ""
+                parent_history.append(
+                    _Rec(k, resp, _action_tag(resp), "")
+                )
+
+            intended_xz = self._cast_intended_xz(env, intended_action)
+
+            req = _diag.build_diagnosis_request(
+                env=env,
+                replayed_states=replayed_states,
+                parent_history=parent_history,
+                data=data,
+                knobs=None,
+                step_budget=int(getattr(env.configuration, "max_actions", 10) or 10),
+                intended_xz=intended_xz,
+                parent_suffix=parent_suffix,
+                want_summary=want_summary,
+                answer_next=answer_next,
+            )
+
+            # Branch camera image for the judge's <image>: the current view. Use
+            # the last non-None observation (a no-op tail step has obs=None).
+            branch_image = None
+            for _act, _st in reversed(sh.to_list()):
+                o = getattr(_st, "observation", None)
+                if o is not None:
+                    branch_image = np.ascontiguousarray(np.asarray(o))
+                    break
+
+            return {
+                "system_prompt": req["system_prompt"],
+                "user_text": req["user_text"],
+                "branch_image": branch_image,
+                "nav_text": req["nav_text"],
+                "target_visible_at_branch": req["target_visible_at_branch"],
+                "nav_stats": req["nav_stats"],
+            }
+        except Exception as e:
+            logger.warning(
+                f"Slot {slot_id}: build_branch_diagnosis_request failed: {e!r}\n"
+                f"{traceback.format_exc()}"
+            )
+            return None
 
     # ── recovery ──────────────────────────────────────────────────────
 

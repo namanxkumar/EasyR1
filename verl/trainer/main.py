@@ -233,6 +233,19 @@ def _create_multiturn_rollout(config: PPOConfig, tokenizer, processor):
             prefix_allocation=guided_cfg.prefix_allocation,
             prefix_max_group_alloc_fraction=guided_cfg.prefix_max_group_alloc_fraction,
             prefix_allow_failure_reuse=guided_cfg.prefix_allow_failure_reuse,
+            # Teacher backend selector — REQUIRED for teacher_mode='self'. Without
+            # this the rollout's slim GuidedConfig defaults to "server" and the
+            # branch step silently uses the expert placeholder annotator instead
+            # of the colocated self-teacher diagnosis hint.
+            teacher_mode=guided_cfg.teacher_mode,
+            judge_temperature=guided_cfg.judge_temperature,
+            teacher_max_prompt_length=guided_cfg.teacher_max_prompt_length,
+            # Moving forced-depth controller (prefix_groups self-teacher).
+            prefix_force_depth=guided_cfg.prefix_force_depth,
+            prefix_depth_target=guided_cfg.prefix_depth_target,
+            prefix_depth_ema_beta=guided_cfg.prefix_depth_ema_beta,
+            prefix_depth_deadband=guided_cfg.prefix_depth_deadband,
+            prefix_min_leave_on_policy=guided_cfg.prefix_min_leave_on_policy,
         )
         # Teacher annotator wiring. Server mode → ServerTeacherVLM via
         # pope_dagger.teacher_vlm; co-located mode is not yet implemented.
@@ -417,6 +430,22 @@ def _create_multiturn_rollout(config: PPOConfig, tokenizer, processor):
             raise NotImplementedError(
                 "guided_rollout.teacher_mode='colocated' is not yet implemented. "
                 "Use 'server' with a dedicated teacher SLURM job for now."
+            )
+        elif guided_cfg.teacher_mode == "self":
+            # Colocated SELF-teacher: the judge IS the student's own in-process
+            # engine (no separate server, no annotate_fn). The pre_step hook
+            # reconstructs the no-leak branch nav state on the sim actor, runs
+            # the judge via generate_sequences, and injects a corrective hint as
+            # a user-turn suffix. Requires sync rollout for per-group dedup.
+            if bool(getattr(config.worker.rollout, "async_mode", False)):
+                raise ValueError(
+                    "guided_rollout.teacher_mode='self' requires "
+                    "worker.rollout.async_mode=false (sync per-group hint dedup)."
+                )
+            teacher_annotate_fn = None
+            logging.info(
+                "[guided] teacher mode=self: colocated self-teacher "
+                "(engine-driven no-leak diagnosis hint injection)"
             )
 
         return GuidedMultiturnEnvRollout(

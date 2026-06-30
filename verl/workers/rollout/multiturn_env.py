@@ -235,6 +235,14 @@ class Trajectory:
     # masks the step from the policy gradient; ``is_expert`` additionally routes
     # it to the SFT loss (fresh oracle action vs. replayed prefix).
     pending_response_override: "tuple[str, list[int], bool, bool] | None" = None
+    # Single-shot USER-turn suffix appended to this step's prompt before
+    # generation (colocated self-teacher hint injection). Unlike
+    # ``pending_response_override``, this does NOT replace the student's
+    # response — the student still generates its own ``<think>``/action/
+    # ``<summary>`` (which carries the policy gradient). The suffix stays in the
+    # cached prompt so it is visible at train time too (train-on-it). Cleared
+    # after the step is recorded.
+    pending_prompt_suffix: "str | None" = None
 
     # Reward collected immediately upon termination (before slot release)
     reward: float | None = None
@@ -707,6 +715,39 @@ class MultiturnEnvRollout:
                 )
                 global_step += 1
                 continue
+
+            # ── Inject the colocated self-teacher hint (USER-turn suffix) ──
+            # A trajectory at its branch step may carry a one-shot
+            # ``pending_prompt_suffix`` (the diagnosis hint block) set by the
+            # guided rollout's pre_step hook. Append it to the LAST user message
+            # of this step's prompt BEFORE caching + tokenization so the student
+            # both generates conditioned on it AND (train-on-it) keeps it in the
+            # trained sample. The student's own response carries the gradient —
+            # this is NOT an override. Consume it after appending.
+            for local_i, t in valid:
+                suffix = getattr(t, "pending_prompt_suffix", None)
+                if not suffix:
+                    continue
+                msgs = prompts[local_i]
+                last_user = next(
+                    (m for m in reversed(msgs) if m.get("role") == "user"), None
+                )
+                if last_user is not None and isinstance(last_user.get("content"), str):
+                    last_user["content"] = f"{last_user['content']}\n\n{suffix}"
+                    if use_full:
+                        fmsgs = full_prompts[local_i]
+                        flast = next(
+                            (m for m in reversed(fmsgs) if m.get("role") == "user"), None
+                        )
+                        if flast is not None and isinstance(flast.get("content"), str):
+                            flast["content"] = f"{flast['content']}\n\n{suffix}"
+                else:
+                    logger.warning(
+                        f"  [step {global_step}][grp {t.group_id}/{t.n_idx}] "
+                        f"pending_prompt_suffix set but no string user turn to "
+                        f"append to; dropping hint."
+                    )
+                t.pending_prompt_suffix = None
 
             # Cache prompt/images for final batch construction. With
             # past_k_steps, training reconstructs the *full* trajectory, so
@@ -1614,6 +1655,7 @@ class MultiturnEnvRollout:
         add_generation_prompt: bool = True,
         full_prompts: list[list[dict]] | None = None,
         full_images_list: list[list[Image.Image]] | None = None,
+        max_prompt_length: int | None = None,
     ) -> dict[str, Any]:
         """Tokenize prompts with images into the format expected by generate_sequences.
 
@@ -1649,6 +1691,11 @@ class MultiturnEnvRollout:
             and full_images_list is not None
             and len(full_prompts) == len(prompts)
         )
+
+        # Per-call prompt-length budget. The self-teacher judge passes a larger
+        # max_prompt_length so its diagnosis system prompt + menu + branch image
+        # are not right-truncated at the student's (smaller) self.max_prompt_length.
+        mpl = max_prompt_length if max_prompt_length is not None else self.max_prompt_length
 
         for idx, (messages, images) in enumerate(zip(prompts, images_list)):
             # Convert <image> placeholders in message content to HF format
@@ -1736,7 +1783,7 @@ class MultiturnEnvRollout:
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
-                max_length=self.max_prompt_length,
+                max_length=mpl,
                 pad_token_id=self.tokenizer.pad_token_id,
                 left_pad=True,
                 truncation="right",
@@ -1801,8 +1848,8 @@ class MultiturnEnvRollout:
             raw_prompt_ids = self.tokenizer.encode(
                 text_prompt, add_special_tokens=False
             )
-            if len(raw_prompt_ids) > self.max_prompt_length:
-                raw_prompt_ids = raw_prompt_ids[: self.max_prompt_length]
+            if len(raw_prompt_ids) > mpl:
+                raw_prompt_ids = raw_prompt_ids[:mpl]
                 # After truncation, some image placeholders may have been cut.
                 # Trim raw_images to match surviving placeholders so vLLM
                 # doesn't get more images than placeholder tokens.
@@ -2939,12 +2986,30 @@ class ObjectNavEnvAdapter:
             simple_step_text=True,
         )
 
-    @staticmethod
-    def _check_format(response: str) -> float:
-        """Check if response matches the SFT multi-turn format: <think>...</think> <action>."""
-        pattern = re.compile(
-            r"<think>.*?</think>\s*<(?:explore|answer).*?(?:/>|</(?:explore|answer)>)",
-            re.DOTALL,
+    # multi_turn:      <think>...</think> <action>
+    # summary_context: <think>...</think> <action> <summary>...</summary>
+    # (summary models must also emit a well-formed rolling <summary> block.)
+    _FORMAT_RE = re.compile(
+        r"<think>.*?</think>\s*<(?:explore|answer).*?(?:/>|</(?:explore|answer)>)",
+        re.DOTALL,
+    )
+    _FORMAT_SUMMARY_RE = re.compile(
+        r"<think>.*?</think>\s*<(?:explore|answer).*?(?:/>|</(?:explore|answer)>)"
+        r"\s*<summary>.*?</summary>",
+        re.DOTALL,
+    )
+
+    def _check_format(self, response: str) -> float:
+        """Check if response matches the SFT format for this context mode.
+
+        ``summary_context`` models additionally require a closed ``<summary>``
+        block after the action (their rolling memory); ``multi_turn`` models do
+        not emit ``<summary>`` and use the action-only format.
+        """
+        pattern = (
+            self._FORMAT_SUMMARY_RE
+            if self.context_mode == "summary_context"
+            else self._FORMAT_RE
         )
         return 1.0 if pattern.search(response) else 0.0
 

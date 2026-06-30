@@ -240,8 +240,68 @@ class GuidedRolloutConfig:
 
     # ── Teacher VLM backend ──────────────────────────────────────────────
     teacher_mode: str = "server"
-    """'server' (always-on dedicated vLLM) or 'colocated' (in-process with
-    sleep mode). v1 supports 'server' only; 'colocated' raises at construction."""
+    """'server' (always-on dedicated vLLM teacher), 'colocated' (in-process with
+    sleep mode — unimplemented), or 'self' (colocated SELF-teacher: the judge IS
+    the student's own in-process rollout engine, same weights, fed a no-leak
+    diagnosis of the branch nav state; it emits a corrective <hint> that is
+    injected as a USER-turn suffix at the branch step and the student re-decides
+    on its own — no separate teacher server, no forced response). 'self' requires
+    rollout.async_mode=false (sync per-group dedup) and ignores the teacher_vlm_*
+    server-discovery fields. The judge's system prompt is the diagnosis prompt
+    baked into ``privileged_eval/diagnosis_prompt.txt`` (NOT teacher_system_prompt_path)."""
+
+    judge_temperature: float = 0.5
+    """Sampling temperature for the colocated self-teacher judge (teacher_mode=
+    'self'). The judge runs through the same generate_sequences engine as the
+    student but at this temperature (mirrors the offline diagnose() default 0.5)."""
+
+    # ── moving forced-depth controller (prefix_groups + teacher_mode='self') ──
+    prefix_force_depth: bool = False
+    """prefix_groups self-teacher only: enable the moving forced-depth curriculum.
+
+    When True, each prefixed group does NOT just inject a single branch hint; it
+    FORCES ``G`` expert steps from the branch (deterministic oracle actions,
+    PG-masked), attaches a teacher-generated strategy ``<summary>`` to the LAST
+    forced step, then injects the suffix-derived hint at the on-policy handoff
+    (branch+G) and lets the student free-roll the remaining steps.
+
+    ``G = max(0, expert_plan_len_from_branch - round(L))`` where ``L`` is the
+    global leave-on-policy count controlled toward ``prefix_depth_target`` success
+    in the prefixed groups (see ``prefix_min_leave_on_policy``). At step 0 the
+    controller starts at ``L = prefix_min_leave_on_policy`` (worst case: force
+    every step but the answer); as the prefixed groups clear the target it raises
+    ``L`` (force fewer / leave more on-policy), and lowers it again if they dip.
+    The 0.5 default target also maximizes within-group GRPO reward variance
+    (half the siblings succeed from the forced pose, half fail). G=0 collapses to
+    the legacy single-hint-at-branch behavior."""
+
+    prefix_depth_target: float = 0.5
+    """force-depth controller success setpoint (fraction of prefixed-group
+    trajectories that solve). Above target+deadband → raise L (force less); below
+    target-deadband → lower L (force more)."""
+
+    prefix_depth_ema_beta: float = 0.5
+    """EMA smoothing for the prefixed-group success rate that drives the
+    force-depth controller (new = beta*old + (1-beta)*obs; first obs set directly)."""
+
+    prefix_depth_deadband: float = 0.05
+    """Hold L when the success EMA is within ±deadband of the target (~1 binomial
+    SE on a ~16-group prefixed half) — avoids chattering L on rollout noise."""
+
+    prefix_min_leave_on_policy: int = 1
+    """Floor for the leave-on-policy count L (also its starting value). 1 = always
+    leave at least the terminal answer step on-policy (never force the <answer/>)."""
+
+    teacher_max_prompt_length: int = 4096
+    """Prompt-length budget (in tokens) for the colocated self-teacher judge ONLY.
+    The judge's diagnosis SYSTEM prompt alone (~2436 tok) exceeds the student's
+    max_prompt_length (1536), so the SHARED ``_tokenize_prompts`` right-truncation
+    would silently drop the menu + branch image on every judge call. Raising this
+    selectively for the teacher path leaves the student's max_prompt_length (and its
+    per-sample padding/memory) untouched. The vLLM engine must also admit the longer
+    prompt: set ``worker.rollout.max_model_len`` >= teacher_max_prompt_length +
+    max_response_length (KV is allocated per-token lazily, so this is essentially free
+    for the short student sequences)."""
 
     teacher_vlm_node: Optional[str] = None
     """Hostname of the teacher vLLM server (server mode)."""
